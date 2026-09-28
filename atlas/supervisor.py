@@ -31,7 +31,10 @@ RESERVED_FLAGS = {
     "-kvu", "--kv-unified", "-no-kvu", "--no-kv-unified", "-cram", "--cache-ram", "--slot-save-path",
     "-ctk", "--cache-type-k", "-ctv", "--cache-type-v", "-fa", "--flash-attn", "-ngl", "--gpu-layers",
     "--n-gpu-layers", "--swa-full", "--api-key", "--api-key-file", "--no-slots",
+    "-mm", "--mmproj", "-mmu", "--mmproj-url", "--no-mmproj", "--mmproj-auto", "--no-mmproj-auto",
 }
+# llama-server options that change how images become tokens (part of visual cache variants)
+IMAGE_FLAGS = {"--image-min-tokens", "--image-max-tokens"}
 CRASH_WINDOW_S = 300
 MAX_CRASH_RESTARTS = 3
 
@@ -47,6 +50,17 @@ class PresetConfig(BaseModel):
     swa_full: bool = False
     extra_args: str = ""
     binary: str = ""  # llama-server command for this preset; empty = the standard build
+    mmproj: str = ""  # vision projector (.gguf) for visual prefill; empty = text only
+
+    @field_validator("mmproj")
+    @classmethod
+    def _mmproj(cls, v: str) -> str:
+        v = (v or "").strip()
+        if v and not v.endswith(".gguf"):
+            raise ValueError("vision projector must be a .gguf file")
+        if v and not Path(v).is_file():
+            raise ValueError(f"vision projector not found: {v}")
+        return v
 
     @field_validator("binary")
     @classmethod
@@ -116,6 +130,19 @@ def preset_label(preset: dict) -> str:
     return f"{preset['name']} · {Path(preset['model_path']).name} · {preset['kv_type']} KV"
 
 
+def vision_ident(preset: dict) -> str | None:
+    """Identifies what turns page images into tokens: the projector file and image options."""
+    mmproj = preset.get("mmproj")
+    if not mmproj:
+        return None
+    path = Path(mmproj)
+    size = path.stat().st_size if path.is_file() else 0
+    args = shlex.split(preset.get("extra_args") or "")
+    image = [f"{a}={args[i + 1]}" for i, a in enumerate(args[:-1]) if a in IMAGE_FLAGS]
+    image += [a for a in args if a.split("=", 1)[0] in IMAGE_FLAGS and "=" in a]
+    return ":".join([path.name, str(size), *sorted(image)])
+
+
 def build_command(binary: list[str], preset: dict, port: int, kv_dir: Path) -> list[str]:
     args = [
         *binary,
@@ -131,6 +158,8 @@ def build_command(binary: list[str], preset: dict, port: int, kv_dir: Path) -> l
     ]
     if preset.get("swa_full"):
         args.append("--swa-full")
+    if preset.get("mmproj"):
+        args += ["--mmproj", preset["mmproj"]]
     return args + shlex.split(preset.get("extra_args") or "")
 
 
@@ -237,6 +266,7 @@ class Supervisor:
                 self.preset = preset
                 self.store.set_state("active_preset", preset["id"])
                 self.engine.extra_ident = preset_ident(preset)
+                self.engine.vision_ident = vision_ident(preset)
                 self.engine.config_label = preset_label(preset)
                 await self._start_process()
                 await self.engine.connect()

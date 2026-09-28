@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS collections (
@@ -33,7 +33,9 @@ CREATE TABLE IF NOT EXISTS documents (
     size_bytes    INTEGER NOT NULL,
     n_chars       INTEGER NOT NULL DEFAULT 0,
     created_at    REAL NOT NULL,
-    updated_at    REAL NOT NULL
+    updated_at    REAL NOT NULL,
+    mode          TEXT NOT NULL DEFAULT 'text',  -- prefill: 'text' (extracted text) or 'visual' (page images)
+    n_pages       INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS documents_sha ON documents(sha256);
 
@@ -48,6 +50,7 @@ CREATE TABLE IF NOT EXISTS caches (
     ingest_ms    REAL,
     created_at   REAL NOT NULL,
     updated_at   REAL NOT NULL,
+    variant      TEXT,  -- what was prefilled: NULL/'text', or 'visual:<projector>:<dpi>'
     PRIMARY KEY (doc_id, fingerprint)
 );
 
@@ -63,7 +66,9 @@ CREATE TABLE IF NOT EXISTS parts (
     char_end      INTEGER NOT NULL,
     prefill_ms    REAL,
     prefix_tokens BLOB NOT NULL,
-    created_at    REAL NOT NULL
+    created_at    REAL NOT NULL,
+    -- visual parts: the prefix as a multimodal prompt string (char_start/char_end = page range)
+    prefix_text   TEXT
 );
 CREATE INDEX IF NOT EXISTS parts_doc_fp ON parts(doc_id, fingerprint, idx);
 
@@ -114,9 +119,11 @@ CREATE INDEX IF NOT EXISTS queries_conversation ON queries(conversation_id, crea
 EARLIER_QUESTIONS = "Earlier questions"
 QUERY_COLUMNS = "id, created_at, question, doc_ids, mode, answer, stats, error, conversation_id, standalone, detail"
 
-DOC_COLUMNS = "id, name, collection_id, mime, sha256, size_bytes, n_chars, created_at, updated_at"
-CACHE_COLUMNS = "doc_id, fingerprint, status, error, n_tokens, n_parts, kv_bytes, ingest_ms, created_at, updated_at"
-PART_COLUMNS = "id, doc_id, fingerprint, idx, n_tokens, kv_file, kv_bytes, char_start, char_end, prefill_ms"
+DOC_COLUMNS = "id, name, collection_id, mime, sha256, size_bytes, n_chars, created_at, updated_at, mode, n_pages"
+CACHE_COLUMNS = ("doc_id, fingerprint, status, error, n_tokens, n_parts, kv_bytes, ingest_ms, created_at, updated_at, "
+                 "variant")
+PART_COLUMNS = ("id, doc_id, fingerprint, idx, n_tokens, kv_file, kv_bytes, char_start, char_end, prefill_ms, "
+                "prefix_text")
 
 
 def pack_tokens(tokens: list[int]) -> bytes:
@@ -159,6 +166,8 @@ class Document:
     n_chars: int
     created_at: float
     updated_at: float
+    mode: str = "text"
+    n_pages: int = 0
 
     def to_json(self) -> dict:
         return dict(self.__dict__)
@@ -177,6 +186,11 @@ class Cache:
     ingest_ms: float | None
     created_at: float
     updated_at: float
+    variant: str | None = None
+
+    @property
+    def built_as(self) -> str:
+        return self.variant or "text"
 
     def to_json(self) -> dict:
         return dict(self.__dict__)
@@ -194,11 +208,18 @@ class Part:
     char_start: int
     char_end: int
     prefill_ms: float | None
+    prefix_text: str | None = field(default=None, repr=False)
     prefix_tokens: list[int] = field(default_factory=list, repr=False)
+
+    @property
+    def visual(self) -> bool:
+        return self.prefix_text is not None
 
     def to_json(self) -> dict:
         d = dict(self.__dict__)
         d.pop("prefix_tokens")
+        d.pop("prefix_text")
+        d["visual"] = self.visual
         return d
 
 
@@ -228,6 +249,16 @@ class Store:
     def _migrate(self) -> None:
         self._migrate_v2()
         self._migrate_v3()
+        self._migrate_v4()
+
+    def _migrate_v4(self) -> None:
+        """v4 adds visual prefill: document mode, cache variant, multimodal part prefixes."""
+        added = [("documents", "mode", "TEXT NOT NULL DEFAULT 'text'"), ("documents", "n_pages", "INTEGER NOT NULL DEFAULT 0"),
+                 ("caches", "variant", "TEXT"), ("parts", "prefix_text", "TEXT")]
+        for table, column, decl in added:
+            columns = self._columns(table)
+            if columns and column not in columns:
+                self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     def _migrate_v3(self) -> None:
         """v3 groups questions into conversations; earlier questions go into one conversation."""
@@ -326,13 +357,13 @@ class Store:
     # --- documents ---------------------------------------------------------------------
 
     def create_document(self, name: str, mime: str | None, sha256: str, size_bytes: int, n_chars: int,
-                        collection_id: str | None = None) -> Document:
+                        collection_id: str | None = None, mode: str = "text", n_pages: int = 0) -> Document:
         now = time.time()
         doc_id = new_id()
         self._exec(
             "INSERT INTO documents (id, name, collection_id, mime, sha256, size_bytes, n_chars, created_at, "
-            "updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (doc_id, name, collection_id, mime, sha256, size_bytes, n_chars, now, now),
+            "updated_at, mode, n_pages) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (doc_id, name, collection_id, mime, sha256, size_bytes, n_chars, now, now, mode, n_pages),
         )
         return self.get_document(doc_id)  # type: ignore[return-value]
 
@@ -432,10 +463,11 @@ class Store:
     def add_part(self, part: Part) -> None:
         self._exec(
             "INSERT INTO parts (id, doc_id, fingerprint, idx, n_tokens, kv_file, kv_bytes, char_start, char_end, "
-            "prefill_ms, prefix_tokens, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "prefill_ms, prefix_tokens, created_at, prefix_text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 part.id, part.doc_id, part.fingerprint, part.idx, part.n_tokens, part.kv_file, part.kv_bytes,
                 part.char_start, part.char_end, part.prefill_ms, pack_tokens(part.prefix_tokens), time.time(),
+                part.prefix_text,
             ),
         )
 

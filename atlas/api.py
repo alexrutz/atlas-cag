@@ -12,9 +12,12 @@ from pathlib import Path, PurePath
 from fastapi import APIRouter, Depends, FastAPI, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from typing import Literal
+
 from pydantic import BaseModel, Field, ValidationError
 
 from . import __version__, builds, models
+from . import pages as page_images
 from .config import RUNTIME_FIELDS, RuntimeSettings, Settings, get_settings
 from .downloads import Downloader, DownloadError
 from .engine import Engine
@@ -39,6 +42,7 @@ class TextDocument(BaseModel):
 class DocumentUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=200)
     collection_id: str | None = None
+    mode: Literal["text", "visual"] | None = None  # prefill from extracted text or from page images
 
 
 class CollectionBody(BaseModel):
@@ -165,8 +169,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "max_final_tokens": settings.max_final_tokens,
                 "max_upload_mb": settings.max_upload_mb,
                 "enable_thinking": settings.enable_thinking,
+                "default_prefill": settings.default_prefill,
+                "visual_dpi": settings.visual_dpi,
             },
-            "supported_extensions": sorted(SUPPORTED_EXTENSIONS),
+            "supported_extensions": sorted(SUPPORTED_EXTENSIONS | page_images.IMAGE_EXTENSIONS),
         }
 
     # --- collections -------------------------------------------------------------------
@@ -212,9 +218,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     def doc_payload(s, doc, cache) -> dict:
         fp = s.engine.info.fingerprint
+        wanted = s.ingestor.variant_for(doc) if fp else None
+        status = cache.status if cache else ("not_built" if fp else "waiting")
+        if fp and not (cache and cache.status in ("queued", "ingesting")):
+            if wanted is None:
+                status = "needs_vision"  # visual document, but no vision projector is loaded
+            elif cache and cache.status == "ready" and cache.built_as != wanted:
+                status = "stale"  # built for the other prefill mode or another projector / resolution
         d = doc.to_json()
         d.update({
-            "status": cache.status if cache else ("not_built" if fp else "waiting"),
+            "status": status,
             "error": cache.error if cache else None,
             "n_tokens": cache.n_tokens if cache else 0,
             "n_parts": cache.n_parts if cache else 0,
@@ -222,7 +235,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "ingest_ms": cache.ingest_ms if cache else None,
             "fingerprint": cache.fingerprint if cache else None,
             "progress": s.ingestor.progress.get(doc.id),
-            "queryable": bool(cache and cache.status == "ready"),
+            "queryable": bool(cache and cache.status == "ready" and wanted and cache.built_as == wanted),
+            "visual_capable": page_images.supports_visual(doc.name),
+            "has_text": doc.n_chars > 0,
         })
         return d
 
@@ -234,12 +249,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             get_collection_or_404(s, collection_id)
         return collection_id or None
 
-    def register(s, name: str, mime: str | None, data: bytes, text: str, collection_id: str | None) -> dict:
+    def register(s, name: str, mime: str | None, data: bytes, text: str, collection_id: str | None,
+                 mode: str = "text", n_pages: int = 0) -> dict:
         sha = hashlib.sha256(data).hexdigest()
         existing = s.store.find_by_sha(sha)
         if existing:
             return {"document": doc_json(s, existing), "duplicate": True}
-        doc = s.store.create_document(name, mime, sha, len(data), len(text), collection_id)
+        doc = s.store.create_document(name, mime, sha, len(data), len(text), collection_id, mode, n_pages)
         folder = settings.docs_dir / doc.id
         folder.mkdir(parents=True, exist_ok=True)
         (folder / f"original{PurePath(name).suffix.lower()}").write_bytes(data)
@@ -259,8 +275,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         caches = s.store.caches_for(s.engine.info.fingerprint)
         return [doc_payload(s, d, caches.get(d.id)) for d in s.store.list_documents()]
 
+    def prepare_upload(name: str, data: bytes, mode: str) -> dict:
+        """Extract text and count pages. Images and PDFs without text layer are prefilled visually."""
+        visual_ok = page_images.supports_visual(name)
+        note = None
+        text = ""
+        if not page_images.is_image(name):
+            try:
+                text = extract_text(name, data)
+            except ExtractionError as e:
+                if not visual_ok:
+                    raise
+                if mode == "text":
+                    note = f"{e}: using visual prefill"
+        if visual_ok and (mode == "visual" or not text):
+            mode = "visual"
+        else:
+            mode = "text"
+        n_pages = page_images.page_count(name, data) if visual_ok else 0
+        return {"text": text, "mode": mode, "n_pages": n_pages, "note": note}
+
     @api.post("/documents")
-    async def upload_documents(request: Request, files: list[UploadFile], collection_id: str | None = Form(None)):
+    async def upload_documents(request: Request, files: list[UploadFile], collection_id: str | None = Form(None),
+                               mode: Literal["text", "visual"] | None = Form(None)):
         s = st(request)
         collection_id = check_collection(s, collection_id)
         limit = settings.max_upload_mb * 1024 * 1024
@@ -272,11 +309,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 results.append({"name": name, "error": f"larger than {settings.max_upload_mb} MB"})
                 continue
             try:
-                text = await asyncio.to_thread(extract_text, name, data)
-            except ExtractionError as e:
+                prepared = await asyncio.to_thread(prepare_upload, name, data, mode or settings.default_prefill)
+            except (ExtractionError, page_images.PageError) as e:
                 results.append({"name": name, "error": str(e)})
                 continue
-            results.append(register(s, name, f.content_type, data, text, collection_id))
+            result = register(s, name, f.content_type, data, prepared["text"], collection_id, prepared["mode"],
+                              prepared["n_pages"])
+            if prepared["note"]:
+                result["note"] = prepared["note"]
+            results.append(result)
         return {"results": results}
 
     @api.post("/documents/text")
@@ -311,9 +352,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             fields["name"] = body.name.strip()
         if "collection_id" in body.model_fields_set:
             fields["collection_id"] = check_collection(s, body.collection_id)
+        doc = s.store.get_document(doc_id)
+        if body.mode and body.mode != doc.mode:
+            if body.mode == "visual" and not page_images.supports_visual(doc.name):
+                raise HTTPException(400, "visual prefill works for PDFs and images")
+            if body.mode == "text" and doc.n_chars == 0:
+                raise HTTPException(400, "this document has no extractable text; it can only be prefilled visually")
+            fields["mode"] = body.mode
+            if body.mode == "visual" and not doc.n_pages:
+                original = next((settings.docs_dir / doc_id).glob("original*"))
+                fields["n_pages"] = await asyncio.to_thread(page_images.page_count, doc.name, original.read_bytes())
         if fields:
             s.store.update_document(doc_id, **fields)
+        if "mode" in fields and s.engine.info.fingerprint and not s.ingestor.is_busy(doc_id):
+            s.ingestor.enqueue(doc_id)  # the cache must be built again from the other input
         return doc_json(s, s.store.get_document(doc_id))
+
+    @api.get("/documents/{doc_id}/pages/{n}")
+    async def get_document_page(request: Request, doc_id: str, n: int):
+        doc = get_doc_or_404(st(request), doc_id)
+        if not page_images.supports_visual(doc.name):
+            raise HTTPException(404, "this document has no pages")
+        folder = settings.docs_dir / doc_id
+        original = next(folder.glob("original*"), None)
+        if original is None:
+            raise HTTPException(404, "original file missing")
+        try:
+            pages = await asyncio.to_thread(page_images.ensure_pages, original, folder, settings.visual_dpi)
+        except page_images.PageError as e:
+            raise HTTPException(422, str(e)) from e
+        if not 1 <= n <= len(pages):
+            raise HTTPException(404, "no such page")
+        return FileResponse(pages[n - 1], media_type="image/png", headers={"Cache-Control": "private, max-age=3600"})
 
     @api.get("/documents/{doc_id}/text", response_class=PlainTextResponse)
     async def get_document_text(request: Request, doc_id: str):
@@ -449,12 +519,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if info is None and path.is_file():
             info = models.describe_file(path)
         build = builds.inspect(p.get("binary") or standard_build(settings, s.store) or "")
+        mmproj = Path(p.get("mmproj") or "")
+        mmproj_bytes = mmproj.stat().st_size if p.get("mmproj") and mmproj.is_file() else 0
         return {**p, "active": p["id"] == active, "model_found": path.is_file(),
+                "mmproj_found": not p.get("mmproj") or mmproj.is_file(),
                 "model": info.to_json() if info else None,
                 "build": build.to_json(),
                 "warnings": builds.preset_warnings(build, info.arch if info else None, p.get("extra_args", "")),
                 "estimate": models.estimate(info, p["ctx_per_slot"], p["slots"], p["kv_type"],
-                                            p.get("extra_args", ""), p.get("gpu_layers", "all"))}
+                                            p.get("extra_args", ""), p.get("gpu_layers", "all"), mmproj_bytes)}
 
     @api.get("/presets")
     async def list_presets(request: Request):
@@ -483,8 +556,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             info = models.describe_file(path)
             extra = str(body.get("extra_args") or "")
             build = builds.inspect(str(body.get("binary") or "") or standard or "")
+            mmproj = Path(str(body.get("mmproj") or ""))
+            mmproj_bytes = mmproj.stat().st_size if body.get("mmproj") and mmproj.is_file() else 0
             return {**models.estimate(info, int(body.get("ctx_per_slot") or 0), int(body.get("slots") or 1),
-                                      str(body.get("kv_type") or "f16"), extra, str(body.get("gpu_layers") or "all")),
+                                      str(body.get("kv_type") or "f16"), extra, str(body.get("gpu_layers") or "all"),
+                                      mmproj_bytes),
                     "warnings": builds.preset_warnings(build, info.arch, extra), "build": build.to_json()}
         try:
             return await asyncio.to_thread(check)
@@ -626,8 +702,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @api.get("/models")
     async def list_models(request: Request):
         index = await model_index()
+        projectors = await asyncio.to_thread(models.discover_projectors, settings.model_dirs, settings.scan_model_caches)
         return {
             "models": [m.to_json() for m in index.values()],
+            "projectors": projectors,
             "dirs": [str(d) for d in settings.model_dirs],
             "download_dir": str(settings.model_dirs[0]),
             "scan_caches": settings.scan_model_caches,

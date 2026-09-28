@@ -4,9 +4,16 @@ Tokens are characters (BOS = 1), slots keep real token state, prefix reuse is co
 llama-server does (longest common prefix, minus one token if the prompt is fully cached), and
 slot save/restore write actual files. Answers are canned but depend on the prompt, so relevance
 filtering and synthesis can be exercised.
+
+With `vision` on, multimodal prompts work like llama-server's: each image becomes one token per
+64x64 pixels, all derived from a hash of the image bytes, so a restored cache only matches when the
+same image bytes are sent again.
 """
 
 import asyncio
+import base64
+import hashlib
+import io
 import json
 import re
 import uuid
@@ -32,8 +39,15 @@ def detokenize(tokens: list[int]) -> str:
     return "".join(chr(t) for t in tokens if t != BOS)
 
 
-def error(status: int, message: str) -> JSONResponse:
-    return JSONResponse({"error": {"code": status, "message": message, "type": "invalid_request_error"}}, status)
+def error(status: int, message: str, kind: str = "invalid_request_error", **extra) -> JSONResponse:
+    return JSONResponse({"error": {"code": status, "message": message, "type": kind, **extra}}, status)
+
+
+def image_tokens(data: bytes) -> list[int]:
+    from PIL import Image
+    w, h = Image.open(io.BytesIO(data)).size
+    token = 200_000 + int(hashlib.sha1(data).hexdigest()[:6], 16)
+    return [token] * (-(-w // 64) * -(-h // 64))
 
 
 class FakeLlama:
@@ -51,7 +65,23 @@ class FakeLlama:
         self.kv_format = "f16"  # stands in for --cache-type-k/v; restores of other formats fail
         self.active = 0  # streams currently being generated
         self.cancelled = 0  # streams aborted because the client went away
+        self.vision = False  # a vision projector (--mmproj) is loaded
         self.app = self._build()
+
+    def multimodal(self, prompt: dict) -> tuple[list[int], str]:
+        """Tokens of a multimodal prompt, and its text with images shown as [image WxH]."""
+        texts = prompt["prompt_string"].split(self.media_marker)
+        images = [base64.b64decode(b) for b in prompt["multimodal_data"]]
+        if len(texts) != len(images) + 1:
+            raise ValueError("number of media markers does not match the images")
+        tokens, shown = [BOS], []
+        for i, text in enumerate(texts):
+            tokens += tokenize(text, False)
+            shown.append(text)
+            if i < len(images):
+                tokens += image_tokens(images[i])
+                shown.append(f"[image {len(image_tokens(images[i]))} tokens]")
+        return tokens, "".join(shown)
 
     def _answer(self, text: str) -> str:
         if "Follow-up question:" in text:  # rewrite: append the longest word of the last question
@@ -60,6 +90,8 @@ class FakeLlama:
             return f"Standalone question: {followup} ({max(re.findall(r'[A-Za-z]{4,}', last_question), key=len)})"
         if "Findings:" in text:
             return f"Synthesized from {text.count('Source:')} findings [1]."
+        if "[image " in text:
+            return f"Saw {text.count('[image ')} page image(s)."
         if "Quote the passages" in text:  # map phase
             doc = text[text.find("<document"): text.find("</document>")].lower()
             question = text.rsplit("Question: ", 1)[1].split("\n\n", 1)[0].lower()
@@ -88,6 +120,7 @@ class FakeLlama:
                 "chat_template": TEMPLATE,
                 "build_info": "fake",
                 "media_marker": fake.media_marker,
+                "modalities": {"vision": fake.vision, "audio": False},
             }
 
         @app.get("/v1/models")
@@ -134,10 +167,16 @@ class FakeLlama:
         @app.post("/completion")
         async def completion(req: Request):
             body = await req.json()
-            prompt: list[int] = body["prompt"]
+            prompt = body["prompt"]
+            text = None
+            if isinstance(prompt, dict):
+                if not fake.vision:
+                    return error(500, "Multimodal data provided, but model does not support multimodal requests.")
+                prompt, text = fake.multimodal(prompt)
             slot = body["id_slot"]
-            if len(prompt) > fake.n_ctx:
-                return error(400, "request exceeds the available context size")
+            if len(prompt) >= fake.n_ctx:
+                return error(400, f"request ({len(prompt)} tokens) exceeds the available context size",
+                             "exceed_context_size_error", n_prompt_tokens=len(prompt), n_ctx=fake.n_ctx)
             cached = fake.slots[slot]
             n = 0
             while n < min(len(cached), len(prompt)) and cached[n] == prompt[n]:
@@ -152,7 +191,7 @@ class FakeLlama:
                 return {"content": "x", "stop": True, "tokens_cached": n,
                         "completion_probabilities": [{"id": token, "token": "x", "logprob": -0.05}],
                         "timings": {"cache_n": n, "prompt_n": len(prompt) - n}}
-            text = detokenize(prompt)
+            text = text if text is not None else detokenize(prompt)
             fake.log[-1]["prompt_text"] = text
             answer = "" if body["n_predict"] == 0 else fake._answer(text)
             pieces = [answer[i:i + 7] for i in range(0, len(answer), 7)]

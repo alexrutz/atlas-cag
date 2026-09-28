@@ -15,6 +15,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 
+from . import pages as page_images
 from . import prompts
 from .config import Settings
 from .engine import Engine, GenResult, cache_rejected
@@ -44,6 +45,7 @@ class Target:
     doc: Document
     part: Part
     n_parts: int
+    dpi: int | None = None  # visual parts: resolution of the page images that were prefilled
 
     @property
     def key(self) -> str:
@@ -51,13 +53,18 @@ class Target:
 
     @property
     def label(self) -> str:
-        return self.doc.name if self.n_parts == 1 else f"{self.doc.name} (part {self.part.idx + 1} of {self.n_parts})"
+        if self.n_parts == 1:
+            return self.doc.name
+        if self.part.visual:
+            a, b = self.part.char_start + 1, self.part.char_end
+            return f"{self.doc.name} (pages {a}–{b})" if b > a else f"{self.doc.name} (page {a})"
+        return f"{self.doc.name} (part {self.part.idx + 1} of {self.n_parts})"
 
     def describe(self) -> dict:
         return {
             "key": self.key, "n": self.n, "doc_id": self.doc.id, "doc_name": self.doc.name,
             "part": self.part.idx + 1, "n_parts": self.n_parts, "n_tokens": self.part.n_tokens,
-            "label": self.label,
+            "label": self.label, "visual": self.part.visual,
         }
 
 
@@ -134,13 +141,19 @@ class QueryService:
             if doc is None:
                 raise QueryError(f"document {doc_id} not found", 404)
             cache = self.store.get_cache(doc_id, fp)
-            if cache is None or cache.status != "ready":
+            wanted = self.ingestor.variant_for(doc)
+            if cache is None or cache.status != "ready" or cache.built_as != wanted:
                 status = cache.status if cache else "not built"
+                if wanted is None:
+                    status = "no vision projector loaded"
+                elif cache and cache.status == "ready":
+                    status = "built for a different prefill mode"
                 raise QueryError(f"'{doc.name}' has no ready KV cache for the current model ({status})", 409)
+            dpi = int(wanted.rsplit(":", 1)[1]) if wanted.startswith("visual:") else None
             # prefix tokens are loaded per call while a slot is leased, bounding memory by slots
             parts = self.store.get_parts(doc_id, fp, with_tokens=False)
             for p in parts:
-                targets.append(Target(len(targets) + 1, doc, p, len(parts)))
+                targets.append(Target(len(targets) + 1, doc, p, len(parts), dpi))
 
         n_q = await self.engine.count(question)
         if n_q > self.settings.max_question_tokens:
@@ -250,7 +263,12 @@ class QueryService:
     async def _answer_target(self, plan: Plan, t: Target, block: str, emit: Emit, tally: Tally,
                              on_piece: Callable[[str, str], Awaitable[None]]) -> tuple[GenResult, dict]:
         eng = self.engine
-        suffix, layout = await eng.question_suffix(block, plan.thinking)
+        if t.part.visual:
+            suffix_text, layout = await eng.visual_suffix(block, plan.thinking)
+            n_suffix = await eng.count(suffix_text)
+            images = await asyncio.to_thread(self._page_bytes, t)
+        else:
+            suffix, layout = await eng.question_suffix(block, plan.thinking)
         await emit({"type": "target", "key": t.key, "status": "queued"})
         async with eng.pool.lease(PRIORITY_QUERY, f"query · {t.label}") as slot:
             if eng.info.fingerprint != plan.fingerprint:
@@ -258,7 +276,13 @@ class QueryService:
             prefix = self.store.get_prefix_tokens(t.part.id)
             if prefix is None:
                 raise QueryError(f"'{t.doc.name}' was deleted or re-ingested during the query", 409)
-            prompt = prefix + suffix
+            if t.part.visual:
+                # the same page images again: llama-server matches them to the restored cache by hash
+                prompt = eng.multimodal(t.part.prefix_text + suffix_text, images)
+                n_prompt = t.part.n_tokens + n_suffix
+            else:
+                prompt = prefix + suffix
+                n_prompt = len(prompt)
             await emit({"type": "target", "key": t.key, "status": "restoring", "slot": slot})
             t0 = time.perf_counter()
             try:
@@ -277,7 +301,8 @@ class QueryService:
                 raise LlamaError(f"restored {restored.get('n_restored')} tokens, expected {t.part.n_tokens}")
             await emit({"type": "target", "key": t.key, "status": "generating", "slot": slot,
                         "restore_ms": round(restore_ms, 1)})
-            res = await eng.generate(slot, prompt, layout, self.settings.max_answer_tokens, on_piece)
+            res = await eng.generate(slot, prompt, layout, self.settings.max_answer_tokens, on_piece,
+                                     n_prompt=n_prompt)
 
         tally.add(res)
         tally.restore_ms += restore_ms
@@ -290,6 +315,13 @@ class QueryService:
         stats = {"slot": slot, "restore_ms": round(restore_ms, 1), "kv_bytes": restored.get("n_read"),
                  "cache_miss": cache_miss, **res.stats()}
         return res, stats
+
+    def _page_bytes(self, t: Target) -> list[bytes]:
+        folder = page_images.page_dir(self.settings.docs_dir / t.doc.id, t.dpi or self.settings.visual_dpi)
+        pages = page_images.list_pages(folder)[t.part.char_start:t.part.char_end]
+        if len(pages) != t.part.char_end - t.part.char_start:
+            raise QueryError(f"page images of '{t.doc.name}' are missing: rebuild its cache", 409)
+        return [p.read_bytes() for p in pages]
 
     def _flag_broken(self, doc: Document, fingerprint: str | None, reason: str) -> None:
         log.error("%s: %s", doc.name, reason)

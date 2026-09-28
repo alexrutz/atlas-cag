@@ -9,13 +9,14 @@ import logging
 import re
 import time
 
+from . import pages as page_images
 from . import prompts
 from .chunking import plan_parts
 from .config import Settings
 from .engine import Engine
 from .llama import LlamaError
 from .slots import PRIORITY_INGEST
-from .store import Part, Store, new_id
+from .store import Document, Part, Store, new_id
 
 log = logging.getLogger("atlas.ingest")
 
@@ -26,6 +27,9 @@ MAX_RETRIES = 5
 RETRY_BASE_DELAY_S = 5.0
 # Part files are named atlas-<uuid hex>.bin; anything else in the directory is left alone.
 ORPHAN_RE = re.compile(r"atlas-[0-9a-f]{32}\.bin")
+NEEDS_VISION = ("visual prefill needs a vision model: add the model's vision projector (mmproj) to the preset, "
+                "or switch the document to text prefill")
+UNAVAILABLE = "visual:unavailable"
 
 
 class IngestCancelled(Exception):
@@ -118,6 +122,12 @@ class Ingestor:
 
     # --- consistency -------------------------------------------------------------------
 
+    def variant_for(self, doc: Document) -> str | None:
+        """What the document's cache must be built from now; None if that is not possible."""
+        if doc.mode == "visual":
+            return self.engine.visual_variant(self.settings.visual_dpi)
+        return "text"
+
     def reconcile(self, startup: bool = False) -> None:
         """Bring the active configuration's caches in line with the library: build missing ones,
         resume interrupted jobs, and flag caches whose files are gone or no longer fit."""
@@ -136,16 +146,22 @@ class Ingestor:
         n_ctx = self.engine.info.n_ctx_slot
         for doc in self.store.list_documents():
             cache = caches.get(doc.id)
+            wanted = self.variant_for(doc)
             if cache is None:
-                if auto:
+                if auto and wanted:
                     self.enqueue(doc.id)
                 continue
             if cache.status in ("queued", "ingesting"):
                 if startup or not self.is_busy(doc.id):
                     self.enqueue(doc.id)
                 continue
-            if cache.status == "failed":
+            if wanted and cache.built_as != wanted:
+                # switched between text and visual, or the projector / page resolution changed
+                if auto and not self.is_busy(doc.id):
+                    self.enqueue(doc.id)
                 continue
+            if cache.status == "failed" or wanted is None:
+                continue  # a visual cache without the projector stays as is for when it is back
             parts = self.store.get_parts(doc.id, fp, with_tokens=False)
             too_big = any(p.n_tokens + self.settings.max_answer_tokens > n_ctx for p in parts)
             missing = any(not (self.settings.kv_dir / p.kv_file).exists() for p in parts)
@@ -221,37 +237,57 @@ class Ingestor:
         while not self.engine.ready:
             await asyncio.sleep(0.5)
 
+    async def _prefix_limit(self) -> int:
+        """Largest cached prefix that leaves room for question, instructions, template tail and answer.
+
+        (The thinking budget is not reserved: with thinking on, generation is capped by the free context.)
+        """
+        n_ctx = self.engine.info.n_ctx_slot
+        tail, _ = await self.engine.question_suffix("", self.settings.enable_thinking)
+        reserve = self.settings.max_question_tokens + QUESTION_BLOCK_OVERHEAD + len(tail) + self.settings.max_answer_tokens
+        if n_ctx - reserve < 512:
+            raise ValueError(
+                f"slot context ({n_ctx} tokens) is too small: {reserve} tokens are reserved for question "
+                "and answer. Give the preset more context per slot or reduce the answer budgets."
+            )
+        return n_ctx - reserve
+
     async def _ingest(self, doc_id: str) -> None:
         await self._wait_ready()
         self._check(doc_id)
         doc = self.store.get_document(doc_id)
         assert doc is not None
-        text = (self.settings.docs_dir / doc_id / "text.txt").read_text(encoding="utf-8")
 
         eng = self.engine
         fingerprint = eng.info.fingerprint
         assert fingerprint
+        variant = self.variant_for(doc) or UNAVAILABLE
         self._active[doc_id] = fingerprint
         self.remove_parts(doc_id, fingerprint)
         self.store.set_cache(doc_id, fingerprint, status="ingesting", error=None, n_tokens=0, n_parts=0,
-                             kv_bytes=0)
+                             kv_bytes=0, variant=variant)
         self.progress[doc_id] = 0.0
         started = time.perf_counter()
+        if variant == UNAVAILABLE:
+            raise ValueError(NEEDS_VISION)
+        if doc.mode == "visual":
+            created = await self._ingest_visual(doc, fingerprint)
+        else:
+            created = await self._ingest_text(doc, fingerprint)
+        self._finish(doc, fingerprint, created, started)
 
-        n_ctx = eng.info.n_ctx_slot
+    async def _ingest_text(self, doc: Document, fingerprint: str) -> list[Part]:
+        doc_id = doc.id
+        eng = self.engine
+        text = (self.settings.docs_dir / doc_id / "text.txt").read_text(encoding="utf-8")
+        if not text.strip():
+            raise ValueError("this document has no extractable text: use visual prefill")
         head, mid = await eng.prefix_overhead()
-        tail, _ = await eng.question_suffix("", self.settings.enable_thinking)
         header = await eng.count(prompts.document_block(doc.name, 98, 99, ""))
-        # Every query appends question + instructions + template tail + answer to the cached prefix.
-        # (Thinking budget is not reserved: with thinking on, generation is capped by the free context.)
-        reserve = self.settings.max_question_tokens + QUESTION_BLOCK_OVERHEAD + len(tail) + self.settings.max_answer_tokens
-        prefix_limit = n_ctx - reserve
+        prefix_limit = await self._prefix_limit()
         budget = prefix_limit - len(head) - len(mid) - header
         if budget < 256:
-            raise ValueError(
-                f"slot context ({n_ctx} tokens) is too small: {reserve} tokens are reserved for question "
-                "and answer. Give the preset more context per slot or reduce the answer budgets."
-            )
+            raise ValueError(f"slot context ({eng.info.n_ctx_slot} tokens) is too small for document parts")
 
         spans = await plan_parts(text, eng.count, budget, self.settings.part_overlap_tokens)
         n = len(spans)
@@ -289,23 +325,123 @@ class Ingestor:
                 self._check(doc_id)
                 self.store.add_part(part)
         except BaseException:
-            for p in created:
-                (self.settings.kv_dir / p.kv_file).unlink(missing_ok=True)
-            if self.store.get_document(doc_id):
-                self.store.delete_parts(doc_id, fingerprint)
+            self._discard(doc_id, fingerprint, created)
             raise
+        return created
 
+    def _discard(self, doc_id: str, fingerprint: str, created: list[Part]) -> None:
+        for p in created:
+            (self.settings.kv_dir / p.kv_file).unlink(missing_ok=True)
+        if self.store.get_document(doc_id):
+            self.store.delete_parts(doc_id, fingerprint)
+
+    async def _ingest_visual(self, doc: Document, fingerprint: str) -> list[Part]:
+        """Prefill page images: parts are runs of pages that fit a slot, sized by measuring."""
+        doc_id = doc.id
+        eng = self.engine
+        doc_dir = self.settings.docs_dir / doc_id
+        original = next(doc_dir.glob("original*"), None)
+        if original is None:
+            raise ValueError("the original file of this document is missing")
+        pages = await asyncio.to_thread(page_images.ensure_pages, original, doc_dir, self.settings.visual_dpi)
+        if not pages:
+            raise ValueError("the document has no pages")
+        if len(pages) != doc.n_pages:
+            self.store.update_document(doc_id, n_pages=len(pages))
+        prefix_limit = await self._prefix_limit()
+
+        async with eng.pool.lease(PRIORITY_INGEST, f"ingest · {doc.name} (sizing)") as slot:
+            if eng.info.fingerprint != fingerprint:
+                raise ConfigChanged(doc_id)
+            spans = await self._plan_pages(doc, pages, slot, prefix_limit)
+        n = len(spans)
+        log.info("ingesting %s (%s) visually: %d page(s) -> %d part(s), limit %d tokens/part",
+                 doc.name, doc_id, len(pages), n, prefix_limit)
+
+        created: list[Part] = []
+        try:
+            for k, (a, b) in enumerate(spans):
+                await self._wait_ready()
+                self._check(doc_id)
+                text = await eng.visual_prefix(doc.name, k, n, list(range(a + 1, b + 1)))
+                images = await asyncio.to_thread(lambda a=a, b=b: [p.read_bytes() for p in pages[a:b]])
+
+                def on_progress(done: int, total: int, k: int = k) -> None:
+                    self.progress[doc_id] = (k + done / max(total, 1)) / n
+
+                part_id = new_id()
+                kv_file = f"atlas-{part_id}.bin"
+                async with eng.pool.lease(PRIORITY_INGEST, f"ingest · {doc.name} ({k + 1}/{n})") as slot:
+                    if eng.info.fingerprint != fingerprint:
+                        raise ConfigChanged(doc_id)
+                    t0 = time.perf_counter()
+                    final = await eng.prefill(slot, eng.multimodal(text, images), on_progress)
+                    prefill_ms = (time.perf_counter() - t0) * 1000
+                    saved = await eng.llama.slot_save(slot, kv_file)
+                n_tokens = int(saved.get("n_saved") or 0)
+                part = Part(
+                    id=part_id, doc_id=doc_id, fingerprint=fingerprint, idx=k, n_tokens=n_tokens,
+                    kv_file=kv_file, kv_bytes=int(saved.get("n_written") or 0), char_start=a, char_end=b,
+                    prefill_ms=round(prefill_ms, 1), prefix_text=text,
+                )
+                created.append(part)
+                if n_tokens != int(final.get("tokens_evaluated") or 0) or n_tokens > prefix_limit:
+                    raise LlamaError(f"part {k + 1}: slot saved {n_tokens} tokens, prefill evaluated "
+                                     f"{final.get('tokens_evaluated')} (limit {prefix_limit})")
+                self._check(doc_id)
+                self.store.add_part(part)
+        except BaseException:
+            self._discard(doc_id, fingerprint, created)
+            raise
+        return created
+
+    async def _plan_pages(self, doc: Document, pages: list, slot: int, limit: int) -> list[tuple[int, int]]:
+        """Split pages into runs whose prompt fits `limit` tokens, measuring instead of guessing:
+        how many tokens an image takes depends on the vision encoder and the image size."""
+        eng = self.engine
+        sizes: dict[tuple[int, int], int] = {}
+
+        async def measure(a: int, b: int) -> int:
+            if (a, b) not in sizes:
+                text = await eng.visual_prefix(doc.name, 98, 99, list(range(a + 1, b + 1)))
+                images = await asyncio.to_thread(lambda: [p.read_bytes() for p in pages[a:b]])
+                sizes[(a, b)] = await eng.measure(slot, text, images)
+            return sizes[(a, b)]
+
+        base = len(await eng.llama.tokenize(await eng.visual_prefix(doc.name, 98, 99, []), add_special=True,
+                                            parse_special=True))
+        per_page = max(1.0, await measure(0, 1) - base)
+        spans: list[tuple[int, int]] = []
+        a = 0
+        while a < len(pages):
+            b = min(len(pages), a + max(1, int((limit - base) / per_page * 0.97)))
+            while True:
+                tokens = await measure(a, b)
+                if tokens <= limit:
+                    break
+                if b - a == 1:
+                    raise ValueError(f"page {a + 1} alone takes {tokens} tokens, but a slot holds {limit} for a "
+                                     "document part: lower the page resolution or give the preset more context")
+                b = a + max(1, min(b - a - 1, int((b - a) * (limit - base) / max(1, tokens - base) * 0.97)))
+            spans.append((a, b))
+            per_page = max(1.0, (tokens - base) / (b - a))
+            a = b
+        return spans
+
+    def _finish(self, doc: Document, fingerprint: str, created: list[Part], started: float) -> None:
+        doc_id = doc.id
+        eng = self.engine
         self.store.set_cache(
             doc_id, fingerprint,
             status="ready",
             error=None,
             n_tokens=sum(p.n_tokens for p in created),
-            n_parts=n,
+            n_parts=len(created),
             kv_bytes=sum(p.kv_bytes for p in created),
             ingest_ms=round((time.perf_counter() - started) * 1000, 1),
         )
         self._retries.pop(doc_id, None)
-        log.info("ingested %s: %d tokens in %d part(s)", doc.name, sum(p.n_tokens for p in created), n)
+        log.info("ingested %s: %d tokens in %d part(s)", doc.name, sum(p.n_tokens for p in created), len(created))
         if fingerprint != eng.info.fingerprint and self.settings.auto_build_caches:
             # finished for the previous configuration (still valid there); build for the new one
             self._active.pop(doc_id, None)

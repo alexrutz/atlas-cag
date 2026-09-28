@@ -83,6 +83,7 @@
   async function loadModels() {
     const res = await getJSON("/api/models");
     view.models = res.models;
+    view.projectors = res.projectors || [];
     view.gpus = res.gpus;
     view.ramTotal = res.ram_total || 0;
     view.gpuBaseline = res.gpu_baseline || 0;
@@ -108,12 +109,14 @@
           <span class="seg weights" style="width:${pct(est.weights, cap)}" title="Weights on the GPU ${fmtGB(est.weights)}"></span>
           <span class="seg kv" style="width:${pct(est.kv_cache, cap)}" title="KV cache ${fmtGB(est.kv_cache)}"></span>
           ${est.recurrent ? `<span class="seg recurrent" style="width:${pct(est.recurrent, cap)}" title="Recurrent state ${fmtBytes(est.recurrent)}"></span>` : ""}
+          ${est.projector ? `<span class="seg projector" style="width:${pct(est.projector, cap)}" title="Vision projector ${fmtGB(est.projector)}"></span>` : ""}
         </div>
         <strong title="${view.gpuBaseline ? `${fmtGB(view.gpuBaseline)} of the GPU is used by other programs` : ""}">≈ ${fmtGB(est.total)}${gpu ? ` of ${fmtGB(gpu)} free` : ""}</strong></div>
       <div class="legend">
         <span><i class="weights"></i>weights ${fmtGB(est.weights)}</span>
         <span><i class="kv"></i>KV cache ${fmtGB(est.kv_cache)}</span>
         ${est.recurrent ? `<span><i class="recurrent"></i>recurrent ${fmtBytes(est.recurrent)}</span>` : ""}
+        ${est.projector ? `<span><i class="projector"></i>vision projector ${fmtGB(est.projector)}</span>` : ""}
       </div>
       ${est.ram ? `<div class="est-row"><span class="est-label">RAM</span>
         <div class="bar"><span class="seg ram" style="width:${pct(est.ram, Math.max(ram, est.ram))}" title="Offloaded weights ${fmtGB(est.ram)}"></span></div>
@@ -160,6 +163,7 @@
     if (!p.model_found) problems.push("Model file not found.");
     if (m && m.ctx_train && p.ctx_per_slot > m.ctx_train) problems.push(`Context per slot exceeds the model's trained context (${fmtInt(m.ctx_train)}).`);
     if (m && m.sliding_window && !p.swa_full) problems.push("This model uses sliding-window attention: enable “Full SWA cache”, or cached prompts cannot be extended.");
+    if (!p.mmproj_found) problems.push("Vision projector file not found.");
     problems.push(...(p.warnings || []));
     const build = p.build ? `${p.binary ? "" : "standard build · "}${p.build.label}` : "";
     return `<article class="preset${p.active ? " active" : ""}" data-id="${esc(p.id)}">
@@ -168,6 +172,7 @@
         <div class="muted small">${esc(m?.name || p.model_path.split("/").pop())}${m?.quant ? ` · ${esc(m.quant)}` : ""}
           · ${p.slots} slot${p.slots > 1 ? "s" : ""} × ${fmtTok(p.ctx_per_slot)} context · ${esc(p.kv_type)} KV</div>
         ${build ? `<div class="muted small">llama-server ${esc(build)}</div>` : ""}
+        ${p.mmproj ? `<div class="muted small">vision: ${esc(p.mmproj.split("/").pop())} · visual prefill available</div>` : ""}
         ${estimateBar(est)}
         ${problems.map((x) => `<div class="warn-text">${esc(x)}</div>`).join("")}
       </div>
@@ -437,6 +442,24 @@
     return `<span class="muted small">${bits.join(" · ")}</span>`;
   }
 
+  // a projector next to the model (same folder or Hugging Face repo) most likely belongs to it
+  function suggestProjector(modelPath) {
+    const m = view.models.find((x) => x.path === modelPath);
+    const dir = (modelPath || "").split("/").slice(0, -1).join("/");
+    const near = view.projectors.filter((x) => !x.error && x.vision &&
+      (x.path.split("/").slice(0, -1).join("/") === dir || (m?.repo && x.repo === m.repo)));
+    return near.length === 1 ? near[0].path : "";
+  }
+
+  function projectorOptions(selected) {
+    let html = `<option value="" ${selected ? "" : "selected"}>None · text prefill only</option>`;
+    for (const x of view.projectors.filter((x) => !x.error)) {
+      html += `<option value="${esc(x.path)}" ${x.path === selected ? "selected" : ""}>${esc(x.file)}${x.repo ? ` · ${esc(x.repo)}` : ""} · ${fmtBytes(x.size_bytes)}${x.projector_type ? ` · ${esc(x.projector_type)}` : ""}</option>`;
+    }
+    const custom = selected && !view.projectors.some((x) => x.path === selected);
+    return html + `<option value="__custom" ${custom ? "selected" : ""}>Other path…</option>`;
+  }
+
   function buildOptions(selected) {
     const list = view.builds || [];
     const def = list.find((b) => b.default);
@@ -464,9 +487,12 @@
       swa_full: base.swa_full ?? !!model?.sliding_window,
       extra_args: base.extra_args ?? "",
       binary: base.binary ?? "",
+      mmproj: base.mmproj ?? (preset ? "" : suggestProjector(model?.path)),
     };
+    let projectorTouched = !!preset;  // follow the model's projector until the user picks one
     const customBuild = p.binary && !(view.builds || []).some((b) => b.command === p.binary);
     const isCustom = p.model_path && !view.models.some((m) => m.path === p.model_path);
+    const customProjector = p.mmproj && !view.projectors.some((x) => x.path === p.mmproj);
     presetForm.innerHTML = `
       <div class="dialog-head"><h3>${preset?.id ? "Edit preset" : "New preset"}</h3>
         <button type="button" class="icon-btn" data-close aria-label="Close"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div>
@@ -497,6 +523,12 @@
         </label>
         <label class="field check-field"><span><input type="checkbox" name="swa_full" ${p.swa_full ? "checked" : ""}> Full SWA cache (--swa-full)</span>
           <span class="muted small">Required for sliding-window models (Gemma, gpt-oss) so restored prompts can be extended.</span>
+        </label>
+        <label class="field span2">Vision projector (mmproj) for visual prefill
+          <select name="mmproj_select">${projectorOptions(p.mmproj)}</select>
+          <input name="mmproj" placeholder="/path/to/mmproj.gguf" value="${esc(p.mmproj)}" ${customProjector ? "" : "hidden"}>
+          <span class="muted small">Lets the model read PDF pages and images as pictures (tables, charts, scans). Must belong to the model, e.g. the
+            <code>mmproj-*.gguf</code> from the same Hugging Face repository. Text caches are kept when you add or change it.</span>
         </label>
         <label class="field span2">llama-server build
           <select name="build_select">${buildOptions(p.binary)}</select>
@@ -540,7 +572,7 @@
           est = await (await api("/api/presets/estimate", { method: "POST", json: {
             model_path: f.model_path.value.trim(), ctx_per_slot: ctx, slots: Number(f.slots.value) || 1,
             kv_type: f.kv_type.value, extra_args: f.extra_args.value, gpu_layers: f.gpu_layers.value.trim() || "all",
-            binary: f.binary.value.trim(),
+            binary: f.binary.value.trim(), mmproj: f.mmproj.value.trim(),
           } })).json();
         } catch { /* shown as "no estimate" */ }
         if (seq !== estimateSeq) return;
@@ -553,6 +585,13 @@
       }, 200);
     };
     presetForm.onchange = (e) => {
+      if (e.target.name === "mmproj_select") {
+        projectorTouched = true;
+        const custom = e.target.value === "__custom";
+        f.mmproj.hidden = !custom;
+        if (!custom) f.mmproj.value = e.target.value;
+        else f.mmproj.focus();
+      }
       if (e.target.name === "build_select") {
         const custom = e.target.value === "__custom";
         f.binary.hidden = !custom;
@@ -566,6 +605,10 @@
           f.model_path.value = e.target.value;
           const m = currentModel();
           if (m?.sliding_window) f.swa_full.checked = true;
+          if (!projectorTouched) {
+            f.mmproj.value = suggestProjector(m?.path);
+            f.mmproj_select.value = f.mmproj.value;
+          }
           if (m?.ctx_train && Number(f.ctx_per_slot.value) > m.ctx_train) f.ctx_per_slot.value = m.ctx_train;
         } else {
           f.model_path.focus();
@@ -586,6 +629,7 @@
         ctx_per_slot: Number(f.ctx_per_slot.value), slots: Number(f.slots.value),
         kv_type: f.kv_type.value, flash_attn: f.flash_attn.value, gpu_layers: f.gpu_layers.value.trim() || "all",
         swa_full: f.swa_full.checked, extra_args: f.extra_args.value.trim(), binary: f.binary.value.trim(),
+        mmproj: f.mmproj.value.trim(),
       };
       const err = $(".dialog-error", presetForm);
       try {
@@ -633,7 +677,7 @@
     if (view.hfFiles.error) return `<div class="response-error">${esc(view.hfFiles.error)}</div>`;
     if (!view.hfFiles.files.length) return '<div class="muted">No GGUF files in this repository.</div>';
     return `<div class="table-wrap"><table class="table"><thead><tr><th>File</th><th>Size</th><th></th></tr></thead><tbody>${
-      view.hfFiles.files.map((g) => `<tr><td>${esc(g.file)}${g.files.length > 1 ? ` <span class="muted small">(${g.files.length} parts)</span>` : ""}</td>
+      view.hfFiles.files.map((g) => `<tr><td>${esc(g.file)}${g.files.length > 1 ? ` <span class="muted small">(${g.files.length} parts)</span>` : ""}${g.projector ? ' <span class="badge" title="Vision projector: download it next to the model for visual prefill">vision projector</span>' : ""}</td>
         <td class="num">${fmtBytes(g.size)}</td>
         <td><button class="btn small" data-act="hf-download" data-file="${esc(g.file)}">Download</button></td></tr>`).join("")
     }</tbody></table></div>`;
@@ -663,6 +707,13 @@
           ${view.models.length ? `<div class="table-wrap"><table class="table">
             <thead><tr><th>Model</th><th>Quant</th><th>Size</th><th>Context</th><th>KV / 1k tokens</th><th>Location</th><th></th></tr></thead>
             <tbody>${rows}</tbody></table></div>` : '<div class="empty-card">No GGUF models found yet.</div>'}
+          ${view.projectors.length ? `<h3 class="form-section">Vision projectors</h3>
+            <p class="muted small">Add one to a preset of the matching model to enable visual prefill (PDF pages and images read as pictures).</p>
+            <div class="table-wrap"><table class="table"><thead><tr><th>Projector</th><th>Type</th><th>Size</th><th>Location</th></tr></thead><tbody>${
+            view.projectors.map((x) => `<tr><td><strong>${esc(x.file)}</strong><div class="muted small">${esc(x.name || "")}</div></td>
+              <td>${esc(x.projector_type || "–")}${x.audio ? " · audio" : ""}</td><td class="num">${fmtBytes(x.size_bytes)}</td>
+              <td><span class="muted small" title="${esc(x.path)}">${esc(x.source)}${x.repo ? ` · ${esc(x.repo)}` : ""}</span></td></tr>`).join("")
+            }</tbody></table></div>` : ""}
         </section>
         <section class="card">
           <div class="card-head"><h2>Download from Hugging Face</h2></div>
@@ -720,6 +771,12 @@
     { section: "Several documents" },
     { key: "relevance_filter", label: "Drop answers from documents that rate themselves as not covering the question", type: "checkbox",
       help: "Off (recommended): every per-document answer goes into the combined answer. On: faster with many documents, but relies on the model’s self-rating." },
+    { section: "Visual prefill" },
+    { key: "default_prefill", label: "New PDFs and images are prefilled from", type: "select",
+      options: [["text", "extracted text"], ["visual", "page images (needs a vision projector)"]],
+      help: "Each document can be switched in its ⋯ menu. Images and PDFs without a text layer always use page images." },
+    { key: "visual_dpi", label: "Page resolution (dpi)", type: "number", step: 10, min: 36, max: 400,
+      help: "Higher reads small print better but costs more tokens per page. Changing it rebuilds visual caches." },
     { section: "Ingestion" },
     { key: "auto_build_caches", label: "Build KV caches automatically (new documents, model switches, repairs)", type: "checkbox" },
     { key: "ingest_concurrency", label: "Slots used for ingestion at most", type: "number", step: 1, min: 1, help: "Always leaves at least one slot free for questions." },
@@ -745,6 +802,10 @@
       }
       if (f.type === "textarea") {
         return `<label class="field span2${changed ? " changed" : ""}">${esc(f.label)}<textarea name="${f.key}" rows="5">${esc(v)}</textarea>${help}${reset}</label>`;
+      }
+      if (f.type === "select") {
+        return `<label class="field${changed ? " changed" : ""}">${esc(f.label)}<select name="${f.key}">${f.options.map(([o, l]) =>
+          `<option value="${o}" ${o === v ? "selected" : ""}>${esc(l)}</option>`).join("")}</select>${help}${reset}</label>`;
       }
       return `<label class="field${changed ? " changed" : ""}">${esc(f.label)}<input name="${f.key}" type="number" step="${f.step}" min="${f.min ?? ""}" ${f.max ? `max="${f.max}"` : ""} value="${v}">${def}${help}${reset}</label>`;
     }).join("");

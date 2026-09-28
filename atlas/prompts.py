@@ -67,6 +67,26 @@ def document_block(name: str, part_idx: int, n_parts: int, text: str) -> str:
     return f'<document name="{_attr(name)}"{part}>\n{text}\n</document>\n\n'
 
 
+# --- visual prefill ----------------------------------------------------------------------
+# A visual document is sent as a multimodal prompt string: page images take the place of media
+# markers. The marker is random per llama-server process, so prefixes are stored with a
+# placeholder and the current marker is substituted when a prompt is sent.
+
+MEDIA_PLACEHOLDER = "<<ATLAS-MEDIA-5c1e>>"
+
+
+def defuse(text: str) -> str:
+    """Multimodal prompt strings are tokenized with special-token parsing: keep user text (names,
+    questions) from forming control tokens such as <|im_end|> or [INST]."""
+    return text.replace("<", "<\u200b").replace("[", "[\u200b")
+
+
+def visual_document_block(name: str, part_idx: int, n_parts: int, page_numbers: list[int]) -> str:
+    part = f' part="{part_idx + 1} of {n_parts}"' if n_parts > 1 else ""
+    pages = "".join(f"[Page {n}]\n{MEDIA_PLACEHOLDER}\n\n" for n in page_numbers)
+    return f'<document name="{defuse(_attr(name))}"{part}>\n{pages}</document>\n\n'
+
+
 def single_question_block(question: str) -> str:
     return (
         "Answer the question using only the document above, in the language of the question. "

@@ -60,6 +60,11 @@ class Settings(BaseSettings):
     # Build KV caches automatically: for new documents, for every document when a new model
     # configuration becomes active, and to repair missing or broken caches.
     auto_build_caches: bool = True
+    # How new PDFs and images are prefilled: "text" (extracted text) or "visual" (page images,
+    # needs a preset with a vision projector). Each document can be switched later.
+    default_prefill: Literal["text", "visual"] = "text"
+    # Resolution PDF pages are rendered at for visual prefill; more dots = more image tokens.
+    visual_dpi: int = 120
 
     # --- generation -------------------------------------------------------------------
     # Off: every per-document answer is synthesized (best recall in testing). On: each answer
@@ -151,6 +156,8 @@ class RuntimeSettings(BaseModel):
     ingest_concurrency: int = Field(ge=1, le=32)
     part_overlap_tokens: int = Field(ge=0, le=16384)
     auto_build_caches: bool
+    default_prefill: Literal["text", "visual"]
+    visual_dpi: int = Field(ge=36, le=400)
     build_updates: Literal["off", "install", "apply"]
     system_prompt: str = Field(min_length=1, max_length=20000)
     synthesis_prompt: str = Field(min_length=1, max_length=20000)

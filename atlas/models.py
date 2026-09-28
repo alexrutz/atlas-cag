@@ -25,6 +25,7 @@ KV_TYPE_BYTES = {"f16": 2.0, "bf16": 2.0, "q8_0": 34 / 32, "q5_1": 24 / 32, "q5_
 
 _SHARD = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
 _SKIP = re.compile(r"(^|[-_.])(mmproj|imatrix)", re.I)
+_PROJECTOR = re.compile(r"(^|[-_.])mmproj", re.I)
 
 
 @dataclass
@@ -156,12 +157,12 @@ def _classify(info: ModelInfo, files: list[Path]) -> None:
     info.expert_bytes_by_layer = experts or None
 
 
-def _candidates(root: Path) -> list[Path]:
+def _candidates(root: Path, projectors: bool = False) -> list[Path]:
     if not root.is_dir():
         return []
     out = []
     for p in root.rglob("*.gguf"):
-        if _SKIP.search(p.name):
+        if projectors != bool(_PROJECTOR.search(p.name)) or (not projectors and _SKIP.search(p.name)):
             continue
         m = _SHARD.search(p.name)
         if m and m.group(1) != "00001":
@@ -170,17 +171,11 @@ def _candidates(root: Path) -> list[Path]:
     return out
 
 
-def discover(models_dirs: list[Path], scan_caches: bool = True) -> list[ModelInfo]:
-    found: dict[str, ModelInfo] = {}
-
-    def add(p: Path, source: str, repo: str | None) -> None:
-        real = str(p.resolve())
-        if real not in found and p.exists():
-            found[real] = _info(p, source, repo)
-
+def _walk(models_dirs: list[Path], scan_caches: bool, projectors: bool):
+    """(path, source, repo) of the GGUF files in the models directories and download caches."""
     for d in models_dirs:
-        for p in _candidates(d):
-            add(p, "models dir", None)
+        for p in _candidates(d, projectors):
+            yield p, "models dir", None
     if scan_caches:
         hub = _hub_cache()
         if hub.is_dir():
@@ -188,11 +183,46 @@ def discover(models_dirs: list[Path], scan_caches: bool = True) -> list[ModelInf
                 repo = repo_dir.name[len("models--"):].replace("--", "/")
                 snaps = sorted((repo_dir / "snapshots").glob("*"), key=lambda p: p.stat().st_mtime, reverse=True)
                 for snap in snaps:
-                    for p in _candidates(snap):
-                        add(p, "Hugging Face cache", repo)
-        for p in _candidates(_llama_cache()):
-            add(p, "llama.cpp cache", None)
+                    for p in _candidates(snap, projectors):
+                        yield p, "Hugging Face cache", repo
+        for p in _candidates(_llama_cache(), projectors):
+            yield p, "llama.cpp cache", None
+
+
+def discover(models_dirs: list[Path], scan_caches: bool = True) -> list[ModelInfo]:
+    found: dict[str, ModelInfo] = {}
+    for p, source, repo in _walk(models_dirs, scan_caches, projectors=False):
+        real = str(p.resolve())
+        if real not in found and p.exists():
+            found[real] = _info(p, source, repo)
     return sorted(found.values(), key=lambda m: (m.name or m.file).lower())
+
+
+def describe_projector(path: Path, source: str = "custom path", repo: str | None = None) -> dict:
+    """A vision (or audio) projector for multimodal models: the file llama-server loads with --mmproj."""
+    info = {"path": str(path), "file": path.name, "source": source, "repo": repo,
+            "size_bytes": path.resolve().stat().st_size, "name": None, "projector_type": None,
+            "vision": False, "audio": False, "error": None}
+    try:
+        meta = read_metadata(str(path))
+    except (OSError, GGUFError) as e:
+        info["error"] = str(e)
+        return info
+    name = meta.get("general.name")
+    info["name"] = name if name and not re.fullmatch(r"[0-9a-f]{32,}", name) else path.stem
+    info["projector_type"] = meta.get("clip.projector_type") or meta.get("clip.vision.projector_type")
+    info["vision"] = bool(meta.get("clip.has_vision_encoder"))
+    info["audio"] = bool(meta.get("clip.has_audio_encoder"))
+    return info
+
+
+def discover_projectors(models_dirs: list[Path], scan_caches: bool = True) -> list[dict]:
+    found: dict[str, dict] = {}
+    for p, source, repo in _walk(models_dirs, scan_caches, projectors=True):
+        real = str(p.resolve())
+        if real not in found and p.exists():
+            found[real] = describe_projector(p, source, repo)
+    return sorted(found.values(), key=lambda m: m["path"])
 
 
 def describe_file(path: Path) -> ModelInfo:
@@ -219,9 +249,9 @@ def _flags(extra_args: str) -> dict:
 
 
 def estimate(model: ModelInfo | None, ctx_per_slot: int, slots: int, kv_type: str,
-             extra_args: str = "", gpu_layers: str = "all") -> dict:
-    """Rough memory estimate for a preset, in bytes: GPU (weights + KV + recurrent state),
-    system RAM (CPU-offloaded experts, input embeddings) and SSD (lazily read embeddings)."""
+             extra_args: str = "", gpu_layers: str = "all", mmproj_bytes: int = 0) -> dict:
+    """Rough memory estimate for a preset, in bytes: GPU (weights + KV + recurrent state + vision
+    projector), system RAM (CPU-offloaded experts, input embeddings) and SSD (lazily read embeddings)."""
     if model is None or not model.kv_bytes_per_token_f16:
         return {}
     flags = _flags(extra_args)
@@ -237,11 +267,15 @@ def estimate(model: ModelInfo | None, ctx_per_slot: int, slots: int, kv_type: st
     per_token = model.kv_bytes_per_token_f16 / 2 * KV_TYPE_BYTES.get(kv_type, 2.0)
     kv = per_token * ctx_per_slot * slots
     recurrent = model.recurrent_bytes_per_slot * slots
+    if mmproj_bytes and "--no-mmproj-offload" in shlex.split(extra_args or ""):
+        ram += mmproj_bytes
+        mmproj_bytes = 0
     return {
         "weights": int(gpu_weights),
         "kv_cache": int(kv),
         "recurrent": int(recurrent),
-        "total": int(gpu_weights + kv + recurrent),  # GPU
+        "projector": int(mmproj_bytes),
+        "total": int(gpu_weights + kv + recurrent + mmproj_bytes),  # GPU
         "ram": int(ram),
         "ssd": int(lazy_ssd),
         "kv_bytes_per_token": int(per_token),

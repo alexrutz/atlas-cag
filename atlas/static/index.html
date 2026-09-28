@@ -42,7 +42,14 @@
       <div class="dropzone" id="dropzone">
         <div>Drop files here to ingest into
           <select id="upload-target" aria-label="Upload into collection"></select></div>
-        <span class="muted">PDF, DOCX, HTML, Markdown, text, code · <button class="link-btn" id="paste-btn" type="button">paste text</button></span>
+        <span class="muted">PDF, DOCX, HTML, Markdown, text, code, images · <button class="link-btn" id="paste-btn" type="button">paste text</button></span>
+        <label class="upload-mode" title="How PDFs and images are prefilled. Visual prefill sends page images to a vision model (needs a preset with a vision projector); it reads tables, charts and scans that text extraction misses.">
+          PDFs &amp; images:
+          <select id="upload-mode" aria-label="Prefill mode for PDFs and images">
+            <option value="text">extracted text</option>
+            <option value="visual">page images (vision)</option>
+          </select>
+        </label>
       </div>
       <div class="library-tools">
         <input type="search" id="search" placeholder="Filter documents" autocomplete="off">
@@ -121,6 +128,7 @@
       <button class="icon-btn" aria-label="Close"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
     </form>
     <div class="dialog-meta" id="text-meta"></div>
+    <div class="page-grid" id="text-pages"></div>
     <pre class="doc-text" id="text-body"></pre>
   </dialog>
 

@@ -21,16 +21,17 @@ FINAL_RESPONSE_FIELDS = [
 
 
 class LlamaError(RuntimeError):
-    def __init__(self, message: str, status: int | None = None, kind: str | None = None):
+    def __init__(self, message: str, status: int | None = None, kind: str | None = None, data: dict | None = None):
         super().__init__(message)
         self.status = status
         self.kind = kind
+        self.data = data or {}  # the whole error object, e.g. n_prompt_tokens for context overflows
 
 
 def _error_from_response(status: int, body: bytes) -> LlamaError:
     try:
         err = json.loads(body).get("error", {})
-        return LlamaError(err.get("message") or body.decode(errors="replace"), status, err.get("type"))
+        return LlamaError(err.get("message") or body.decode(errors="replace"), status, err.get("type"), err)
     except (ValueError, AttributeError):
         return LlamaError(body.decode(errors="replace")[:500] or f"HTTP {status}", status)
 

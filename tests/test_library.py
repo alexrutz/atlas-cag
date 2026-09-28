@@ -185,8 +185,9 @@ async def test_hub_listing_groups_shards(fake_hub, tmp_path):
     url, files, _ = fake_hub
     d = Downloader(url, tmp_path / "models")
     listing = await d.list_files("org/repo")
-    assert [g["file"] for g in listing] == ["Model-Q4_K_M.gguf", "Split-Q8_0-00001-of-00002.gguf"]
-    split = listing[1]
+    assert [g["file"] for g in listing] == ["mmproj-F16.gguf", "Model-Q4_K_M.gguf", "Split-Q8_0-00001-of-00002.gguf"]
+    assert [g["projector"] for g in listing] == [True, False, False]
+    split = listing[2]
     assert split["size"] == 150_000 and len(split["files"]) == 2
     with pytest.raises(DownloadError):
         await d.list_files("org/missing")

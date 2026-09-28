@@ -57,7 +57,7 @@
 
   const STATUS_LABELS = {
     ready: "ready", queued: "queued", ingesting: "prefilling", failed: "failed", stale: "rebuilding",
-    not_built: "not built", waiting: "waiting",
+    not_built: "not built", waiting: "waiting", needs_vision: "needs vision model",
   };
 
   // ---------------------------------------------------------------- state
@@ -69,6 +69,7 @@
     selected: new Set(store.get("atlas.selected", [])),
     collapsed: new Set(store.get("atlas.collapsed", [])),
     uploadTarget: store.get("atlas.uploadTarget", ""),
+    uploadMode: store.get("atlas.uploadMode", null),  // null: the server's default prefill mode
     filter: "",
     apiKey: store.get("atlas.apiKey", ""),
     busy: false,
@@ -281,11 +282,13 @@
   // ---------------------------------------------------------------- library
 
   function docMeta(d) {
+    const pages = d.mode === "visual" ? `${d.n_pages} page${d.n_pages === 1 ? "" : "s"} · ` : "";
     switch (d.status) {
       case "ready": {
         const parts = d.n_parts > 1 ? ` · ${d.n_parts} parts` : "";
-        return `${fmtTok(d.n_tokens)} tokens${parts} · ${fmtBytes(d.kv_bytes)} KV · prefilled in ${fmtMs(d.ingest_ms)}`;
+        return `${pages}${fmtTok(d.n_tokens)} tokens${parts} · ${fmtBytes(d.kv_bytes)} KV · prefilled in ${fmtMs(d.ingest_ms)}`;
       }
+      case "needs_vision": return `${pages}add a vision projector (mmproj) to the preset, or switch to text prefill`;
       case "ingesting":
         return `prefilling ${d.progress != null ? Math.round(d.progress * 100) + "%" : "…"} · ${fmtBytes(d.size_bytes)} file`;
       case "queued": return "waiting for a free slot";
@@ -302,10 +305,10 @@
       <input type="checkbox" ${selected ? "checked" : ""} ${d.queryable ? "" : "disabled"} aria-label="Select ${esc(d.name)}">
       <div class="doc-name" title="${esc(d.name)}">${esc(d.name)}</div>
       <div class="doc-actions">
-        <button class="icon-btn" data-act="view" title="View extracted text">${ICONS.eye}</button>
+        <button class="icon-btn" data-act="view" title="${d.mode === "visual" ? "View pages" : "View extracted text"}">${ICONS.eye}</button>
         <button class="icon-btn" data-act="doc-menu" title="More actions" aria-haspopup="menu">${ICONS.more}</button>
       </div>
-      <div class="doc-meta"><span class="pill ${esc(d.status)}">${esc(STATUS_LABELS[d.status] || d.status)}</span>${esc(docMeta(d))}</div>
+      <div class="doc-meta">${d.mode === "visual" ? '<span class="pill visual" title="Prefilled from page images by the vision model">visual</span>' : ""}<span class="pill ${esc(d.status)}">${esc(STATUS_LABELS[d.status] || d.status)}</span>${esc(docMeta(d))}</div>
       ${d.status === "ingesting" ? `<div class="progress"><span style="width:${Math.round((d.progress || 0) * 100)}%"></span></div>` : ""}
       ${d.error && !["ready", "queued"].includes(d.status) ? `<div class="doc-error">${esc(d.error)}</div>` : ""}
     </li>`;
@@ -380,6 +383,12 @@
       ? `${s.documents.count} documents · ${s.documents.ready} ready · ${fmtTok(s.documents.tokens)} tokens · ${fmtBytes(s.documents.kv_bytes)} KV for this model`
       : "";
     renderUploadTargets();
+    renderUploadMode();
+  }
+
+  function renderUploadMode() {
+    const sel = $("#upload-mode");
+    if (sel && document.activeElement !== sel) sel.value = uploadMode();
   }
 
   function renderUploadTargets() {
@@ -462,8 +471,13 @@
     if (!d) return;
     const busy = ["queued", "ingesting"].includes(d.status);
     const targets = groups().filter((g) => (g.id || null) !== (d.collection_id || null));
+    const modeItems = !d.visual_capable ? [] : d.mode === "visual"
+      ? [{ label: d.has_text ? "Prefill from extracted text" : "Prefill from extracted text (no text layer)", disabled: !d.has_text || busy,
+           action: () => setMode(d, "text") }]
+      : [{ label: "Prefill from page images (vision)", disabled: busy, action: () => setMode(d, "visual") }];
     openMenu(anchor, [
-      { label: "View extracted text", action: () => openTextDialog(id) },
+      { label: d.mode === "visual" ? "View pages" : "View extracted text", action: () => openTextDialog(id) },
+      ...modeItems,
       { label: d.status === "ready" ? "Rebuild KV cache" : "Build KV cache", disabled: busy || d.status === "waiting",
         action: () => run(() => api(`/api/documents/${id}/reingest`, { method: "POST" }), `Rebuilding ${d.name}`) },
       { label: "Rename…", action: async () => {
@@ -479,6 +493,14 @@
         }
       } },
     ]);
+  }
+
+  function setMode(d, mode) {
+    const what = mode === "visual" ? "page images" : "extracted text";
+    run(() => api(`/api/documents/${d.id}`, { method: "PATCH", json: { mode } }), `${d.name}: prefilling from ${what}`);
+    if (mode === "visual" && !state.status?.engine?.vision) {
+      toast("The running model has no vision projector: add one (mmproj) to the preset in Settings → Model.", "error");
+    }
   }
 
   function collectionMenu(anchor, cid) {
@@ -564,6 +586,7 @@
     const form = new FormData();
     for (const f of files) form.append("files", f, f.name);
     if (target) form.append("collection_id", target);
+    form.append("mode", uploadMode());
     toast(`Uploading ${files.length} file${files.length > 1 ? "s" : ""} to ${collectionName(target)}…`);
     try {
       const res = await api("/api/documents", { method: "POST", body: form });
@@ -573,6 +596,7 @@
         if (r.error) toast(`${r.name}: ${r.error}`, "error");
         else if (r.duplicate) toast(`${r.document.name} is already in the library (${collectionName(r.document.collection_id)})`);
         else added++;
+        if (r.note) toast(`${r.document.name}: ${r.note}`);
       }
       if (added) toast(`Queued ${added} document${added > 1 ? "s" : ""} for ingestion`);
     } catch (e) {
@@ -580,6 +604,15 @@
     }
     refresh();
   }
+
+  const uploadMode = () => state.uploadMode || state.status?.limits?.default_prefill || "text";
+  $("#upload-mode").addEventListener("change", (e) => {
+    state.uploadMode = e.target.value;
+    store.set("atlas.uploadMode", state.uploadMode);
+    if (state.uploadMode === "visual" && state.status && !state.status.engine?.vision) {
+      toast("Visual prefill needs a preset with a vision projector (mmproj): documents wait until one runs.");
+    }
+  });
 
   let pickTarget = null;
   function pickFiles(target) {
@@ -646,22 +679,55 @@
   });
 
   // text preview
+  const pageUrls = [];
+  $("#text-dialog").addEventListener("close", () => {
+    pageUrls.splice(0).forEach((u) => URL.revokeObjectURL(u));
+    $("#text-pages").innerHTML = "";
+  });
+
+  async function loadPages(id, n, box) {
+    // fetched with the API key (an <img src> could not send it), a few at a time
+    for (let i = 1; i <= n && $("#text-dialog").open; i++) {
+      const fig = document.createElement("figure");
+      fig.innerHTML = `<div class="page-ph"><span class="spinner"></span></div><figcaption>Page ${i}</figcaption>`;
+      box.appendChild(fig);
+      try {
+        const blob = await (await api(`/api/documents/${id}/pages/${i}`)).blob();
+        const url = URL.createObjectURL(blob);
+        pageUrls.push(url);
+        fig.querySelector(".page-ph").outerHTML = `<img src="${url}" alt="Page ${i}" loading="lazy">`;
+      } catch (e) {
+        fig.querySelector(".page-ph").textContent = e.message;
+        break;
+      }
+    }
+  }
+
   async function openTextDialog(id) {
     const dlg = $("#text-dialog");
     const d = docById(id);
     $("#text-title").textContent = d?.name || "Document";
     $("#text-meta").textContent = "Loading…";
     $("#text-body").textContent = "";
+    $("#text-pages").innerHTML = "";
     dlg.showModal();
     try {
       const [detail, text] = await Promise.all([getJSON(`/api/documents/${id}`), api(`/api/documents/${id}/text`).then((r) => r.text())]);
-      const parts = detail.parts.map((p) => `part ${p.idx + 1}: ${fmtInt(p.n_tokens)} tokens, ${fmtBytes(p.kv_bytes)}, prefill ${fmtMs(p.prefill_ms)}`);
+      const visual = detail.mode === "visual";
+      const parts = detail.parts.map((p) => {
+        const what = p.visual ? (p.char_end - p.char_start > 1 ? `pages ${p.char_start + 1}–${p.char_end}` : `page ${p.char_start + 1}`) : `part ${p.idx + 1}`;
+        return `${what}: ${fmtInt(p.n_tokens)} tokens, ${fmtBytes(p.kv_bytes)}, prefill ${fmtMs(p.prefill_ms)}`;
+      });
       $("#text-meta").textContent = [
-        `${collectionName(detail.collection_id)} · ${STATUS_LABELS[detail.status] || detail.status} · ${fmtInt(detail.n_chars)} characters · ${fmtInt(detail.n_tokens)} tokens · ${fmtBytes(detail.kv_bytes)} KV`,
+        `${collectionName(detail.collection_id)} · ${STATUS_LABELS[detail.status] || detail.status} · ` +
+          (visual ? `visual prefill from ${detail.n_pages} page image${detail.n_pages === 1 ? "" : "s"}` : `${fmtInt(detail.n_chars)} characters`) +
+          ` · ${fmtInt(detail.n_tokens)} tokens · ${fmtBytes(detail.kv_bytes)} KV`,
         ...parts,
       ].join("\n");
       $("#text-meta").style.whiteSpace = "pre-line";
-      $("#text-body").textContent = text;
+      $("#text-body").textContent = visual ? (text ? `Extracted text (not used for prefill):\n\n${text}` : "") : text;
+      $("#text-body").hidden = visual && !text;
+      if (visual) loadPages(id, detail.n_pages, $("#text-pages"));
     } catch (e) {
       $("#text-meta").textContent = e.message;
     }

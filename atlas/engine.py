@@ -1,6 +1,7 @@
 """Connection to llama-server: discovery, fingerprinting, prompt assembly and low-level generation."""
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
@@ -24,6 +25,8 @@ REFS_FILE = "atlas-canary-refs.json"
 # that computes differently (or a cache it cannot really read) fails that check.
 CANARY_TEXT = "Atlas KV-cache check. Counting: one, two, three, four, five, six, seven, eight"
 CANARY_SUFFIX = ","
+# Allowance for tokens merging differently where a measured prompt meets its padding.
+MEASURE_MARGIN = 8
 
 PieceCallback = Callable[[str, str], Awaitable[None]]
 ProgressCallback = Callable[[int, int], None]
@@ -41,6 +44,8 @@ class EngineInfo:
     config_label: str | None = None
     kv_dir_ok: bool = False
     supports_thinking: bool = False
+    vision: bool = False  # llama-server has a vision projector (mmproj) loaded
+    media_marker: str | None = None
     meta: dict = field(default_factory=dict)
 
     def to_json(self) -> dict:
@@ -102,6 +107,9 @@ class Engine:
         self.restarted = False  # set by refresh() when llama-server was restarted since the last call
         # Set by the supervisor in managed mode: preset fields that define the KV-cache format.
         self.extra_ident: dict = {}
+        # Set by the supervisor: the vision projector and image options (part of visual cache variants).
+        self.vision_ident: str | None = None
+        self._pad: tuple[int, str, int] | None = None
         self.config_label: str | None = None
         self.paused: str | None = None  # reason while llama-server is being switched or is down
         self._epochs_file = settings.kv_dir / EPOCHS_FILE
@@ -132,7 +140,7 @@ class Engine:
             await self.probe_kv_dir()
 
     async def refresh(self) -> bool:
-        """Re-read server props. Returns True if the model fingerprint changed."""
+        """Re-read server props. Returns True if the fingerprint or the vision support changed."""
         try:
             props = await self.llama.props()
             meta = await self.llama.model_meta()
@@ -188,6 +196,10 @@ class Engine:
         self.info.n_ctx_slot = n_ctx
         self.info.fingerprint = fingerprint
         self.info.config_label = self.config_label or self.info.model
+        vision = bool((props.get("modalities") or {}).get("vision"))
+        vision_changed = vision != self.info.vision
+        self.info.vision = vision
+        self.info.media_marker = instance
         self.info.meta = meta
         try:
             on = await self.layout(self.settings.system_prompt, True)
@@ -196,7 +208,7 @@ class Engine:
         except (LlamaError, prompts.TemplateError) as e:
             self.info.connected = False
             self.info.error = f"chat template unusable for CAG: {e}"
-        return changed
+        return changed or vision_changed  # visual documents become (un)buildable
 
     # --- KV-format tracking --------------------------------------------------------------
     #
@@ -425,6 +437,62 @@ class Engine:
         )
         return tokens, lay
 
+    # --- visual prefill ------------------------------------------------------------------
+
+    def visual_variant(self, dpi: int) -> str | None:
+        """What a visual cache is built from: projector and page resolution. None without vision."""
+        if not self.info.vision:
+            return None
+        return f"visual:{self.vision_ident or 'external'}:{dpi}"
+
+    async def visual_prefix(self, name: str, idx: int, n_parts: int, page_numbers: list[int]) -> str:
+        lay = await self.layout(self.settings.system_prompt, self.settings.enable_thinking)
+        return lay.head + prompts.visual_document_block(name, idx, n_parts, page_numbers) + lay.mid
+
+    async def visual_suffix(self, block: str, thinking: bool) -> tuple[str, prompts.Layout]:
+        lay = await self.layout(self.settings.system_prompt, thinking)
+        return prompts.defuse(block) + lay.tail, lay
+
+    def multimodal(self, text: str, images: list[bytes]) -> dict:
+        marker = self.info.media_marker
+        if not marker:
+            raise LlamaError("llama-server did not report a media marker; is a vision projector loaded?")
+        if text.count(prompts.MEDIA_PLACEHOLDER) != len(images):
+            raise ValueError("number of page images does not match the prompt")
+        return {"prompt_string": text.replace(prompts.MEDIA_PLACEHOLDER, marker),
+                "multimodal_data": [base64.b64encode(b).decode() for b in images]}
+
+    async def _padding(self) -> tuple[str, int]:
+        """Text of more tokens than a slot holds, so a prompt carrying it is always rejected."""
+        n_ctx = self.info.n_ctx_slot
+        if self._pad and self._pad[0] == n_ctx:
+            return self._pad[1], self._pad[2]
+        text = "\n" + " x" * (n_ctx + 64)
+        n = len(await self.plain(text))
+        while n <= n_ctx:
+            text += " x" * (n_ctx - n + 64)
+            n = len(await self.plain(text))
+        self._pad = (n_ctx, text, n)
+        return text, n
+
+    async def measure(self, slot: int, text: str, images: list[bytes]) -> int:
+        """Tokens a multimodal prompt occupies, without evaluating it.
+
+        llama-server tokenizes the prompt (images become their token count) and rejects it before
+        any evaluation if it exceeds the slot; the rejection reports the count. Padding makes sure
+        it is rejected.
+        """
+        pad, n_pad = await self._padding()
+        try:
+            await self.llama.completion({"prompt": self.multimodal(text + pad, images), "n_predict": 0,
+                                         "id_slot": slot, "cache_prompt": True})
+        except LlamaError as e:
+            if e.data.get("n_prompt_tokens"):
+                return int(e.data["n_prompt_tokens"]) - n_pad + MEASURE_MARGIN
+            raise
+        raise LlamaError("llama-server accepted a prompt larger than its context: turn off context shift "
+                         "(--no-context-shift) for visual prefill")
+
     async def condense_prompt(self, history: list[tuple[str, str]], question: str) -> tuple[list[int], prompts.Layout]:
         lay = await self.layout(prompts.CONDENSE_SYSTEM_PROMPT, False)
         tokens = (
@@ -442,8 +510,10 @@ class Engine:
 
     # --- execution ---------------------------------------------------------------------
 
-    async def prefill(self, slot: int, tokens: list[int], on_progress: ProgressCallback | None = None) -> dict:
-        """Evaluate `tokens` into the slot without generating (n_predict = 0). Returns timings."""
+    async def prefill(self, slot: int, tokens: list[int] | dict, on_progress: ProgressCallback | None = None) -> dict:
+        """Evaluate `tokens` (or a multimodal prompt) into the slot without generating (n_predict = 0).
+
+        Returns the final response (timings, tokens_evaluated)."""
         payload = {"prompt": tokens, "n_predict": 0, "id_slot": slot, "cache_prompt": True, "return_progress": True}
         final: dict | None = None
         async for chunk in self.llama.completion_stream(payload):
@@ -454,18 +524,22 @@ class Engine:
                 final = chunk
         if final is None:
             raise LlamaError("prefill ended without a final response")
-        if final.get("tokens_evaluated") != len(tokens):
+        if isinstance(tokens, list) and final.get("tokens_evaluated") != len(tokens):
             raise LlamaError(f"prefill evaluated {final.get('tokens_evaluated')} of {len(tokens)} tokens")
-        return final.get("timings") or {}
+        return final
 
-    async def generate(self, slot: int, tokens: list[int], layout: prompts.Layout, answer_cap: int,
-                       on_piece: PieceCallback | None = None, temperature: float | None = None) -> GenResult:
-        """Decode an answer of up to `answer_cap` tokens (plus the thinking budget, if thinking is on)."""
+    async def generate(self, slot: int, tokens: list[int] | dict, layout: prompts.Layout, answer_cap: int,
+                       on_piece: PieceCallback | None = None, temperature: float | None = None,
+                       n_prompt: int | None = None) -> GenResult:
+        """Decode an answer of up to `answer_cap` tokens (plus the thinking budget, if thinking is on).
+
+        `tokens` may be a multimodal prompt; `n_prompt` then gives its length in tokens."""
         thinking_open = layout.thinking_open
         cap = answer_cap + (self.settings.max_thinking_tokens if thinking_open else 0)
+        prompt_len = len(tokens) if isinstance(tokens, list) else (n_prompt or 0)
         payload = {
             "prompt": tokens,
-            "n_predict": max(1, min(cap, self.info.n_ctx_slot - len(tokens) - 1)),
+            "n_predict": max(1, min(cap, self.info.n_ctx_slot - prompt_len - 1)),
             "id_slot": slot,
             "cache_prompt": True,
             "temperature": self.settings.temperature if temperature is None else temperature,
@@ -502,7 +576,7 @@ class Engine:
         return GenResult(
             answer="".join(parts["answer"]).strip(),
             reasoning="".join(parts["reasoning"]).strip(),
-            n_prompt=int(final.get("tokens_evaluated") or len(tokens)),
+            n_prompt=int(final.get("tokens_evaluated") or prompt_len),
             n_cached=int(t.get("cache_n") or 0),
             n_processed=int(t.get("prompt_n") or 0),
             prompt_ms=float(t.get("prompt_ms") or 0.0),

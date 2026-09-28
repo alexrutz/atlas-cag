@@ -214,6 +214,49 @@ Every document lives in one collection or in *Unfiled*. In the library:
 
 The query API takes `document_ids`, `collection_ids` or both.
 
+## Visual prefill
+
+Every PDF and image can be prefilled in one of two ways, and switched at any time:
+
+- **Text** (default): the extracted text is prefilled.
+- **Visual**: the pages are prefilled as images through the model's vision projector, so the model
+  reads tables, charts, forms, handwriting and scans the way they look. Images and PDFs without a
+  text layer are always prefilled visually.
+
+Choose the mode for uploads in the library (**PDFs & images:** extracted text / page images) and
+switch single documents in their ⋯ menu. The default for new uploads is under **Settings →
+Generation → Visual prefill** (`ATLAS_DEFAULT_PREFILL`), together with the page resolution
+(`ATLAS_VISUAL_DPI`, 120). The eye button shows a visual document's pages.
+
+Visual prefill needs a vision-capable model and its projector (`mmproj-*.gguf`): set it in the
+preset (**Vision projector**). Hugging Face listings mark projectors, and a projector downloaded
+next to its model is suggested automatically. For a safetensors checkpoint, convert one with
+`convert_hf_to_gguf.py <snapshot> --mmproj`. Visual documents wait ("needs vision model") while no
+projector is loaded.
+
+How it works:
+
+- PDF pages are rendered to PNG once (pypdfium2) and kept in `data/docs/<id>/pages-<dpi>/`; images
+  are normalized to PNG. The cached prefix is the template, the document header and one `[Page n]`
+  label plus image per page, sent to llama-server as a multimodal prompt.
+- llama-server identifies an image by a hash of its file bytes. A query sends the same page files
+  again with the question; after the slot restore they match the cached image tokens, so nothing
+  is encoded again. Measured with Qwen3.5-2B on CPU: a 2,216-token page takes 35 s to prefill and
+  restores in 12 ms; the answer takes 1.4 s, with only the 54 question tokens evaluated.
+- How many tokens a page takes depends on the vision encoder and the image size (about 1,100 per
+  A4 page at 120 dpi for Qwen3.5). Atlas measures instead of guessing: llama-server rejects a
+  padded prompt before evaluating anything and reports its size, so runs of pages that fit one
+  slot are found without wasted prefills. A long PDF becomes several parts ("pages 1–40", …)
+  that are answered and combined like text parts.
+- Each cache records what it was built from (`text` or `visual:<projector>:<dpi>`). Adding or
+  changing a projector keeps the text caches; only visual documents are rebuilt when the
+  projector, its image options (`--image-min-tokens`/`--image-max-tokens`) or the resolution
+  change.
+- User text in multimodal prompts (file names, questions) is defused so it cannot form control
+  tokens, since llama-server parses special tokens in multimodal prompt strings.
+
+Context shift must stay off (llama-server's default) for visual prefill.
+
 ## Conversations
 
 Questions are grouped into conversations. The bar above the answers shows the open conversation:
@@ -326,6 +369,8 @@ override the environment.
 | `ATLAS_MAX_QUESTION_TOKENS` / `_ANSWER_` / `_FINAL_` | 1024 / 1024 / 2048 | also in the UI; question and answer budgets are reserved in every slot |
 | `ATLAS_ENABLE_THINKING`, `ATLAS_MAX_THINKING_TOKENS` | false, 2048 | also in the UI |
 | `ATLAS_CONDENSE_FOLLOWUPS` | true | also in the UI; rewrite follow-ups into standalone questions |
+| `ATLAS_DEFAULT_PREFILL` | text | also in the UI; `text` or `visual` for new PDFs and images |
+| `ATLAS_VISUAL_DPI` | 120 | also in the UI; page resolution for visual prefill |
 | `ATLAS_RELEVANCE_FILTER` | false | also in the UI; see the prompt findings below |
 | `ATLAS_AUTO_BUILD_CACHES` | true | also in the UI |
 | `ATLAS_BUILD_UPDATES` | install | `off` / `install` / `apply`; also in the UI |
@@ -368,10 +413,11 @@ answer:
 | `GET /api/status` | engine, server, slots, leases, totals, limits |
 | `GET /api/collections` · `POST` · `PATCH /{id}` · `DELETE /{id}?delete_documents=` | collections |
 | `GET /api/documents` | library with the cache status for the active configuration |
-| `POST /api/documents` | multipart upload (`files`, optional `collection_id`), deduplicated by SHA-256 |
+| `POST /api/documents` | multipart upload (`files`, optional `collection_id` and `mode` = `text`/`visual`), deduplicated by SHA-256 |
 | `POST /api/documents/text` | `{name, text, collection_id?}` |
-| `GET` / `PATCH /api/documents/{id}` | details (parts) / rename or move (`{name?, collection_id?}`) |
+| `GET` / `PATCH /api/documents/{id}` | details (parts) / rename, move or switch prefill (`{name?, collection_id?, mode?}`) |
 | `GET /api/documents/{id}/text` · `POST …/reingest` · `DELETE …` | |
+| `GET /api/documents/{id}/pages/{n}` | page image (PNG) of a PDF or image |
 | `POST /api/query` | `{question, document_ids?, collection_ids?, thinking?, conversation_id?}` → Server-Sent Events |
 | `GET /api/conversations` · `POST` · `GET /{id}` (with turns) · `PATCH /{id}` · `DELETE /{id}` | conversations |
 | `GET /api/presets` · `POST` · `PUT /{id}` · `DELETE /{id}` · `POST /{id}/activate` | presets (managed mode) |
@@ -392,7 +438,7 @@ or `error`, with per-call stats), `target_delta`, `synthesis`, `delta` (channel 
 ## Development
 
 ```bash
-uv run pytest    # 82 tests, no GPU needed: a fake llama-server (tests/fake_llama.py) and its
+uv run pytest    # 88 tests, no GPU needed: a fake llama-server (tests/fake_llama.py) and its
                  # command-line wrapper let the supervisor spawn, switch and crash real processes
 uv run python scripts/benchmark.py cases.json --runs 3    # answer quality of a running instance
 ```
@@ -415,6 +461,7 @@ atlas/
                  conversations and their turns
   chunking.py    token-budgeted splitting at natural boundaries
   extract.py     PDF / DOCX / HTML / text extraction
+  pages.py       page images for visual prefill (PDF rendering, image normalization)
   static/        single-page UI (no build step, no external assets)
 ```
 
@@ -422,8 +469,10 @@ atlas/
 
 - No per-document access control or multi-tenancy. The API keys are shared secrets; SSO and RBAC
   belong in a reverse proxy or a future version.
-- No OCR: scanned PDFs are rejected with a clear error.
-- Questions are standalone; there is no conversational memory.
+- Visual prefill needs a vision model with its projector; without one, scanned PDFs and images wait.
+  DOCX, HTML and text files are always prefilled as text.
+- Follow-ups see the conversation only through the rewritten question; the documents' caches never
+  contain the conversation.
 - One llama-server at a time. Scaling out means more slots or sharding documents across servers.
 - Every query restores from disk; there is no slot affinity. This keeps results deterministic and
   works for recurrent and hybrid models, which cannot roll a slot back to a prefix.

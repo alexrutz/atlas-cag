@@ -22,6 +22,7 @@ HELP = """-m,    --model FNAME                    model path
 -c,    --ctx-size N                     size of the prompt context
 --slot-save-path PATH                   path to save slot kv cache
 -ctk,  --cache-type-k TYPE              KV cache data type for K
+-mm,   --mmproj FILE                    path to a multimodal projector file
 -t,    --threads N                      number of threads
 """
 
@@ -48,6 +49,7 @@ def main() -> None:
     ap.add_argument("--fake-version")
     ap.add_argument("--fake-fail-start", action="store_true")
     ap.add_argument("--fake-minimal-help", action="store_true")
+    ap.add_argument("--mmproj")
     ap.add_argument("--model", required=True)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, required=True)
@@ -68,6 +70,7 @@ def main() -> None:
     fake.model_path = args.model
     fake.kv_format = args.cache_type_k
     fake.semantics = args.fake_semantics
+    fake.vision = bool(args.mmproj)
     print(f"init: n_slots = {args.parallel}, n_ctx_slot = {args.ctx_size // args.parallel}", flush=True)
     uvicorn.run(fake.app, host=args.host, port=args.port, log_level="warning")
 

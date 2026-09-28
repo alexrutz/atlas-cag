@@ -81,12 +81,14 @@ class Downloader:
         groups: dict[str, dict] = {}
         for e in entries:
             name = e["path"]
-            if re.search(r"(^|/)(mmproj|imatrix)", name, re.I):
+            if re.search(r"(^|/)imatrix", name, re.I):
                 continue
             size = (e.get("lfs") or {}).get("size") or e.get("size") or 0
             m = _SHARD.search(name)
             key = _SHARD.sub("", name) if m else name
-            g = groups.setdefault(key, {"file": name, "files": [], "size": 0})
+            # vision projectors (mmproj) are downloaded next to the model for visual prefill
+            projector = bool(re.search(r"(^|[/_.-])mmproj", name, re.I))
+            g = groups.setdefault(key, {"file": name, "files": [], "size": 0, "projector": projector})
             g["files"].append(name)
             g["size"] += size
             if m and m.group(1) == "00001":
