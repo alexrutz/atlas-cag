@@ -66,7 +66,7 @@ def _env_for(exe: Path) -> dict:
     return env
 
 
-def _format_problem(exe: Path) -> str | None:
+def format_problem(exe: Path) -> str | None:
     try:
         head = exe.read_bytes()[:4096] if exe.stat().st_size < 4096 else open(exe, "rb").read(4096)
     except OSError as e:
@@ -85,7 +85,17 @@ def _format_problem(exe: Path) -> str | None:
     return "not an executable format this system can run"
 
 
-_cache: dict[tuple[str, float], BuildInfo] = {}
+_cache: dict[tuple, BuildInfo] = {}
+
+
+def _release_tag(exe: Path) -> str | None:
+    """Release packages such as ai-dock's llama.cpp-cuda put a VERSION.txt next to the binary."""
+    try:
+        text = (exe.resolve().parent / "VERSION.txt").read_text(errors="replace")[:4096]
+    except OSError:
+        return None
+    m = re.search(r"llama\.cpp version:\s*(\S+)", text)
+    return m.group(1) if m else None
 _VERSION = re.compile(r"version:\s*(\S+)\s*\(build\s+(\d+),\s*commit\s+(\w+)\)")
 _FLAG_PART = re.compile(r"\s{2,}(?![\s-])")
 _FLAG = re.compile(r"(?<![\w-])(-{1,2}[A-Za-z][\w-]*)")
@@ -98,10 +108,11 @@ def inspect(command: str) -> BuildInfo:
     if not words or not exe.is_file():
         info.problem = "file not found"
         return info
-    key = (command, exe.stat().st_mtime)
+    # the folder's mtime changes when libraries are added next to the binary
+    key = (command, exe.stat().st_mtime, exe.resolve().parent.stat().st_mtime)
     if key in _cache:
         return _cache[key]
-    info.problem = _format_problem(exe)
+    info.problem = format_problem(exe)
     if info.problem is None and not os.access(exe, os.X_OK):
         info.problem = "file is not executable (chmod +x)"
     if info.problem is None:
@@ -119,7 +130,11 @@ def inspect(command: str) -> BuildInfo:
                 res = subprocess.run([str(exe), *words[1:], "--version"], capture_output=True, text=True,
                                      timeout=30, env=env)
                 if m := _VERSION.search(res.stdout + res.stderr):
-                    info.version, info.commit = f"b{m.group(2)}", m.group(3)
+                    semver, build, info.commit = m.groups()
+                    # shallow clones (e.g. CI release packages) count only one commit
+                    info.version = f"b{build}" if int(build) > 1 else f"v{semver}"
+                if tag := _release_tag(exe):
+                    info.version = tag
                 elif res.returncode != 0:
                     info.problem = (res.stderr or res.stdout).strip().splitlines()[-1][:300] if (res.stderr or res.stdout).strip() else f"exited with code {res.returncode}"
                 help_out = subprocess.run([str(exe), *words[1:], "--help"], capture_output=True, text=True,

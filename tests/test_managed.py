@@ -42,6 +42,7 @@ async def managed(tmp_path, monkeypatch):
         models_dirs=str(models_dir),
         scan_model_caches=False,
         llama_start_timeout_s=30,
+        build_updates="off",
         max_question_tokens=256,
         max_answer_tokens=256,
         max_final_tokens=256,

@@ -22,7 +22,8 @@ from .extract import SUPPORTED_EXTENSIONS, ExtractionError, extract_text, normal
 from .ingest import Ingestor
 from .query import QueryError, QueryService
 from .store import Store
-from .supervisor import PresetConfig, Supervisor
+from .supervisor import PresetConfig, Supervisor, standard_build
+from .updater import BuildUpdater, UpdateError
 
 log = logging.getLogger("atlas.api")
 STATIC = Path(__file__).parent / "static"
@@ -80,18 +81,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         downloader = Downloader(settings.hf_endpoint, settings.model_dirs[0])
         downloader.start()
         supervisor = Supervisor(settings, store, engine, ingestor) if settings.managed else None
+        updater = BuildUpdater(settings, store, supervisor) if supervisor else None
+        if updater:
+            updater.start()
         app.state.store = store
         app.state.engine = engine
         app.state.ingestor = ingestor
         app.state.queries = QueryService(engine, store, ingestor, settings)
         app.state.downloader = downloader
         app.state.supervisor = supervisor
+        app.state.updater = updater
         monitor = asyncio.create_task(_monitor(engine, ingestor, supervisor, store), name="llama-monitor")
         try:
             yield
         finally:
             monitor.cancel()
             await asyncio.gather(monitor, return_exceptions=True)
+            if updater:
+                await updater.stop()
             if supervisor:
                 await supervisor.shutdown()
             await downloader.stop()
@@ -394,12 +401,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         found = await asyncio.to_thread(models.discover, settings.model_dirs, settings.scan_model_caches)
         return {m.path: m for m in found}
 
-    def preset_payload(p: dict, index: dict[str, models.ModelInfo], active: str | None) -> dict:
+    def preset_payload(s, p: dict, index: dict[str, models.ModelInfo], active: str | None) -> dict:
         path = Path(p["model_path"])
         info = index.get(p["model_path"])
         if info is None and path.is_file():
             info = models.describe_file(path)
-        build = builds.inspect(p.get("binary") or settings.llama_server_bin or "")
+        build = builds.inspect(p.get("binary") or standard_build(settings, s.store) or "")
         return {**p, "active": p["id"] == active, "model_found": path.is_file(),
                 "model": info.to_json() if info else None,
                 "build": build.to_json(),
@@ -413,7 +420,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         index = await model_index()
         active = s.store.get_state("active_preset")
         presets = s.store.list_presets()
-        payload = await asyncio.to_thread(lambda: [preset_payload(p, index, active) for p in presets])
+        payload = await asyncio.to_thread(lambda: [preset_payload(s, p, index, active) for p in presets])
         return {"presets": payload, "active": active}
 
     def validate_preset(body: dict) -> dict:
@@ -423,8 +430,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(422, "; ".join(x["msg"].removeprefix("Value error, ") for x in e.errors()))
 
     @api.post("/presets/estimate")
-    async def estimate_preset(body: dict):
+    async def estimate_preset(request: Request, body: dict):
         """Memory estimate for unsaved preset values (used live by the preset editor)."""
+        standard = standard_build(settings, st(request).store)
         path = Path(str(body.get("model_path", "")))
         if not path.is_file() or path.suffix != ".gguf":
             return {}
@@ -432,7 +440,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         def check() -> dict:
             info = models.describe_file(path)
             extra = str(body.get("extra_args") or "")
-            build = builds.inspect(str(body.get("binary") or "") or settings.llama_server_bin or "")
+            build = builds.inspect(str(body.get("binary") or "") or standard or "")
             return {**models.estimate(info, int(body.get("ctx_per_slot") or 0), int(body.get("slots") or 1),
                                       str(body.get("kv_type") or "f16"), extra, str(body.get("gpu_layers") or "all")),
                     "warnings": builds.preset_warnings(build, info.arch, extra), "build": build.to_json()}
@@ -486,11 +494,43 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def list_builds(request: Request):
         s = st(request)
         added = added_builds(s)
-        found = await asyncio.to_thread(builds.discover, settings.llama_server_bin, added)
-        default = builds.inspect(settings.llama_server_bin).path if settings.llama_server_bin else None
-        return {"default": settings.llama_server_bin, "builds": [
-            {**b.to_json(), "default": b.path == default and b.command == settings.llama_server_bin,
-             "added": b.command in added} for b in found]}
+        standard = standard_build(settings, s.store)
+        updates = s.updater.installed_commands() if s.updater else []
+        configured = [settings.llama_server_bin] if settings.llama_server_bin else []
+        found = await asyncio.to_thread(builds.discover, standard, [*updates, *configured, *added])
+        return {"default": standard, "configured": settings.llama_server_bin,
+                "updates": s.updater.to_json() if s.updater else None,
+                "builds": [{**b.to_json(), "default": b.command == standard, "added": b.command in added,
+                            "update": b.command in updates,
+                            "configured": b.command == settings.llama_server_bin} for b in found]}
+
+    def updater_or_409(s) -> BuildUpdater:
+        return managed(s) and s.updater
+
+    @api.get("/builds/updates")
+    async def build_updates(request: Request):
+        return updater_or_409(st(request)).to_json()
+
+    @api.post("/builds/updates/check", status_code=202)
+    async def check_build_updates(request: Request):
+        updater = updater_or_409(st(request))
+        updater.check_in_background()
+        return updater.to_json()
+
+    @api.post("/builds/updates/rollback")
+    async def roll_back_build(request: Request):
+        updater = updater_or_409(st(request))
+        try:
+            await updater.roll_back()
+        except UpdateError as e:
+            raise HTTPException(409, str(e)) from e
+        return updater.to_json()
+
+    @api.post("/builds/updates/unskip")
+    async def unskip_build(request: Request, tag: str):
+        updater = updater_or_409(st(request))
+        updater.unskip(tag)
+        return updater.to_json()
 
     @api.post("/builds")
     async def add_build(request: Request, body: BuildRequest):
@@ -516,7 +556,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {
             "mode": "managed" if s.supervisor else "external",
             "llama_url": settings.llama_url,
-            "llama_server_bin": settings.llama_server_bin,
+            "llama_server_bin": standard_build(settings, s.store) if s.supervisor else None,
             "supervisor": s.supervisor.to_json() if s.supervisor else None,
             "gpus": await models.gpu_info(),
             "ram_total": models.system_memory(),

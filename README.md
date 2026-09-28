@@ -133,8 +133,9 @@ configuration; its caches are built in the background, and the old ones are kept
 ## llama-server builds
 
 Each preset can use its own llama-server build: a newer release, or a custom build for a model
-architecture the default build does not know. Leave the preset's build empty to use
-`ATLAS_LLAMA_SERVER_BIN`. **Settings → Model → llama-server builds** lists the builds Atlas
+architecture the standard build does not know. Leave the preset's build empty to use the standard
+build, which Atlas keeps up to date (below; before the first update it is
+`ATLAS_LLAMA_SERVER_BIN`). **Settings → Model → llama-server builds** lists the builds Atlas
 finds (`~/*/llama-server`, `~/*/build*/bin/llama-server`, `/opt`, `/usr/local/bin`, `PATH`) and
 the ones you add. Commands with arguments work too (e.g. a wrapper script). Each build is checked:
 
@@ -148,6 +149,36 @@ the ones you add. Commands with arguments work too (e.g. a wrapper script). Each
 Official releases come as `llama-bNNNN-bin-ubuntu-cuda-12.8-x64.tar.gz` together with
 `cudart-llama-bNNNN-bin-ubuntu-cuda-12.8-x64.tar.gz` (the CUDA runtime). Unpack both into the same
 directory. The supervisor puts the binary's directory on `LD_LIBRARY_PATH`.
+
+### Automatic updates
+
+Atlas keeps the standard build up to date from the GitHub releases of
+[ai-dock/llama.cpp-cuda](https://github.com/ai-dock/llama.cpp-cuda/releases), which packages every
+llama.cpp release with CUDA 12.8 for x86-64 and ARM64. It checks every 6 hours (or on
+**Check now**), downloads the package for this machine, verifies its SHA-256 and unpacks it into
+`data/builds/<tag>/`. Modes (**Settings → Model → llama-server builds**, `ATLAS_BUILD_UPDATES`):
+
+- `install` (default): the new build becomes the standard build and is used from the next
+  llama-server start; the settings page offers the restart.
+- `apply`: also restarts llama-server as soon as no request is running.
+- `off`.
+
+The packages leave out the CUDA runtime (`libcudart.so.12`, `libcublas.so.12`, `libcublasLt.so.12`,
+`libnccl.so.2`). Atlas links them from other llama.cpp builds or Python CUDA wheels on this machine
+(`~/*/`, `~/*/lib/python3*/site-packages/nvidia/*/lib`, `/usr/local/cuda*`) into
+`data/builds/cuda-runtime/`, preferring one folder for all of them, and downloads NVIDIA's wheels
+from PyPI only if nothing local fits.
+
+A new build must not break a working setup:
+
+- presets whose model architecture or extra arguments only the previous build supports are
+  pinned to the previous build (shown under the update box);
+- if llama-server fails to start with a new build that has not run before, Atlas goes back to the
+  previous build, skips that release and starts again;
+- **Go back to …** does the same by hand; skipped releases can be allowed again. Releases older
+  than one you went back from are not installed automatically.
+
+The two newest updates and any build a preset uses are kept; older ones are deleted.
 
 Caches are shared between builds when they are compatible. Every start restores a canary cache
 and checks that it still predicts the same next token as when it was built. A build that stores
@@ -281,6 +312,10 @@ override the environment.
 | `ATLAS_ENABLE_THINKING`, `ATLAS_MAX_THINKING_TOKENS` | false, 2048 | also in the UI |
 | `ATLAS_RELEVANCE_FILTER` | false | also in the UI; see the prompt findings below |
 | `ATLAS_AUTO_BUILD_CACHES` | true | also in the UI |
+| `ATLAS_BUILD_UPDATES` | install | `off` / `install` / `apply`; also in the UI |
+| `ATLAS_BUILD_UPDATE_REPO` | `ai-dock/llama.cpp-cuda` | GitHub repository whose releases provide the standard build |
+| `ATLAS_BUILD_UPDATE_ASSET` | *(empty)* | part of the asset name to pick, e.g. `cuda-12.8-amd64`; empty = CUDA package for this CPU |
+| `ATLAS_BUILD_UPDATE_INTERVAL_H` | 6 | hours between checks |
 
 ## Prompt findings
 
@@ -326,6 +361,7 @@ answer:
 | `GET /api/server` · `POST /api/server/restart` · `POST /api/server/stop` | llama-server state, log, GPU |
 | `GET /api/models` · `GET /api/models/hf?repo=` · `POST /api/models/download` · `GET /api/models/downloads` | model files |
 | `GET /api/builds` · `POST /api/builds` · `DELETE /api/builds?command=` · `POST /api/presets/estimate` | llama-server builds; memory estimate and warnings for unsaved preset values |
+| `GET /api/builds/updates` · `POST /api/builds/updates/check` · `…/rollback` · `…/unskip?tag=` | automatic build updates |
 | `GET` / `PATCH /api/settings` | runtime settings (`null` resets a value) |
 | `GET /api/caches` · `DELETE /api/caches/{fingerprint}` | caches per configuration |
 | `GET /api/queries` | query log with stats |
@@ -338,7 +374,7 @@ or `error`, with per-call stats), `target_delta`, `synthesis`, `delta` (channel 
 ## Development
 
 ```bash
-uv run pytest    # 70 tests, no GPU needed: a fake llama-server (tests/fake_llama.py) and its
+uv run pytest    # 76 tests, no GPU needed: a fake llama-server (tests/fake_llama.py) and its
                  # command-line wrapper let the supervisor spawn, switch and crash real processes
 uv run python scripts/benchmark.py cases.json --runs 3    # answer quality of a running instance
 ```
@@ -352,6 +388,7 @@ atlas/
   query.py       single-document and map-reduce execution, synthesis
   models.py      GGUF discovery, metadata and tensor layout, memory estimates, GPU info
   builds.py      llama-server build discovery and checks (format, libraries, flags, architectures)
+  updater.py     standard build updates from GitHub releases, CUDA runtime, pinning, rollback
   downloads.py   Hugging Face listing and resumable downloads
   gguf.py        dependency-free GGUF header reader
   prompts.py     chat-template layout via sentinels, prompt blocks, reasoning splitter

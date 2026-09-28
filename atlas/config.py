@@ -1,6 +1,7 @@
 import os
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -23,6 +24,18 @@ class Settings(BaseSettings):
     # Atlas verifies this at startup with a probe file.
     kv_dir: Path = Path("data/kv")
     request_timeout_s: float = 3600.0
+
+    # --- llama-server build updates (managed mode) --------------------------------------
+    # Keeps the standard build (used by presets without their own build) up to date from the
+    # GitHub releases of build_update_repo. off | install: download and use it from the next
+    # llama-server start | apply: also restart llama-server as soon as it is idle.
+    build_updates: Literal["off", "install", "apply"] = "install"
+    build_update_repo: str = "ai-dock/llama.cpp-cuda"
+    # Part of the release asset's file name; empty = the CUDA package for this machine's CPU.
+    build_update_asset: str = ""
+    build_update_interval_h: float = 6.0
+    github_api: str = "https://api.github.com"
+    pypi_url: str = "https://pypi.org"  # CUDA runtime wheels, only if no local copy is found
 
     # --- storage / server -------------------------------------------------------------
     data_dir: Path = Path("data")
@@ -134,6 +147,7 @@ class RuntimeSettings(BaseModel):
     ingest_concurrency: int = Field(ge=1, le=32)
     part_overlap_tokens: int = Field(ge=0, le=16384)
     auto_build_caches: bool
+    build_updates: Literal["off", "install", "apply"]
     system_prompt: str = Field(min_length=1, max_length=20000)
     synthesis_prompt: str = Field(min_length=1, max_length=20000)
 

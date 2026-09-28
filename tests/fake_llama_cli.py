@@ -1,6 +1,7 @@
 """Command-line wrapper so the supervisor can spawn the fake llama-server like the real binary.
 
 A model file whose name contains "broken" makes it fail at startup, like a bad model would.
+--fake-version, --fake-fail-start and --fake-minimal-help imitate other builds.
 """
 
 import argparse
@@ -25,15 +26,28 @@ HELP = """-m,    --model FNAME                    model path
 """
 
 
+def _option(name: str) -> str | None:
+    return sys.argv[sys.argv.index(name) + 1] if name in sys.argv[:-1] else None
+
+
 def main() -> None:
     if "--version" in sys.argv:
-        print("version: 0.0.0-fake (build 4242, commit fake42)")
+        if version := _option("--fake-version"):
+            print(f"version: {version}-dev (build 1, commit abc1234)")
+        else:
+            print("version: 0.0.0-fake (build 4242, commit fake42)")
         return
     if "--help" in sys.argv:
-        print(HELP)
+        help_text = HELP
+        if "--fake-minimal-help" in sys.argv:  # a build without -t/--threads
+            help_text = "\n".join(line for line in HELP.splitlines() if "--threads" not in line)
+        print(help_text)
         return
     ap = argparse.ArgumentParser()
     ap.add_argument("--fake-semantics", default="default")
+    ap.add_argument("--fake-version")
+    ap.add_argument("--fake-fail-start", action="store_true")
+    ap.add_argument("--fake-minimal-help", action="store_true")
     ap.add_argument("--model", required=True)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, required=True)
@@ -44,6 +58,9 @@ def main() -> None:
     args, _unknown = ap.parse_known_args()
 
     print(f"load_model: loading model '{args.model}'", flush=True)
+    if args.fake_fail_start:
+        print("ggml_cuda_init: failed to initialize CUDA: unknown error", flush=True)
+        sys.exit(1)
     if "broken" in Path(args.model).name:
         print("llama_model_load: error loading model: invalid magic", flush=True)
         sys.exit(1)

@@ -636,3 +636,12 @@ dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; ma
   .settings-head .btn { margin-left: 0; }
   .group-actions { opacity: 1; }
 }
+
+/* build updates */
+.updates { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 12px; margin-bottom: 12px; background: var(--surface-2); }
+.updates-head { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; margin-bottom: 6px; }
+.updates-head .field { flex: 1; min-width: 240px; margin: 0; }
+.updates .kv { margin: 6px 0; }
+.updates > * + * { margin-top: 4px; }
+.notice { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 8px 10px; border-radius: var(--radius-sm);
+  background: var(--accent-soft, var(--surface)); border: 1px solid var(--border); font-size: 13px; }

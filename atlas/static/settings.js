@@ -29,6 +29,8 @@
     return `${Math.round(s / 86400)} days ago`;
   };
 
+  const tildify = (path) => String(path || "").replace(/^\/home\/[^/]+/, "~");
+
   const view = {
     tab: store.get("atlas.settingsTab", "model"),
     timer: null,
@@ -150,7 +152,7 @@
         ${p ? `<dt>Model</dt><dd>${esc(p.model_path.split("/").pop())}</dd>
         <dt>Slots</dt><dd>${p.slots} × ${fmtInt(p.ctx_per_slot)} tokens · ${esc(p.kv_type)} KV cache${status?.fingerprint ? ` · configuration <code>${esc(status.fingerprint)}</code>` : ""}</dd>` : ""}
         <dt>GPU</dt><dd>${gpu}</dd>
-        <dt>Binary</dt><dd><code>${esc(server.llama_server_bin)}</code> → <code>${esc(server.llama_url)}</code></dd>
+        <dt>Binary</dt><dd><code>${esc(tildify(sup.build || server.llama_server_bin))}</code> → <code>${esc(server.llama_url)}</code></dd>
       </dl>
       ${sup.error ? `<div class="response-error">${esc(sup.error)}</div>` : ""}
       <details class="log" ${sup.state === "failed" || sup.state === "starting" ? "open" : ""}>
@@ -167,7 +169,7 @@
     if (m && m.ctx_train && p.ctx_per_slot > m.ctx_train) problems.push(`Context per slot exceeds the model's trained context (${fmtInt(m.ctx_train)}).`);
     if (m && m.sliding_window && !p.swa_full) problems.push("This model uses sliding-window attention: enable “Full SWA cache”, or cached prompts cannot be extended.");
     problems.push(...(p.warnings || []));
-    const build = p.build ? `${p.binary ? "" : "default build · "}${p.build.label}` : "";
+    const build = p.build ? `${p.binary ? "" : "standard build · "}${p.build.label}` : "";
     return `<article class="preset${p.active ? " active" : ""}" data-id="${esc(p.id)}">
       <div class="preset-main">
         <h3>${esc(p.name)} ${p.active ? `<span class="badge ${running ? "ok" : ""}">${running ? "running" : "selected"}</span>` : ""}</h3>
@@ -186,7 +188,8 @@
   }
 
   async function renderModel(first) {
-    const [server, presets] = await Promise.all([getJSON("/api/server"), getJSON("/api/presets").catch(() => null)]);
+    const [server, presets, updates] = await Promise.all([getJSON("/api/server"), getJSON("/api/presets").catch(() => null),
+      getJSON("/api/builds/updates").catch(() => null)]);
     if (first || !view.models.length) await loadModels();
     else view.gpus = server.gpus;
     if (view.tab !== "model") return;
@@ -214,8 +217,9 @@
         </section>
         <section class="card">
           <div class="card-head"><h2>llama-server builds</h2><button class="btn subtle" data-act="refresh-builds">Check again</button></div>
-          <p class="muted">Presets can use different llama.cpp builds, e.g. a newer release or a custom build for a new model architecture.
-            Atlas finds builds in your home directory and checks that they run on this machine. Windows or ARM downloads and missing libraries are flagged.</p>
+          <p class="muted">Presets use the standard build unless they name their own, e.g. a custom build for a new model architecture.
+            Atlas keeps the standard build up to date, finds other builds in your home directory and checks that they run on this machine.</p>
+          <div id="updates-box"></div>
           <div id="builds-list"><div class="muted"><span class="spinner"></span> Checking builds…</div></div>
           <form class="inline-form" id="add-build-form">
             <input name="command" placeholder="/path/to/llama-server (or a command, e.g. /opt/qwen-fork/bin/llama-server)" required>
@@ -234,6 +238,10 @@
       });
     }
     replaceIfChanged($("#server-card"), serverCard(server));
+    replaceIfChanged($("#updates-box"), updatesBox(updates));
+    const updating = ["checking", "downloading", "installing"].includes(updates?.job?.state);
+    if (view.wasUpdating && !updating) loadBuilds();  // a new build was installed
+    view.wasUpdating = updating;
     const log = $("#server-log");
     if (log) {
       const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 20;
@@ -249,9 +257,66 @@
       : `<div class="empty-card">No presets yet. ${view.models.length
         ? "Create one to start llama-server with a model."
         : "No GGUF models found either: download one under “Model files”."}</div>`);
-    const busy = ["starting", "stopping"].includes(server.supervisor.state);
+    const busy = ["starting", "stopping"].includes(server.supervisor.state) || updating;
     schedule(() => renderModel(false), busy ? 1000 : 3000);
   }
+
+  const UPDATE_MODES = [
+    ["off", "Off"],
+    ["install", "Download and install; used from the next llama-server start"],
+    ["apply", "Install and restart llama-server when it is idle"],
+  ];
+
+  function updatesBox(u) {
+    if (!u) return "";
+    const job = u.job || {};
+    const std = u.installed.find((i) => i.tag === u.standard_tag);
+    const working = ["checking", "downloading", "installing"].includes(job.state);
+    let progress = "";
+    if (job.state === "downloading") {
+      const pct = job.total ? Math.round((100 * job.done) / job.total) : 0;
+      progress = `<div class="muted small">Downloading ${esc(job.tag)} · ${fmtBytes(job.done)} of ${fmtBytes(job.total)}</div>
+        <div class="progress wide"><span style="width:${pct}%"></span></div>`;
+    } else if (working) {
+      progress = `<div class="muted small"><span class="spinner"></span> ${job.state === "checking" ? "Checking for a new release"
+        : `Installing ${esc(job.tag || "")}${job.detail ? ` · ${esc(job.detail)}` : ""}`}…</div>`;
+    }
+    const latest = u.latest ? ` · newest release <a href="${esc(u.latest.url)}" target="_blank" rel="noopener">${esc(u.latest.tag)}</a>` : "";
+    return `<div class="updates">
+      <div class="updates-head">
+        <label class="field">Automatic updates
+          <select data-setting="build_updates">${UPDATE_MODES.map(([v, l]) => `<option value="${v}" ${u.mode === v ? "selected" : ""}>${esc(l)}</option>`).join("")}</select>
+        </label>
+        <button class="btn subtle" data-act="check-updates" ${working ? "disabled" : ""}>Check now</button>
+      </div>
+      <dl class="kv">
+        <dt>Standard build</dt><dd>${std
+          ? `<strong>${esc(u.standard_tag)}</strong> <span class="muted small">released ${esc((std.published_at || "").slice(0, 10))} · installed ${fmtAgo(std.installed_at)}</span>`
+          : `<code>${esc(tildify(u.standard) || "none")}</code> <span class="muted small">ATLAS_LLAMA_SERVER_BIN</span>`}</dd>
+        <dt>Source</dt><dd><a href="https://github.com/${esc(u.repo)}/releases" target="_blank" rel="noopener">${esc(u.repo)}</a>
+          <span class="muted small">${esc(u.asset)}</span></dd>
+        <dt>Last check</dt><dd>${fmtAgo(u.last_check)}${latest}</dd>
+      </dl>
+      ${progress}
+      ${u.restart_pending ? `<div class="notice">llama-server still runs the previous build.
+        <button class="btn small primary" data-act="restart">Restart llama-server</button> to use ${esc(u.standard_tag || "the standard build")}.</div>` : ""}
+      ${u.pinned.map((p) => `<div class="muted small">Preset “${esc(p.preset)}” stays on <code>${esc(tildify(p.build))}</code>: ${esc(p.reason)}</div>`).join("")}
+      ${u.error ? `<div class="warn-text">${esc(u.error)}</div>` : ""}
+      ${u.skipped.length ? `<div class="muted small">Skipped releases: ${u.skipped.map((t) =>
+        `${esc(t)} <button class="link-btn small" data-act="unskip-build" data-tag="${esc(t)}">allow again</button>`).join(", ")}</div>` : ""}
+      ${u.can_roll_back ? `<button class="link-btn small" data-act="rollback-build">Go back to ${esc(u.previous || "the configured build")} and skip ${esc(u.standard_tag)}</button>` : ""}
+    </div>`;
+  }
+
+  body.addEventListener("change", async (e) => {
+    const key = e.target.dataset?.setting;
+    if (!key) return;
+    try {
+      await api("/api/settings", { method: "PATCH", json: { [key]: e.target.value } });
+      toast("Saved");
+      renderModel(false);
+    } catch (err) { toast(err.message, "error"); }
+  });
 
   async function loadBuilds() {
     try {
@@ -262,8 +327,8 @@
     el.innerHTML = view.builds.length ? `<div class="table-wrap"><table class="table">
       <thead><tr><th>Build</th><th>Location</th><th>Status</th><th></th></tr></thead><tbody>${
       view.builds.map((b) => `<tr>
-        <td><strong>${esc(b.version || "–")}</strong>${b.default ? ' <span class="badge ok">default</span>' : ""}</td>
-        <td><code title="${esc(b.command)}">${esc(b.command.replace(/^\/home\/[^/]+/, "~"))}</code></td>
+        <td><strong>${esc(b.version || "–")}</strong>${b.default ? ' <span class="badge ok">standard</span>' : ""}${b.update ? ' <span class="badge">auto-updated</span>' : ""}${b.configured ? ' <span class="badge" title="ATLAS_LLAMA_SERVER_BIN">configured</span>' : ""}</td>
+        <td><code title="${esc(b.command)}">${esc(tildify(b.command))}</code></td>
         <td>${b.runnable ? `<span class="ok-text">runs here</span> <span class="muted small">${b.flags} flags</span>`
                           : `<span class="warn-text">${esc(b.problem)}</span>`}</td>
         <td>${b.added ? `<button class="btn subtle small" data-act="remove-build" data-command="${esc(b.command)}">Remove</button>` : ""}</td>
@@ -320,6 +385,16 @@
         $("#builds-list").innerHTML = '<div class="muted"><span class="spinner"></span> Checking builds…</div>';
         await loadBuilds();
         return;
+      } else if (act === "check-updates") {
+        await api("/api/builds/updates/check", { method: "POST" });
+        setTimeout(() => renderModel(false), 300);
+        return;
+      } else if (act === "rollback-build") {
+        if (!(await A.confirmAction("Go back to the previous build", "Presets without their own build use the previous build again from the next llama-server start. This release is skipped by automatic updates until you allow it again.", "Go back"))) return;
+        await api("/api/builds/updates/rollback", { method: "POST" });
+        await loadBuilds();
+      } else if (act === "unskip-build") {
+        await api(`/api/builds/updates/unskip?tag=${encodeURIComponent(btn.dataset.tag)}`, { method: "POST" });
       } else if (act === "remove-build") {
         await api(`/api/builds?command=${encodeURIComponent(btn.dataset.command)}`, { method: "DELETE" });
         await loadBuilds();
@@ -373,7 +448,7 @@
   function buildOptions(selected) {
     const list = view.builds || [];
     const def = list.find((b) => b.default);
-    let html = `<option value="" ${selected ? "" : "selected"}>Default${def ? ` · ${esc(def.label)}` : ""}</option>`;
+    let html = `<option value="" ${selected ? "" : "selected"}>Standard build${def ? ` · ${esc(def.label)}` : ""} (kept up to date)</option>`;
     for (const b of list.filter((x) => !x.default)) {
       html += `<option value="${esc(b.command)}" ${b.command === selected ? "selected" : ""} ${b.runnable ? "" : "disabled"}>${esc(b.label)}${b.runnable ? "" : ` — ${esc(b.problem)}`}</option>`;
     }

@@ -9,6 +9,7 @@ import shutil
 import signal
 import time
 from collections import deque
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -45,7 +46,7 @@ class PresetConfig(BaseModel):
     gpu_layers: str = "all"
     swa_full: bool = False
     extra_args: str = ""
-    binary: str = ""  # llama-server command for this preset; empty = ATLAS_LLAMA_SERVER_BIN
+    binary: str = ""  # llama-server command for this preset; empty = the standard build
 
     @field_validator("binary")
     @classmethod
@@ -96,6 +97,16 @@ class PresetConfig(BaseModel):
         return self
 
 
+def standard_build(settings: Settings, store: Store) -> str | None:
+    """The build for presets that name none: the installed update, else ATLAS_LLAMA_SERVER_BIN."""
+    updates = store.get_state("build_updates") or {}
+    tag = updates.get("standard")
+    path = ((updates.get("installed") or {}).get(tag) or {}).get("path") if tag else None
+    if path and Path(path).is_file():
+        return path
+    return settings.llama_server_bin
+
+
 def preset_ident(preset: dict) -> dict:
     """Preset fields that change the KV-cache format and therefore the cache fingerprint."""
     return {"kv_type": preset["kv_type"], "flash_attn": preset["flash_attn"], "swa_full": bool(preset["swa_full"])}
@@ -127,6 +138,10 @@ class SupervisorError(RuntimeError):
     pass
 
 
+class StartError(SupervisorError):
+    """llama-server itself did not come up (as opposed to a failed check afterwards)."""
+
+
 class Supervisor:
     def __init__(self, settings: Settings, store: Store, engine: "Engine", ingestor: "Ingestor"):
         self.settings = settings
@@ -146,6 +161,10 @@ class Supervisor:
         self._first_activation = True
         self._pid_file = settings.data_dir / "llama-server.pid"
         self.gpu_baseline: int | None = None  # GPU memory used by other programs, measured before starting
+        self.running_command: str | None = None  # llama-server build of the running process
+        # set by the build updater: called after a successful start, and after a failed one (True = retry)
+        self.on_started: Callable[[dict, str], None] | None = None
+        self.on_start_failed: Callable[[dict, str, str], Awaitable[bool]] | None = None
         # llama-server's own output, kept across restarts in data/logs/llama-server.log
         self._llama_log = logging.getLogger("atlas.llama-server")
         self._llama_log.propagate = False
@@ -162,8 +181,11 @@ class Supervisor:
     def busy(self) -> bool:
         return self._lock.locked()
 
+    def command_for(self, preset: dict | None) -> str:
+        return (preset or {}).get("binary") or standard_build(self.settings, self.store) or ""
+
     def binary_for(self, preset: dict | None) -> list[str]:
-        return builds.command_words((preset or {}).get("binary") or self.settings.llama_server_bin or "")
+        return builds.command_words(self.command_for(preset))
 
     def to_json(self) -> dict:
         return {
@@ -173,6 +195,7 @@ class Supervisor:
             "pid": self.proc.pid if self.proc else None,
             "started_at": self.started_at,
             "gpu_baseline": self.gpu_baseline,
+            "build": self.running_command,
             "command": shlex.join(build_command(self.binary_for(self.preset), self.preset, self.port,
                                                 self.settings.kv_dir)) if self.preset else None,
             "log": list(self.log)[-200:],
@@ -204,6 +227,7 @@ class Supervisor:
 
     async def activate(self, preset: dict) -> None:
         """Switch llama-server to `preset`: drain work, restart, re-validate caches."""
+        retry = False
         async with self._lock:
             self.engine.pause(f"Starting {preset['name']}…")
             try:
@@ -228,6 +252,8 @@ class Supervisor:
                 self.error = None
                 self.engine.resume()
                 log.info("llama-server running with preset %r (pid %s)", preset["name"], self.proc and self.proc.pid)
+                if self.on_started:
+                    self.on_started(preset, self.running_command)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -236,6 +262,10 @@ class Supervisor:
                 log.error("could not start preset %r: %s", preset["name"], self.error)
                 await self._stop_process(state="failed")
                 self.engine.pause(f"llama-server failed to start: {self.error}")
+                if isinstance(e, StartError) and self.on_start_failed:
+                    retry = await self.on_start_failed(preset, self.command_for(preset), self.error)
+        if retry:
+            await self.activate(self.store.get_preset(preset["id"]) or preset)
 
     async def stop(self) -> None:
         async with self._lock:
@@ -267,9 +297,11 @@ class Supervisor:
             log.warning("switching llama-server with %d request(s) still running", len(pool.leases))
 
     async def _start_process(self) -> None:
-        binary = self.binary_for(self.preset)
+        command = self.command_for(self.preset)
+        binary = builds.command_words(command)
         if not binary:
             raise SupervisorError("no llama-server build: set ATLAS_LLAMA_SERVER_BIN or choose a build in the preset")
+        self.running_command = command
         cmd = build_command(binary, self.preset, self.port, self.settings.kv_dir)
         exe = shutil.which(cmd[0]) or cmd[0]
         env = os.environ.copy()
@@ -286,7 +318,7 @@ class Supervisor:
                 start_new_session=True,
             )
         except OSError as e:
-            raise SupervisorError(f"cannot run {cmd[0]}: {e}") from e
+            raise StartError(f"cannot run {cmd[0]}: {e}") from e
         self.proc = proc
         self._pid_file.write_text(str(proc.pid))
         self._spawn(self._pump(proc))
@@ -295,11 +327,11 @@ class Supervisor:
         while True:
             if proc.returncode is not None:
                 tail = "\n".join(list(self.log)[-8:])
-                raise SupervisorError(f"llama-server exited with code {proc.returncode}:\n{tail}")
+                raise StartError(f"llama-server exited with code {proc.returncode}:\n{tail}")
             if await self.engine.llama.health():
                 break
             if time.time() > deadline:
-                raise SupervisorError(f"llama-server did not become ready within "
+                raise StartError(f"llama-server did not become ready within "
                                       f"{self.settings.llama_start_timeout_s:.0f}s")
             await asyncio.sleep(0.5)
         self.state = "running"
