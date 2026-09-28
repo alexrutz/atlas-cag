@@ -9,6 +9,7 @@ import struct
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import sampling
 from .gguf import GGUFError, read_metadata, read_tensor_sizes
 
 # llama_ftype values (general.file_type) -> common quantization names
@@ -51,6 +52,7 @@ class ModelInfo:
     expert_bytes_by_layer: dict[int, int] | None = None
     lazy_bytes: int = 0  # per-layer / n-gram embeddings: can stay on disk with --lazy-mode on
     input_bytes: int = 0  # token embeddings: always kept in system RAM by llama.cpp
+    sampling: dict | None = None  # recommended sampling from general.sampling.* (see sampling.py)
     error: str | None = None
 
     def to_json(self) -> dict:
@@ -80,6 +82,7 @@ def _describe(info: ModelInfo) -> None:
     info.name = name if name and not re.fullmatch(r"[0-9a-f]{32,}", name) else _SHARD.sub("", Path(info.file).stem)
     info.size_label = meta.get("general.size_label")
     info.quant = FILE_TYPES.get(meta.get("general.file_type"), None)
+    info.sampling = sampling.from_model(meta)
 
     def a(key, default=None):
         return meta.get(f"{arch}.{key}", default)

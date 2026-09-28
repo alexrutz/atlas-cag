@@ -25,7 +25,8 @@ from .extract import SUPPORTED_EXTENSIONS, ExtractionError, extract_text, normal
 from .ingest import Ingestor
 from .query import QueryError, QueryService
 from .store import Store
-from .supervisor import PresetConfig, Supervisor, standard_build
+from . import sampling
+from .supervisor import PresetConfig, Supervisor, preset_sampling, standard_build
 from .updater import BuildUpdater, UpdateError
 
 log = logging.getLogger("atlas.api")
@@ -485,7 +486,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not isinstance(body, dict) or not set(body) <= set(RUNTIME_FIELDS):
             unknown = sorted(set(body) - set(RUNTIME_FIELDS)) if isinstance(body, dict) else body
             raise HTTPException(422, f"unknown settings: {unknown}")
-        overrides = s.store.get_state("settings") or {}
+        overrides = {k: v for k, v in (s.store.get_state("settings") or {}).items() if k in RUNTIME_FIELDS}
         for key, value in body.items():
             if value is None:
                 overrides.pop(key, None)  # back to the default
@@ -521,11 +522,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         build = builds.inspect(p.get("binary") or standard_build(settings, s.store) or "")
         mmproj = Path(p.get("mmproj") or "")
         mmproj_bytes = mmproj.stat().st_size if p.get("mmproj") and mmproj.is_file() else 0
+        effective, source, missing = sampling.resolve(p.get("sampling"), (info.sampling or {}) if info else {})
+        warnings = builds.preset_warnings(build, info.arch if info else None, p.get("extra_args", ""))
+        if missing:
+            warnings.append(sampling.describe_missing(missing).capitalize())
         return {**p, "active": p["id"] == active, "model_found": path.is_file(),
+                "sampling_model": (info.sampling or {}) if info else {}, "sampling_effective": effective,
+                "sampling_source": source, "sampling_missing": missing,
                 "mmproj_found": not p.get("mmproj") or mmproj.is_file(),
                 "model": info.to_json() if info else None,
                 "build": build.to_json(),
-                "warnings": builds.preset_warnings(build, info.arch if info else None, p.get("extra_args", "")),
+                "warnings": warnings,
                 "estimate": models.estimate(info, p["ctx_per_slot"], p["slots"], p["kv_type"],
                                             p.get("extra_args", ""), p.get("gpu_layers", "all"), mmproj_bytes)}
 
@@ -538,11 +545,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         payload = await asyncio.to_thread(lambda: [preset_payload(s, p, index, active) for p in presets])
         return {"presets": payload, "active": active}
 
-    def validate_preset(body: dict) -> dict:
+    def validate_preset(body: dict, complete: bool = True) -> dict:
+        """Check a preset; `complete` also requires every core sampling parameter to be known."""
         try:
-            return PresetConfig(**body).model_dump()
+            data = PresetConfig(**body).model_dump()
         except ValidationError as e:
-            raise HTTPException(422, "; ".join(x["msg"].removeprefix("Value error, ") for x in e.errors()))
+            raise HTTPException(422, "; ".join(
+                (f"{x['loc'][-1]}: " if x["loc"] and x["loc"][0] == "sampling" else "")
+                + x["msg"].removeprefix("Value error, ") for x in e.errors()))
+        if complete:
+            _, _, missing = preset_sampling(data)
+            if missing:
+                raise HTTPException(422, sampling.describe_missing(missing))
+        return data
 
     @api.post("/presets/estimate")
     async def estimate_preset(request: Request, body: dict):
@@ -558,7 +573,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             build = builds.inspect(str(body.get("binary") or "") or standard or "")
             mmproj = Path(str(body.get("mmproj") or ""))
             mmproj_bytes = mmproj.stat().st_size if body.get("mmproj") and mmproj.is_file() else 0
-            return {**models.estimate(info, int(body.get("ctx_per_slot") or 0), int(body.get("slots") or 1),
+            return {"sampling_model": info.sampling or {},
+                    **models.estimate(info, int(body.get("ctx_per_slot") or 0), int(body.get("slots") or 1),
                                       str(body.get("kv_type") or "f16"), extra, str(body.get("gpu_layers") or "all"),
                                       mmproj_bytes),
                     "warnings": builds.preset_warnings(build, info.arch, extra), "build": build.to_json()}
@@ -578,11 +594,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def update_preset(request: Request, preset_id: str):
         s = st(request)
         managed(s)
-        if not s.store.get_preset(preset_id):
+        old = s.store.get_preset(preset_id)
+        if not old:
             raise HTTPException(404, "preset not found")
-        s.store.save_preset(preset_id, validate_preset(await request.json()))
-        active = s.store.get_state("active_preset") == preset_id
-        return {**s.store.get_preset(preset_id), "restart_required": active}
+        data = validate_preset(await request.json())
+        s.store.save_preset(preset_id, data)
+        running = s.supervisor.preset if s.supervisor else None
+        restart = False
+        if running and running.get("id") == preset_id:
+            # sampling and the name take effect at once; everything else needs a restart
+            s.supervisor.preset = {**running, "sampling": data["sampling"], "name": data["name"]}
+            s.supervisor.apply_sampling(s.supervisor.preset)
+            same = {"sampling", "name", "id"}
+            restart = any(running.get(k) != v for k, v in data.items() if k not in same)
+        return {**s.store.get_preset(preset_id), "restart_required": restart}
 
     @api.delete("/presets/{preset_id}")
     async def delete_preset(request: Request, preset_id: str):
@@ -599,7 +624,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         preset = s.store.get_preset(preset_id)
         if not preset:
             raise HTTPException(404, "preset not found")
-        validate_preset({k: preset[k] for k in PresetConfig.model_fields if k in preset})
+        validate_preset({k: preset[k] for k in PresetConfig.model_fields if k in preset}, complete=False)
         sup._spawn(sup.activate(preset))
         return {"activating": preset_id}
 

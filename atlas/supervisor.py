@@ -15,8 +15,9 @@ from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from . import builds
+from . import builds, models, sampling
 from .config import Settings
+from .sampling import SamplingConfig
 from .store import Store
 
 if TYPE_CHECKING:
@@ -51,6 +52,7 @@ class PresetConfig(BaseModel):
     extra_args: str = ""
     binary: str = ""  # llama-server command for this preset; empty = the standard build
     mmproj: str = ""  # vision projector (.gguf) for visual prefill; empty = text only
+    sampling: SamplingConfig = Field(default_factory=SamplingConfig)  # unset values: from the model file
 
     @field_validator("mmproj")
     @classmethod
@@ -124,6 +126,13 @@ def standard_build(settings: Settings, store: Store) -> str | None:
 def preset_ident(preset: dict) -> dict:
     """Preset fields that change the KV-cache format and therefore the cache fingerprint."""
     return {"kv_type": preset["kv_type"], "flash_attn": preset["flash_attn"], "swa_full": bool(preset["swa_full"])}
+
+
+def preset_sampling(preset: dict) -> tuple[dict, dict, list[str]]:
+    """The preset's effective sampling, where each value came from, and required ones missing."""
+    path = Path(preset.get("model_path") or "")
+    model = (models.describe_file(path).sampling or {}) if path.is_file() else {}
+    return sampling.resolve(preset.get("sampling"), model)
 
 
 def preset_label(preset: dict) -> str:
@@ -210,6 +219,14 @@ class Supervisor:
     def busy(self) -> bool:
         return self._lock.locked()
 
+    def apply_sampling(self, preset: dict) -> None:
+        """Sampling is sent with every request, so changing it needs no restart."""
+        effective, _, missing = preset_sampling(preset)
+        self.engine.sampling = effective
+        if missing:
+            log.warning("preset %r: %s; llama-server's defaults are used meanwhile", preset.get("name"),
+                        sampling.describe_missing(missing))
+
     def command_for(self, preset: dict | None) -> str:
         return (preset or {}).get("binary") or standard_build(self.settings, self.store) or ""
 
@@ -267,6 +284,7 @@ class Supervisor:
                 self.store.set_state("active_preset", preset["id"])
                 self.engine.extra_ident = preset_ident(preset)
                 self.engine.vision_ident = vision_ident(preset)
+                self.apply_sampling(preset)
                 self.engine.config_label = preset_label(preset)
                 await self._start_process()
                 await self.engine.connect()

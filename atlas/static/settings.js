@@ -17,6 +17,17 @@
     ["q4_0", "q4_0 · quarter memory, some quality loss"],
     ["q5_1", "q5_1"], ["q5_0", "q5_0"], ["q4_1", "q4_1"], ["bf16", "bf16"],
   ];
+  // mirrors atlas/sampling.py; REQUIRED ones must come from the model file or the preset
+  const SAMPLING = [
+    { key: "temperature", label: "Temperature", short: "temp", step: 0.05, min: 0, max: 5 },
+    { key: "top_k", label: "Top-k", short: "top-k", step: 1, min: -1, max: 10000, off: (v) => v <= 0 },
+    { key: "top_p", label: "Top-p", short: "top-p", step: 0.01, min: 0, max: 1, off: (v) => v >= 1 },
+    { key: "min_p", label: "Min-p", short: "min-p", step: 0.01, min: 0, max: 1, off: (v) => v <= 0 },
+    { key: "repeat_penalty", label: "Repeat penalty", short: "repeat", step: 0.05, min: 0, max: 5, optional: true, off: (v) => v === 1 },
+    { key: "presence_penalty", label: "Presence penalty", short: "presence", step: 0.1, min: -2, max: 2, optional: true, off: (v) => v === 0 },
+  ];
+  const fmtSample = (f, v) => (f.off && f.off(v) ? "off" : String(v));
+
   const CTX_STEPS = [8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576];
   const GiB = 2 ** 30;
   const fmtGB = (b) => `${(b / GiB).toFixed(b >= 10 * GiB ? 1 : 2)} GB`;
@@ -173,6 +184,7 @@
           · ${p.slots} slot${p.slots > 1 ? "s" : ""} × ${fmtTok(p.ctx_per_slot)} context · ${esc(p.kv_type)} KV</div>
         ${build ? `<div class="muted small">llama-server ${esc(build)}</div>` : ""}
         ${p.mmproj ? `<div class="muted small">vision: ${esc(p.mmproj.split("/").pop())} · visual prefill available</div>` : ""}
+        ${samplingSummary(p)}
         ${estimateBar(est)}
         ${problems.map((x) => `<div class="warn-text">${esc(x)}</div>`).join("")}
       </div>
@@ -182,6 +194,14 @@
         <button class="icon-btn" data-act="preset-menu" title="More" aria-haspopup="menu"><svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.3"/><circle cx="12" cy="12" r="1.3"/><circle cx="19" cy="12" r="1.3"/></svg></button>
       </div>
     </article>`;
+  }
+
+  function samplingSummary(p) {
+    const eff = p.sampling_effective || {}, src = p.sampling_source || {};
+    const bits = SAMPLING.filter((f) => eff[f.key] !== undefined && !(f.optional && f.off(eff[f.key]))).map((f) =>
+      `<span class="${src[f.key] === "preset" ? "own" : ""}" title="${src[f.key] === "preset" ? "set in the preset" : "from the model file"}">${f.short} ${esc(fmtSample(f, eff[f.key]))}</span>`);
+    bits.push(...(p.sampling_missing || []).map((k) => `<span class="missing">${esc(SAMPLING.find((f) => f.key === k).short)} ?</span>`));
+    return `<div class="muted small sampling-line">sampling: ${bits.join(" · ")}</div>`;
   }
 
   async function renderModel(first) {
@@ -488,7 +508,9 @@
       extra_args: base.extra_args ?? "",
       binary: base.binary ?? "",
       mmproj: base.mmproj ?? (preset ? "" : suggestProjector(model?.path)),
+      sampling: base.sampling || {},
     };
+    let samplingModel = null;  // the model file's recommendations, from the estimate endpoint
     let projectorTouched = !!preset;  // follow the model's projector until the user picks one
     const customBuild = p.binary && !(view.builds || []).some((b) => b.command === p.binary);
     const isCustom = p.model_path && !view.models.some((m) => m.path === p.model_path);
@@ -535,6 +557,17 @@
           <input name="binary" placeholder="/path/to/llama-server" value="${esc(p.binary)}" ${customBuild ? "" : "hidden"}>
           <span class="muted small">Use a newer or custom build for models the default build does not support.</span>
         </label>
+        <fieldset class="span2 sampling-box">
+          <legend>Sampling</legend>
+          <p class="muted small sampling-note">Reading the model file…</p>
+          <div class="sampling-grid">${SAMPLING.map((f) => {
+            const v = p.sampling[f.key];
+            return `<label class="field" data-sampling="${f.key}">${esc(f.label)}
+              <input name="s_${f.key}" type="number" step="${f.step}" min="${f.min}" max="${f.max}" value="${v ?? ""}">
+              <span class="small sampling-src"></span></label>`;
+          }).join("")}</div>
+          <button type="button" class="link-btn small" data-act="sampling-reset">Use the model file's values</button>
+        </fieldset>
         <label class="field span2">Extra llama-server arguments
           <input name="extra_args" value="${esc(p.extra_args)}" placeholder="--threads 8 --batch-size 4096">
           <span class="muted small">Advanced. Flags Atlas controls (port, slots, context, KV cache, slot path…) are rejected.</span>
@@ -550,6 +583,38 @@
 
     const f = presetForm.elements;
     const currentModel = () => view.models.find((m) => m.path === f.model_path.value);
+    const ownSampling = () => Object.fromEntries(SAMPLING.map((x) => {
+      const raw = f[`s_${x.key}`].value.trim();
+      return [x.key, raw === "" ? null : Number(raw)];
+    }));
+    const missingSampling = () => {
+      if (samplingModel === null) return [];  // still reading the model file: the server checks
+      const own = ownSampling();
+      return SAMPLING.filter((x) => !x.optional && own[x.key] === null && (samplingModel || {})[x.key] === undefined);
+    };
+    // placeholders show the model file's values; fields it does not cover must be filled in
+    const renderSampling = () => {
+      const model = samplingModel || {};
+      const own = ownSampling();
+      const known = SAMPLING.filter((x) => model[x.key] !== undefined);
+      $(".sampling-note", presetForm).innerHTML = samplingModel === null ? "Reading the model file…"
+        : known.length
+          ? `Recommended by the model file: ${known.map((x) => `${x.short} ${esc(fmtSample(x, model[x.key]))}`).join(" · ")}.
+             Empty fields use these values; enter a value to override one for this preset.`
+          : `<span class="warn-text">The model file recommends no sampling parameters. Enter them, e.g. from the model card.</span>`;
+      for (const x of SAMPLING) {
+        const input = f[`s_${x.key}`];
+        const label = $(`[data-sampling="${x.key}"]`, presetForm);
+        const needed = !x.optional && own[x.key] === null && model[x.key] === undefined && samplingModel !== null;
+        input.placeholder = model[x.key] !== undefined ? String(model[x.key]) : x.optional ? "off" : "";
+        input.required = needed;
+        label.classList.toggle("needs", needed);
+        $(".sampling-src", label).textContent = own[x.key] !== null
+          ? (model[x.key] !== undefined ? `preset (model file: ${fmtSample(x, model[x.key])})` : "preset")
+          : model[x.key] !== undefined ? "from the model file"
+          : needed ? "required: not in the model file" : x.optional ? "off" : "";
+      }
+    };
     const update = () => {
       const m = currentModel();
       $(".model-info", presetForm).innerHTML = modelSummary(m);
@@ -576,6 +641,8 @@
           } })).json();
         } catch { /* shown as "no estimate" */ }
         if (seq !== estimateSeq) return;
+        samplingModel = est?.sampling_model || {};
+        renderSampling();
         $(".estimate-panel", presetForm).innerHTML = `
           ${(est?.warnings || []).map((w) => `<div class="warn-text strong">${esc(w)}</div>`).join("")}
           <h4>Estimated memory</h4>${estimateBar(est)}
@@ -599,6 +666,8 @@
         else f.binary.focus();
       }
       if (e.target.name === "model_select") {
+        samplingModel = null;  // until the new model's recommendations are read
+        renderSampling();
         const custom = e.target.value === "__custom";
         f.model_path.hidden = !custom;
         if (!custom) {
@@ -616,10 +685,17 @@
       }
       update();
     };
-    presetForm.oninput = update;
+    presetForm.oninput = (e) => {
+      if (e.target.name?.startsWith("s_")) return renderSampling();  // no new estimate needed
+      update();
+    };
     presetForm.onclick = (e) => {
       const b = e.target.closest("[data-ctx]");
       if (b) { f.ctx_per_slot.value = b.dataset.ctx; update(); }
+      if (e.target.closest("[data-act='sampling-reset']")) {
+        for (const x of SAMPLING) f[`s_${x.key}`].value = "";
+        renderSampling();
+      }
       if (e.target.closest("[data-close]")) presetDialog.close();
     };
     presetForm.onsubmit = async (e) => {
@@ -629,9 +705,16 @@
         ctx_per_slot: Number(f.ctx_per_slot.value), slots: Number(f.slots.value),
         kv_type: f.kv_type.value, flash_attn: f.flash_attn.value, gpu_layers: f.gpu_layers.value.trim() || "all",
         swa_full: f.swa_full.checked, extra_args: f.extra_args.value.trim(), binary: f.binary.value.trim(),
-        mmproj: f.mmproj.value.trim(),
+        mmproj: f.mmproj.value.trim(), sampling: ownSampling(),
       };
       const err = $(".dialog-error", presetForm);
+      const missing = missingSampling();
+      if (missing.length) {
+        err.textContent = `The model file does not recommend ${missing.map((x) => x.label.toLowerCase()).join(", ")}: enter ${missing.length > 1 ? "values" : "a value"} under Sampling.`;
+        err.hidden = false;
+        f[`s_${missing[0].key}`].focus();
+        return;
+      }
       try {
         const res = preset?.id
           ? await api(`/api/presets/${preset.id}`, { method: "PUT", json: payload })
@@ -652,6 +735,7 @@
         err.hidden = false;
       }
     };
+    renderSampling();
     update();
     presetDialog.showModal();
   }
@@ -756,9 +840,7 @@
   // ---------------------------------------------------------------- generation tab
 
   const FIELDS = [
-    { section: "Answers" },
-    { key: "temperature", label: "Temperature", type: "number", step: 0.05, min: 0, max: 2, help: "Lower is more deterministic. 0.1–0.3 suits document Q&A." },
-    { key: "top_p", label: "Top-p", type: "number", step: 0.01, min: 0.01, max: 1 },
+    { section: "Answers", note: "Sampling (temperature, top-p, top-k, min-p) belongs to each preset: Settings → Model → Edit preset." },
     { key: "max_answer_tokens", label: "Max tokens per document answer", type: "number", step: 64, min: 64, help: "Reserved in every slot, so it also limits how large a document part can be." },
     { key: "max_final_tokens", label: "Max tokens of the combined answer", type: "number", step: 64, min: 64 },
     { key: "max_question_tokens", label: "Max question length (tokens)", type: "number", step: 64, min: 64 },
@@ -791,7 +873,7 @@
     const s = await getJSON("/api/settings");
     if (view.tab !== "generation") return;
     const fields = FIELDS.map((f) => {
-      if (f.section) return `<h3 class="form-section">${esc(f.section)}</h3>`;
+      if (f.section) return `<h3 class="form-section">${esc(f.section)}</h3>${f.note ? `<p class="muted small span2 form-note">${esc(f.note)}</p>` : ""}`;
       const v = s.values[f.key], d = s.defaults[f.key];
       const changed = JSON.stringify(v) !== JSON.stringify(d);
       const reset = changed ? `<button type="button" class="link-btn small" data-act="reset-setting" data-key="${f.key}">reset to default</button>` : "";

@@ -13,7 +13,7 @@ def _value(v) -> tuple[int, bytes]:
     if isinstance(v, bool):
         return 7, struct.pack("<?", v)
     if isinstance(v, int):
-        return 4, struct.pack("<I", v)
+        return (5, struct.pack("<i", v)) if v < 0 else (4, struct.pack("<I", v))
     if isinstance(v, float):
         return 6, struct.pack("<f", v)
     if isinstance(v, str):
@@ -40,9 +40,15 @@ def write_gguf(path: Path, metadata: dict, padding: int = 0, tensors: dict[str, 
     return path
 
 
-def qwen35_like(path: Path, name: str = "Test Qwen3.5", padding: int = 0) -> Path:
+# what convert_hf_to_gguf.py writes from a generation_config.json (float32, hence 0.949999…)
+RECOMMENDED_SAMPLING = {"general.sampling.temp": 0.6, "general.sampling.top_k": 20,
+                        "general.sampling.top_p": 0.949999988079071, "general.sampling.min_p": 0.0}
+
+
+def qwen35_like(path: Path, name: str = "Test Qwen3.5", padding: int = 0, sampling: dict | None = None) -> Path:
     """Hybrid model: 32 layers, full attention every 4th, 4 KV heads of 256 (like Qwen3.5-9B)."""
     return write_gguf(path, {
+        **(RECOMMENDED_SAMPLING if sampling is None else sampling),
         "general.architecture": "qwen35", "general.name": name, "general.size_label": "9B",
         "general.file_type": 15, "qwen35.block_count": 33, "qwen35.nextn_predict_layers": 1,
         "qwen35.context_length": 262144, "qwen35.embedding_length": 4096, "qwen35.attention.head_count": 16,

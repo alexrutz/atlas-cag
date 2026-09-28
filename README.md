@@ -127,6 +127,23 @@ indexer keys and the recurrent and convolution state. Slot files are about the s
 (≈ 1.7 GB per 100k document tokens at q8_0 for Qwen3.5-9B), so put `ATLAS_KV_DIR` on fast local NVMe.
 
 Changing the context size or slot count keeps existing caches valid, so a restart is enough.
+### Sampling
+
+Sampling parameters belong to the preset. Converters store a model's recommended sampling (from
+its `generation_config.json`) in the GGUF as `general.sampling.*`, often only part of it: a preset
+takes each parameter from the model file unless you set your own value. Temperature, top-k, top-p
+and min-p must be known: when the model file does not recommend one, the preset editor asks for it
+(it marks the field "required: not in the model file") and does not save without it. Repeat and
+presence penalty are optional and off unless set. Other recommendations in the file (repeat window,
+XTC, Mirostat) are passed on as they are. The preset card shows the values in use, those set in the
+preset in bold.
+
+Sampling is sent with every request, so changing it takes effect immediately, without restarting
+llama-server. Follow-up rewrites always use temperature 0. With an external llama-server (no
+presets) its own defaults apply: the model file's recommendations, unless its command line sets
+others. Presets created before sampling moved into presets keep working with the model file's
+values; the card points out a missing one until you add it.
+
 Changing the model, the KV cache type, flash attention or `--swa-full` creates a new cache
 configuration; its caches are built in the background, and the old ones are kept for when you switch back.
 
@@ -438,7 +455,7 @@ or `error`, with per-call stats), `target_delta`, `synthesis`, `delta` (channel 
 ## Development
 
 ```bash
-uv run pytest    # 88 tests, no GPU needed: a fake llama-server (tests/fake_llama.py) and its
+uv run pytest    # 92 tests, no GPU needed: a fake llama-server (tests/fake_llama.py) and its
                  # command-line wrapper let the supervisor spawn, switch and crash real processes
 uv run python scripts/benchmark.py cases.json --runs 3    # answer quality of a running instance
 ```
@@ -456,6 +473,7 @@ atlas/
   downloads.py   Hugging Face listing and resumable downloads
   gguf.py        dependency-free GGUF header reader
   prompts.py     chat-template layout via sentinels, prompt blocks, reasoning splitter
+  sampling.py    preset sampling defaulting to the model file's general.sampling.* recommendations
   slots.py       prioritized exclusive slot leases (pausable, resizable)
   store.py       SQLite: collections, documents, caches per configuration, parts, presets, settings,
                  conversations and their turns

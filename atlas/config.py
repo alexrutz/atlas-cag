@@ -74,8 +74,7 @@ class Settings(BaseSettings):
     max_question_tokens: int = 1024
     max_answer_tokens: int = 1024  # per-document answers (map phase and single-document mode)
     max_final_tokens: int = 2048  # synthesized answer (reduce phase)
-    temperature: float = 0.2
-    top_p: float = 0.95
+    # Sampling (temperature, top-p, …) belongs to presets; see atlas/sampling.py.
     # Default for chat templates that support a thinking switch (Qwen3, etc.). Overridable per query.
     enable_thinking: bool = False
     # Reasoning tokens allowed per generation when thinking is on (added to the answer budget).
@@ -144,8 +143,6 @@ def get_settings() -> Settings:
 class RuntimeSettings(BaseModel):
     """Settings editable at runtime from the UI. Values are persisted and override the env."""
 
-    temperature: float = Field(ge=0, le=2)
-    top_p: float = Field(gt=0, le=1)
     max_question_tokens: int = Field(ge=64, le=65536)
     max_answer_tokens: int = Field(ge=64, le=65536)
     max_final_tokens: int = Field(ge=64, le=65536)

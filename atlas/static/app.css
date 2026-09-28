@@ -688,3 +688,15 @@ dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; ma
 .page-grid img, .page-grid .page-ph { width: 100%; border: 1px solid var(--border); border-radius: 4px; background: white; }
 .page-grid .page-ph { aspect-ratio: 1 / 1.414; display: grid; place-items: center; color: var(--muted); font-size: 12px; }
 .page-grid figcaption { font-size: 11px; color: var(--muted); text-align: center; margin-top: 2px; }
+
+/* sampling */
+.sampling-box { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 12px 10px; margin: 0; }
+.sampling-box legend { font-weight: 600; font-size: 13px; padding: 0 4px; }
+.sampling-note { margin: 0 0 8px; }
+.sampling-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px 12px; }
+.sampling-grid .field { margin: 0; }
+.sampling-grid .field.needs input { border-color: var(--warn); background: var(--warn-soft); }
+.sampling-src { color: var(--muted); }
+.field.needs .sampling-src { color: var(--warn); font-weight: 600; }
+.sampling-line .own { font-weight: 600; color: var(--text); }
+.sampling-line .missing { color: var(--warn); font-weight: 600; }

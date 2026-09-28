@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 BOS = 1
 TEMPLATE = "chatml-fake"
+SAMPLING_FIELDS = ("temperature", "top_k", "top_p", "min_p", "repeat_penalty", "presence_penalty", "repeat_last_n")
 
 
 def render(messages: list[dict]) -> str:
@@ -184,7 +185,8 @@ class FakeLlama:
             if n == len(prompt):
                 n -= 1
             fake.slots[slot] = list(prompt)
-            fake.log.append({"slot": slot, "n_prompt": len(prompt), "cache_n": n, "n_predict": body["n_predict"]})
+            fake.log.append({"slot": slot, "n_prompt": len(prompt), "cache_n": n, "n_predict": body["n_predict"],
+                             "sampling": {k: body[k] for k in SAMPLING_FIELDS if k in body}})
             if not body.get("stream"):
                 # non-streaming requests are only used for the canary's next-token check
                 token = 11 if fake.semantics == "default" else 12

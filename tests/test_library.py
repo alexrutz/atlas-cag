@@ -59,14 +59,16 @@ async def test_unknown_collection_is_rejected(atlas):
 
 async def test_runtime_settings_persist_and_validate(atlas):
     s = (await atlas.get("/api/settings")).json()
-    assert s["values"]["temperature"] == s["defaults"]["temperature"]
-    r = await atlas.patch("/api/settings", json={"temperature": 0.7, "max_answer_tokens": 512})
-    assert r.status_code == 200 and r.json()["values"]["temperature"] == 0.7
+    assert s["values"]["max_thinking_tokens"] == s["defaults"]["max_thinking_tokens"]
+    assert "temperature" not in s["values"], "sampling belongs to presets"
+    atlas.app.state.store.set_state("settings", {"temperature": 0.2})  # stored by an older version
+    r = await atlas.patch("/api/settings", json={"max_thinking_tokens": 4096, "max_answer_tokens": 512})
+    assert r.status_code == 200 and r.json()["values"]["max_thinking_tokens"] == 4096
     assert atlas.app.state.queries.settings.max_answer_tokens == 512
-    assert (await atlas.patch("/api/settings", json={"temperature": 5})).status_code == 422
-    assert (await atlas.patch("/api/settings", json={"no_such_setting": 1})).status_code == 422
-    r = await atlas.patch("/api/settings", json={"temperature": None})  # reset to default
-    assert r.json()["values"]["temperature"] == s["defaults"]["temperature"]
+    assert (await atlas.patch("/api/settings", json={"max_thinking_tokens": -5})).status_code == 422
+    assert (await atlas.patch("/api/settings", json={"temperature": 0.5})).status_code == 422
+    r = await atlas.patch("/api/settings", json={"max_thinking_tokens": None})  # reset to default
+    assert r.json()["values"]["max_thinking_tokens"] == s["defaults"]["max_thinking_tokens"]
     assert atlas.app.state.store.get_state("settings") == {"max_answer_tokens": 512}
 
 

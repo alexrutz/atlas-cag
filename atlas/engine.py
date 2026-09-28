@@ -109,6 +109,10 @@ class Engine:
         self.extra_ident: dict = {}
         # Set by the supervisor: the vision projector and image options (part of visual cache variants).
         self.vision_ident: str | None = None
+        # Set by the supervisor from the active preset (llama-server request fields). Empty with an
+        # external llama-server: its own defaults apply (the model file's, unless its command line
+        # sets others).
+        self.sampling: dict = {}
         self._pad: tuple[int, str, int] | None = None
         self.config_label: str | None = None
         self.paused: str | None = None  # reason while llama-server is being switched or is down
@@ -542,9 +546,10 @@ class Engine:
             "n_predict": max(1, min(cap, self.info.n_ctx_slot - prompt_len - 1)),
             "id_slot": slot,
             "cache_prompt": True,
-            "temperature": self.settings.temperature if temperature is None else temperature,
-            "top_p": self.settings.top_p,
+            **self.sampling,
         }
+        if temperature is not None:
+            payload["temperature"] = temperature
         if thinking_open:
             # llama-server forces the end tag once the budget is spent, so an answer always follows.
             # The message key must be present: only its handler sets the tokens that get forced.

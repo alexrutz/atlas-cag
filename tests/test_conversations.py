@@ -25,7 +25,7 @@ async def test_follow_up_is_rewritten_and_turns_are_stored(atlas, fake):
     assert [e["stage"] for e in rewrite] == ["start", "done"]
     assert rewrite[-1]["question"] == "And why did it happen? (gearbox)"
     found = [e for e in events if e["type"] == "target" and e["status"] == "done"]
-    assert "Found gearbox" in found[0]["answer"], "the documents were asked the standalone question"
+    assert any("Found gearbox" in e["answer"] for e in found), "the documents were asked the standalone question"
     assert events[-1]["type"] == "done" and events[-1]["stats"]["rewrite"]["question"].endswith("(gearbox)")
 
     # the rewrite saw the conversation, not the documents
@@ -39,9 +39,9 @@ async def test_follow_up_is_rewritten_and_turns_are_stored(atlas, fake):
     assert first["question"] == "When did the gearbox fail?" and first["standalone"] is None
     assert second["question"] == "And why did it happen?" and second["standalone"].endswith("(gearbox)")
     assert second["answer"] == "Synthesized from 2 findings [1]." and second["doc_ids"] == docs
-    targets = second["detail"]["targets"]
-    assert [t["status"] for t in targets] == ["done", "done"]
-    assert targets[0]["answer"].startswith("Found gearbox") and targets[0]["stats"]["slot"] in (0, 1)
+    targets = {t["doc_name"]: t for t in second["detail"]["targets"]}
+    assert [t["status"] for t in targets.values()] == ["done", "done"]
+    assert targets["a.txt"]["answer"].startswith("Found gearbox") and targets["a.txt"]["stats"]["slot"] in (0, 1)
 
     r = await atlas.patch(f"/api/conversations/{cid}", json={"title": "Gearbox"})
     assert r.json()["title"] == "Gearbox"

@@ -257,6 +257,7 @@ class QueryService:
             "cache_misses": tally.cache_misses,
             "truncated": tally.truncated,
             "llm_calls": tally.llm_calls,
+            "sampling": dict(self.engine.sampling),
             **tally.extra,
         }
 
