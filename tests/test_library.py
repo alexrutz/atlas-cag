@@ -247,3 +247,12 @@ def test_sliding_window_layers_only_cache_their_window(tmp_path):
     assert windowed["compute"] == 524288 * 512 * 2 + 64 * 2**20 + 4 * 512 * 2 * 524288
     assert models.estimate(m, 524288, 1, "q8_0", extra_args="-ub 256")["compute"] < windowed["compute"]
     assert models.estimate(m, 524288, 1, "f16")["compute"] == 524288 * 512 * 2 + 64 * 2**20, "f16 needs no conversion"
+
+
+def test_empty_limits_in_the_environment_mean_no_limit(tmp_path):
+    from atlas.config import Settings
+    env = tmp_path / ".env"
+    env.write_text("ATLAS_MAX_ANSWER_TOKENS=\nATLAS_MAX_THINKING_TOKENS=\nATLAS_RESERVE_TOKENS=8192\n")
+    s = Settings(_env_file=env)
+    assert s.max_answer_tokens is None and s.max_thinking_tokens is None and s.reserve_tokens == 8192
+    assert s.enable_thinking is True and s.max_final_tokens is None

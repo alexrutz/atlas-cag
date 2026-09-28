@@ -8,19 +8,25 @@ model reads the complete document every time, at a fraction of the prefill cost.
 ```
  ingest    text ──► prefill (n_predict = 0) into a slot ──► POST /slots/{id}?action=save ──► atlas-<part>.bin
 
- query     one document    restore slot file ──► append question ──► decode answer ──► stream
+ query     one document    restore slot file ──► append conversation + question ──► decode answer ──► stream
 
            several docs    map:    every document is answered individually, in parallel across slots
                            reduce: the answers are concatenated and the original question is run
                                    against them to synthesize the final answer, with [n] citations
 ```
 
-- **Collections** group documents. Tick whole collections, single documents, or both.
-- **Presets** define how llama-server runs a model: GGUF file, slots, context per slot, KV cache
-  type. Atlas starts, stops and switches llama-server itself. Every configuration keeps its own
+The UI has four modules, one tab each:
+
+- **Chat**: tick documents or whole collections and chat with them. Earlier questions and
+  answers go along with every question, as chat turns after each cached document.
+- **Library**: manage documents and collections: upload, move, switch between text and visual
+  prefill, rebuild caches, inspect parts and caches, bulk actions.
+- **PDF tools**: cut large PDFs into shards (by chapters, token budget, page count or ranges) and
+  estimate tokens, cache size and prefill time of any text or file.
+- **Settings**: presets (how llama-server runs a model: GGUF file, slots, context, KV cache,
+  sampling, build), model files with Hugging Face downloads, generation settings, cache storage.
+  Atlas starts, stops and switches llama-server itself; every configuration keeps its own
   document caches, so switching back to a preset is instant.
-- **Settings** in the UI cover model files (with Hugging Face downloads), presets, generation
-  settings and cache storage.
 
 Measured on an RTX 2000 Ada (16 GB) with Qwen3.5-2B:
 
@@ -249,17 +255,58 @@ extends a window-sized prompt, and warns on the preset if the build prefills it 
 
 Atlas must be the only client of its llama-server: in managed mode it listens on `127.0.0.1` only.
 
-## Collections
+## Library and collections
 
-Every document lives in one collection or in *Unfiled*. In the library:
+Every document lives in one collection or in *Unfiled*. The **Library** tab manages them:
 
-- A collection's checkbox selects all of its ready documents; a partially selected collection shows
-  a dash.
-- Drag documents onto a collection, or use a document's ⋯ menu, to move it.
-- Drop files onto a collection, or use its upload button, to ingest straight into it.
-- Deleting a collection moves its documents to Unfiled unless you choose to delete them as well.
+- the collections panel lists each collection with its documents and tokens; click one to show
+  it, use its ⋯ menu to upload into it, rename it, ask all of it in chat or delete it (its
+  documents move to Unfiled unless you delete them as well);
+- the table lists documents with collection, prefill mode, pages, tokens, parts, KV cache size,
+  file size, state and age; sort by any column, filter by name, state and prefill mode;
+- tick documents for bulk actions: ask in chat, move, switch prefill, rebuild caches, delete;
+- drag rows onto a collection to move them; drop files anywhere on the page to upload (into the
+  collection and prefill mode chosen above the table);
+- click a document for its details: parts for the running model, its caches in every model
+  configuration, text or page preview, download of the original file, and a shortcut to the PDF
+  tools.
 
-The query API takes `document_ids`, `collection_ids` or both.
+In the **Chat** tab the left column only selects: a collection's checkbox selects all of its ready
+documents, a partially selected collection shows a dash. The query API takes `document_ids`,
+`collection_ids` or both.
+
+## PDF tools
+
+Large PDFs often work better as several documents: questions can target the chapters that matter
+(fewer map calls, less noise), citations name the chapter, and covers, indexes or appendices can be
+left out. Atlas does split big documents into parts by itself, but only by token count.
+
+**PDF tools → Split a PDF into shards** loads a PDF (upload, or a library PDF via its details or
+⋯ menu) and shows:
+
+- every page with a thumbnail, its exact token count (the running model's tokenizer; estimated
+  when no model runs) and whether it has a text layer; pages without one are scans or pictures
+  and belong in visual prefill;
+- the PDF's bookmarks (chapters) and how many tokens one part of the running model holds.
+
+Cut strategies set the cuts, which you can then adjust by hand (the scissors between pages; click
+a page to leave it out):
+
+- **By token budget** (default): fill shards up to a token budget, by default what fits one part
+  of the running model, cutting at the last chapter start instead when that keeps a shard at
+  least half full;
+- **By chapters**: one shard per bookmark of the chosen level;
+- **Every N pages**;
+- **Page ranges**, e.g. `1-12, 13-40, 41-`; pages outside the ranges are left out.
+
+The shard list shows pages and tokens per shard and flags shards that would still need several
+parts. Names default to the chapter title or page range and can be edited. **Add to the library**
+creates one document per shard (in a chosen collection, text or visual prefill); **Download
+(.zip)** saves the shard PDFs. Analyzed PDFs are kept for a day in `data/tools/`.
+
+**Token estimator**: paste text or drop a file to get its exact token count, words and characters,
+and for the running model the KV cache (= slot file) size, the prefill time at the speed measured
+on this machine, and whether it fits one part or how many parts Atlas would make.
 
 ## Visual prefill
 
@@ -312,12 +359,33 @@ Asking in a new conversation creates it, titled after the first question. Openin
 shows its earlier turns again, with their per-document answers, and selects the documents its
 last question used. The open conversation is restored when the page is reloaded.
 
-Each document cache holds only its document, not the conversation, so a follow-up such as "and
-why did it happen?" is first rewritten into a standalone question ("Why did the gearbox fail?")
-from the last four turns. This is one short generation without any document (temperature 0,
-no thinking). The rewrite then runs like any other question, single-document or map-reduce, and
-is shown under the follow-up ("Asked the documents: …"). Switch it off under **Settings →
-Generation → Conversations** (`ATLAS_CONDENSE_FOLLOWUPS=false`) to send follow-ups unchanged.
+It is a real chat: every question carries the conversation's earlier questions and final answers
+as chat turns, so follow-ups ("and why?") need no reformulation. Each document part is asked
+
+```
+[system] [user: <document> first question] [assistant: first answer] … [user: new question]
+```
+
+The document still opens the first user turn, so it stays the cached prefix and only the
+conversation and the new question are evaluated. The template is rendered with one sentinel per
+turn (template text is tokenized with special tokens, questions and answers as plain text).
+Neither documents nor the model's thinking go into the history. The synthesis of several
+documents sees the conversation as well. Oldest turns are left out only when they do not fit next
+to a document part; the answer footer says how many earlier turns were sent. If a chat template
+renders the first turn differently in a longer chat, the earlier turns go into the question as
+text instead. Switch the history off under **Settings → Generation → Chat**
+(`ATLAS_CHAT_HISTORY=false`).
+
+## Limits and thinking
+
+Thinking is on by default for models with a thinking switch (per question in the composer). No
+token limits apply by default: answers, the combined answer and thinking run until the model stops
+or the slot is full (the Stop button ends a generation), and questions may be as long as the slot
+allows. Limits can be set under **Settings → Generation**.
+
+One size still has to be chosen: when a document is split into parts, each part leaves room for
+the conversation, the question, thinking and the answer. By default that is 1/8 of the slot,
+between 4k and 64k tokens (`ATLAS_RESERVE_TOKENS` or the setting to change it).
 
 ## How it works
 
@@ -413,9 +481,10 @@ override the environment.
 | `ATLAS_HOST` / `ATLAS_PORT` | 127.0.0.1 / 8000 | `0.0.0.0` to serve other machines |
 | `ATLAS_API_KEYS` | *(empty)* | comma-separated bearer tokens; empty disables auth |
 | `HF_TOKEN` | *(empty)* | for gated or private Hugging Face repositories |
-| `ATLAS_MAX_QUESTION_TOKENS` / `_ANSWER_` / `_FINAL_` | 1024 / 1024 / 2048 | also in the UI; question and answer budgets are reserved in every slot |
-| `ATLAS_ENABLE_THINKING`, `ATLAS_MAX_THINKING_TOKENS` | false, 2048 | also in the UI |
-| `ATLAS_CONDENSE_FOLLOWUPS` | true | also in the UI; rewrite follow-ups into standalone questions |
+| `ATLAS_MAX_QUESTION_TOKENS` / `_ANSWER_` / `_FINAL_` | *(no limit)* | also in the UI; 0 or empty = no limit |
+| `ATLAS_ENABLE_THINKING`, `ATLAS_MAX_THINKING_TOKENS` | true, *(no limit)* | also in the UI |
+| `ATLAS_RESERVE_TOKENS` | *(automatic)* | also in the UI; room kept per slot when splitting documents (1/8 of the slot, 4k–64k) |
+| `ATLAS_CHAT_HISTORY` | true | also in the UI; send earlier turns with every question |
 | `ATLAS_DEFAULT_PREFILL` | text | also in the UI; `text` or `visual` for new PDFs and images |
 | `ATLAS_VISUAL_DPI` | 120 | also in the UI; page resolution for visual prefill |
 | `ATLAS_RELEVANCE_FILTER` | false | also in the UI; see the prompt findings below |
@@ -463,7 +532,7 @@ answer:
 | `POST /api/documents` | multipart upload (`files`, optional `collection_id` and `mode` = `text`/`visual`), deduplicated by SHA-256 |
 | `POST /api/documents/text` | `{name, text, collection_id?}` |
 | `GET` / `PATCH /api/documents/{id}` | details (parts) / rename, move or switch prefill (`{name?, collection_id?, mode?}`) |
-| `GET /api/documents/{id}/text` · `POST …/reingest` · `DELETE …` | |
+| `GET /api/documents/{id}/text` · `GET …/original` · `POST …/reingest` · `DELETE …` | |
 | `GET /api/documents/{id}/pages/{n}` | page image (PNG) of a PDF or image |
 | `POST /api/query` | `{question, document_ids?, collection_ids?, thinking?, conversation_id?}` → Server-Sent Events |
 | `GET /api/conversations` · `POST` · `GET /{id}` (with turns) · `PATCH /{id}` · `DELETE /{id}` | conversations |
@@ -475,17 +544,18 @@ answer:
 | `GET` / `PATCH /api/settings` | runtime settings (`null` resets a value) |
 | `GET /api/caches` · `DELETE /api/caches/{fingerprint}` | caches per configuration |
 | `GET /api/queries` | query log with stats |
+| `POST /api/tools/pdf` (multipart `file` or form `doc_id`) · `GET …/{id}/thumb/{page}` · `POST …/{id}/shards` · `POST …/{id}/zip` · `DELETE …/{id}` | PDF analysis, thumbnails, shards into the library or as a ZIP |
+| `POST /api/tools/estimate` (form `text` or multipart `file`) | token estimate with KV size, prefill time and parts |
 | `GET /healthz` | unauthenticated liveness |
 
-Query events: `plan` (includes the conversation), `rewrite` (stage `start`, then `done` with the
-standalone question), `target` (status `queued`, `restoring`, `generating`, `done`, `irrelevant`
+Query events: `plan` (includes the conversation and the number of earlier turns), `target` (status `queued`, `restoring`, `generating`, `done`, `irrelevant`
 or `error`, with per-call stats), `target_delta`, `synthesis`, `delta` (channel `answer` or
 `reasoning`), `done` (answer and stats), `error`, and `ping` as a keep-alive.
 
 ## Development
 
 ```bash
-uv run pytest    # 95 tests, no GPU needed: a fake llama-server (tests/fake_llama.py) and its
+uv run pytest    # 101 tests, no GPU needed: a fake llama-server (tests/fake_llama.py) and its
                  # command-line wrapper let the supervisor spawn, switch and crash real processes
 uv run python scripts/benchmark.py cases.json --runs 3    # answer quality of a running instance
 ```
@@ -496,7 +566,7 @@ atlas/
   supervisor.py  managed mode: presets, llama-server process, drain / switch / crash restart
   engine.py      discovery, fingerprints and canaries, prompt assembly, prefill and generation
   ingest.py      ingestion queue per configuration: split, prefill, save; repairs, orphan sweep
-  query.py       follow-up rewriting, single-document and map-reduce execution, synthesis
+  query.py       chat history per document part, single-document and map-reduce execution, synthesis
   models.py      GGUF discovery, metadata and tensor layout, memory estimates, GPU info
   builds.py      llama-server build discovery and checks (format, libraries, flags, architectures)
   updater.py     standard build updates from GitHub releases, CUDA runtime, pinning, rollback
@@ -510,7 +580,9 @@ atlas/
   chunking.py    token-budgeted splitting at natural boundaries
   extract.py     PDF / DOCX / HTML / text extraction
   pages.py       page images for visual prefill (PDF rendering, image normalization)
-  static/        single-page UI (no build step, no external assets)
+  pdftools.py    PDF analysis (pages, text, bookmarks), thumbnails, shards
+  static/        single-page UI, no build step: app.js (core, router, chat), library.js,
+                 tools.js (PDF tools, estimator), settings.js
 ```
 
 ## Limitations

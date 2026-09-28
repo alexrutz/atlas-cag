@@ -10,18 +10,19 @@ from contextlib import asynccontextmanager
 from pathlib import Path, PurePath
 
 from fastapi import APIRouter, Depends, FastAPI, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from typing import Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
-from . import __version__, builds, models
+from . import __version__, builds, models, pdftools
 from . import pages as page_images
 from .config import RUNTIME_FIELDS, RuntimeSettings, Settings, get_settings
 from .downloads import Downloader, DownloadError
 from .engine import Engine
 from .extract import SUPPORTED_EXTENSIONS, ExtractionError, extract_text, normalize
+from .prompts import document_block
 from .ingest import Ingestor
 from .query import QueryError, QueryService
 from .store import Store
@@ -51,11 +52,22 @@ class CollectionBody(BaseModel):
 
 
 class QueryRequest(BaseModel):
-    question: str = Field(min_length=1, max_length=20000)
+    question: str = Field(min_length=1, max_length=4_000_000)  # tokens are checked, not characters
     document_ids: list[str] = Field(default_factory=list, max_length=2000)
     collection_ids: list[str] = Field(default_factory=list, max_length=200)
     thinking: bool | None = None
     conversation_id: str | None = None  # empty: the question starts a new conversation
+
+
+class ShardSpec(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    pages: list[int] = Field(min_length=1, max_length=10000)
+
+
+class ShardRequest(BaseModel):
+    shards: list[ShardSpec] = Field(min_length=1, max_length=500)
+    collection_id: str | None = None
+    mode: Literal["text", "visual"] | None = None
 
 
 class ConversationBody(BaseModel):
@@ -82,6 +94,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         settings.docs_dir.mkdir(parents=True, exist_ok=True)
         settings.kv_dir.mkdir(parents=True, exist_ok=True)
         settings.model_dirs[0].mkdir(parents=True, exist_ok=True)
+        pdftools.sweep(settings.data_dir / "tools")
         store = Store(settings.db_path)
         for key, value in (store.get_state("settings") or {}).items():
             if key in RUNTIME_FIELDS:
@@ -344,7 +357,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         doc = get_doc_or_404(s, doc_id)
         fp = s.engine.info.fingerprint
         return {**doc_json(s, doc),
-                "parts": [p.to_json() for p in s.store.get_parts(doc_id, fp, with_tokens=False)] if fp else []}
+                "parts": [p.to_json() for p in s.store.get_parts(doc_id, fp, with_tokens=False)] if fp else [],
+                "caches": [{**c, "active": c["fingerprint"] == fp} for c in s.store.document_caches(doc_id)]}
+
+    @api.get("/documents/{doc_id}/original")
+    async def get_document_original(request: Request, doc_id: str):
+        doc = get_doc_or_404(st(request), doc_id)
+        original = next((settings.docs_dir / doc_id).glob("original*"), None)
+        if original is None:
+            raise HTTPException(404, "original file missing")
+        return FileResponse(original, filename=doc.name, media_type=doc.mime or "application/octet-stream")
 
     @api.patch("/documents/{doc_id}")
     async def update_document(request: Request, doc_id: str, body: DocumentUpdate):
@@ -410,6 +432,163 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         get_doc_or_404(s, doc_id)
         remove_document(s, doc_id)
         return {"deleted": doc_id}
+
+    # --- tools: PDF shards and token estimates ---------------------------------------------
+
+    tools_dir = settings.data_dir / "tools"
+
+    async def count_many(s, texts: list[str]) -> tuple[list[int], bool]:
+        """Token counts with the running model's tokenizer, or a rough estimate (4 characters per token)."""
+        if s.engine.ready:
+            sem = asyncio.Semaphore(8)
+
+            async def one(text: str) -> int:
+                async with sem:
+                    return await s.engine.count(text) if text else 0
+            try:
+                return list(await asyncio.gather(*(one(t) for t in texts))), True
+            except Exception:
+                pass
+        return [-(-len(t) // 4) for t in texts], False
+
+    def throughput(s) -> dict:
+        """Measured prefill speed and KV bytes per token of the running configuration."""
+        caches = [c for c in s.store.caches_for(s.engine.info.fingerprint).values()
+                  if c.status == "ready" and c.n_tokens >= 1000 and c.ingest_ms]
+        tokens = sum(c.n_tokens for c in caches)
+        info = {"prefill_tps": round(tokens / (sum(c.ingest_ms for c in caches) / 1000), 1) if caches else None,
+                "kv_bytes_per_token": round(sum(c.kv_bytes for c in caches) / tokens) if caches else None}
+        sup = s.supervisor
+        if info["kv_bytes_per_token"] is None and sup and sup.preset and Path(sup.preset["model_path"]).is_file():
+            est = models.estimate(models.describe_file(Path(sup.preset["model_path"])), sup.preset["ctx_per_slot"],
+                                  1, sup.preset["kv_type"], sup.preset.get("extra_args", ""),
+                                  swa_full=bool(sup.preset.get("swa_full")))
+            info["kv_bytes_per_token"] = est.get("kv_bytes_per_token")
+        n_ctx = s.engine.info.n_ctx_slot
+        info["part_tokens"] = n_ctx - s.engine.reserve_tokens() if n_ctx else None
+        info["model"] = s.engine.info.config_label or s.engine.info.model
+        return info
+
+    def tool_source(s, file_data: bytes | None, file_name: str | None, doc_id: str | None) -> tuple[bytes, str]:
+        if doc_id:
+            doc = get_doc_or_404(s, doc_id)
+            original = next((settings.docs_dir / doc_id).glob("original*"), None)
+            if original is None or original.suffix.lower() != ".pdf":
+                raise HTTPException(400, "the document is not a PDF")
+            return original.read_bytes(), doc.name
+        if file_data is None:
+            raise HTTPException(400, "upload a PDF or choose a library document")
+        return file_data, PurePath(file_name or "document.pdf").name
+
+    @api.post("/tools/pdf")
+    async def analyze_pdf(request: Request, file: UploadFile | None = None, doc_id: str | None = Form(None)):
+        s = st(request)
+        limit = settings.max_upload_mb * 1024 * 1024
+        data = await file.read(limit + 1) if file else None
+        if data is not None and len(data) > limit:
+            raise HTTPException(413, f"larger than {settings.max_upload_mb} MB")
+        data, name = tool_source(s, data, file.filename if file else None, doc_id)
+        try:
+            result = await asyncio.to_thread(pdftools.analyze, data)
+        except pdftools.PdfToolError as e:
+            raise HTTPException(400, str(e)) from e
+        tokens, exact = await count_many(s, [p["text"] for p in result["pages"]])
+        ws_id = hashlib.sha256(data).hexdigest()[:32]
+        folder = tools_dir / ws_id
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "source.pdf").write_bytes(data)
+        pages = [{k: v for k, v in p.items() if k != "text"} | {"tokens": t} for p, t in zip(result["pages"], tokens)]
+        overhead = await s.engine.count(document_block(name, 98, 99, "")) if s.engine.ready else 64
+        return {"id": ws_id, "name": name, "doc_id": doc_id, "n_pages": result["n_pages"], "pages": pages,
+                "outline": result["outline"], "exact": exact, "total_tokens": sum(tokens),
+                "shard_overhead_tokens": overhead, **throughput(s)}
+
+    def tool_workspace(ws_id: str) -> Path:
+        try:
+            return pdftools.workspace(tools_dir, ws_id)
+        except (pdftools.PdfToolError, FileNotFoundError) as e:
+            raise HTTPException(404, "this PDF is no longer loaded; analyze it again") from e
+
+    @api.get("/tools/pdf/{ws_id}/thumb/{n}")
+    async def pdf_thumbnail(ws_id: str, n: int, width: int = 180):
+        folder = tool_workspace(ws_id)
+        width = max(60, min(width, 800))
+        cached = folder / f"thumb-{n}-{width}.png"
+        if not cached.exists():
+            try:
+                png = await asyncio.to_thread(pdftools.thumbnail, (folder / "source.pdf").read_bytes(), n, width)
+            except pdftools.PdfToolError as e:
+                raise HTTPException(404, str(e)) from e
+            cached.write_bytes(png)
+        return FileResponse(cached, media_type="image/png", headers={"Cache-Control": "private, max-age=86400"})
+
+    @api.post("/tools/pdf/{ws_id}/shards")
+    async def create_shards(request: Request, ws_id: str, body: ShardRequest):
+        """Cut the loaded PDF into shards and add them to the library as documents."""
+        s = st(request)
+        data = (tool_workspace(ws_id) / "source.pdf").read_bytes()
+        collection_id = check_collection(s, body.collection_id)
+        results, taken = [], set()
+        for shard in body.shards:
+            name = pdftools.shard_filename(shard.name, taken)
+            try:
+                shard_data = await asyncio.to_thread(pdftools.build_shard, data, shard.pages)
+                prepared = await asyncio.to_thread(prepare_upload, name, shard_data, body.mode or settings.default_prefill)
+            except (pdftools.PdfToolError, ExtractionError, page_images.PageError) as e:
+                results.append({"name": name, "error": str(e)})
+                continue
+            result = register(s, name, "application/pdf", shard_data, prepared["text"], collection_id,
+                              prepared["mode"], prepared["n_pages"])
+            if prepared["note"]:
+                result["note"] = prepared["note"]
+            results.append(result)
+        return {"results": results}
+
+    @api.post("/tools/pdf/{ws_id}/zip")
+    async def download_shards(ws_id: str, body: ShardRequest):
+        data = (tool_workspace(ws_id) / "source.pdf").read_bytes()
+        try:
+            archive = await asyncio.to_thread(pdftools.build_zip, data, [(x.name, x.pages) for x in body.shards])
+        except pdftools.PdfToolError as e:
+            raise HTTPException(400, str(e)) from e
+        return Response(archive, media_type="application/zip",
+                        headers={"Content-Disposition": 'attachment; filename="shards.zip"'})
+
+    @api.delete("/tools/pdf/{ws_id}")
+    async def close_pdf(ws_id: str):
+        shutil.rmtree(tool_workspace(ws_id), ignore_errors=True)
+        return {"closed": ws_id}
+
+    @api.post("/tools/estimate")
+    async def estimate_tokens(request: Request, file: UploadFile | None = None, text: str | None = Form(None)):
+        """How many tokens a text or file is, and what that means for the running model."""
+        s = st(request)
+        pages = None
+        if file is not None:
+            limit = settings.max_upload_mb * 1024 * 1024
+            data = await file.read(limit + 1)
+            if len(data) > limit:
+                raise HTTPException(413, f"larger than {settings.max_upload_mb} MB")
+            name = PurePath(file.filename or "file").name
+            try:
+                text = await asyncio.to_thread(extract_text, name, data) if not page_images.is_image(name) else ""
+            except ExtractionError as e:
+                if not page_images.supports_visual(name):
+                    raise HTTPException(400, str(e)) from e
+                text = ""
+            if page_images.supports_visual(name):
+                try:
+                    pages = await asyncio.to_thread(page_images.page_count, name, data)
+                except page_images.PageError:
+                    pages = None
+        text = text or ""
+        [tokens], exact = await count_many(s, [text])
+        info = throughput(s)
+        part = info["part_tokens"]
+        return {"tokens": tokens, "exact": exact, "chars": len(text), "words": len(text.split()), "pages": pages,
+                **info, "parts": (-(-tokens // part) if part and tokens else None),
+                "kv_bytes": tokens * info["kv_bytes_per_token"] if info["kv_bytes_per_token"] else None,
+                "prefill_s": round(tokens / info["prefill_tps"], 1) if info["prefill_tps"] else None}
 
     # --- queries -----------------------------------------------------------------------
 

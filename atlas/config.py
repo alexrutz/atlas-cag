@@ -104,6 +104,12 @@ class Settings(BaseSettings):
         "findings."
     )
 
+    @field_validator("max_question_tokens", "max_answer_tokens", "max_final_tokens", "max_thinking_tokens",
+                     "reserve_tokens", mode="before")
+    @classmethod
+    def _empty_is_none(cls, v):
+        return None if isinstance(v, str) and not v.strip() else v  # ATLAS_MAX_ANSWER_TOKENS= means no limit
+
     @field_validator("kv_dir", "data_dir", mode="after")
     @classmethod
     def _expand_path(cls, v: Path) -> Path:

@@ -48,21 +48,17 @@
 
   function openSettings(tab) {
     if (tab) view.tab = tab;
-    document.body.classList.add("settings-open");
-    $("#settings").hidden = false;
-    $("#open-settings").setAttribute("aria-pressed", "true");
-    render();
+    if (location.hash.split("/")[0] !== "#settings") location.hash = "#settings";
+    else render();
   }
-  function closeSettings() {
-    document.body.classList.remove("settings-open");
-    $("#settings").hidden = true;
-    $("#open-settings").setAttribute("aria-pressed", "false");
-    clearTimeout(view.timer);
-  }
-  $("#open-settings").addEventListener("click", () =>
-    document.body.classList.contains("settings-open") ? closeSettings() : openSettings());
-  $("#close-settings").addEventListener("click", closeSettings);
-  document.querySelectorAll(".tabs [data-tab]").forEach((b) => b.addEventListener("click", () => {
+  A.registerModule("settings", {
+    show(sub) {
+      if (["model", "models", "generation", "storage"].includes(sub)) view.tab = sub;
+      render();
+    },
+    hide() { clearTimeout(view.timer); },
+  });
+  document.querySelectorAll("#settings .tabs [data-tab]").forEach((b) => b.addEventListener("click", () => {
     view.tab = b.dataset.tab;
     store.set("atlas.settingsTab", view.tab);
     render();
@@ -70,12 +66,12 @@
 
   function schedule(fn, ms) {
     clearTimeout(view.timer);
-    view.timer = setTimeout(() => { if (!$("#settings").hidden) fn(); }, ms);
+    view.timer = setTimeout(() => { if (A.current() === "settings") fn(); }, ms);
   }
 
   async function render() {
     clearTimeout(view.timer);
-    document.querySelectorAll(".tabs [data-tab]").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.tab === view.tab)));
+    document.querySelectorAll("#settings .tabs [data-tab]").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.tab === view.tab)));
     body.dataset.tab = view.tab;
     try {
       if (view.tab === "model") await renderModel(true);
@@ -964,5 +960,5 @@
     </section>`;
   }
 
-  window.AtlasSettings = { open: openSettings, close: closeSettings };
+  window.AtlasSettings = { open: openSettings };
 })();

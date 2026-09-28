@@ -68,8 +68,6 @@
     collections: [],
     selected: new Set(store.get("atlas.selected", [])),
     collapsed: new Set(store.get("atlas.collapsed", [])),
-    uploadTarget: store.get("atlas.uploadTarget", ""),
-    uploadMode: store.get("atlas.uploadMode", null),  // null: the server's default prefill mode
     filter: "",
     apiKey: store.get("atlas.apiKey", ""),
     busy: false,
@@ -152,8 +150,9 @@
       state.collections = collections;
       pruneSelection();
       renderEngine();
-      renderLibrary();
+      renderPicker();
       renderComposer();
+      for (const fn of subscribers) fn(state);
     } catch (e) {
       if (seq !== refreshSeq) return;
       if (e.status !== 401) renderEngine(e);
@@ -171,7 +170,6 @@
       if (!d || !d.queryable) { state.selected.delete(id); changed = true; }
     }
     if (changed) store.set("atlas.selected", [...state.selected]);
-    if (state.uploadTarget && !collectionById(state.uploadTarget)) state.uploadTarget = "";
   }
 
   // ---------------------------------------------------------------- header
@@ -279,7 +277,7 @@
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeMenu(); });
   window.addEventListener("resize", closeMenu);
 
-  // ---------------------------------------------------------------- library
+  // ---------------------------------------------------------------- documents (shared)
 
   function docMeta(d) {
     const pages = d.mode === "visual" ? `${d.n_pages} page${d.n_pages === 1 ? "" : "s"} · ` : "";
@@ -298,21 +296,7 @@
       default: return `${fmtBytes(d.size_bytes)} file`;
     }
   }
-
-  function docRow(d) {
-    const selected = state.selected.has(d.id);
-    return `<li class="doc${selected ? " selected" : ""}${d.queryable ? "" : " disabled"}" data-id="${esc(d.id)}" draggable="true">
-      <input type="checkbox" ${selected ? "checked" : ""} ${d.queryable ? "" : "disabled"} aria-label="Select ${esc(d.name)}">
-      <div class="doc-name" title="${esc(d.name)}">${esc(d.name)}</div>
-      <div class="doc-actions">
-        <button class="icon-btn" data-act="view" title="${d.mode === "visual" ? "View pages" : "View extracted text"}">${ICONS.eye}</button>
-        <button class="icon-btn" data-act="doc-menu" title="More actions" aria-haspopup="menu">${ICONS.more}</button>
-      </div>
-      <div class="doc-meta">${d.mode === "visual" ? '<span class="pill visual" title="Prefilled from page images by the vision model">visual</span>' : ""}<span class="pill ${esc(d.status)}">${esc(STATUS_LABELS[d.status] || d.status)}</span>${esc(docMeta(d))}</div>
-      ${d.status === "ingesting" ? `<div class="progress"><span style="width:${Math.round((d.progress || 0) * 100)}%"></span></div>` : ""}
-      ${d.error && !["ready", "queued"].includes(d.status) ? `<div class="doc-error">${esc(d.error)}</div>` : ""}
-    </li>`;
-  }
+  const statusPill = (d) => `${d.mode === "visual" ? '<span class="pill visual" title="Prefilled from page images by the vision model">visual</span>' : ""}<span class="pill ${esc(d.status)}">${esc(STATUS_LABELS[d.status] || d.status)}</span>`;
 
   function groups() {
     return [...state.collections.map((c) => ({ id: c.id, name: c.name })), { id: null, name: "Unfiled" }];
@@ -326,12 +310,12 @@
     const nodes = items.map(({ key, html }) => {
       const el = existing.get(key);
       if (el && el.dataset.html === html) return el;
-      const tpl = document.createElement("template");
+      const tpl = document.createElement(list.tagName === "TBODY" ? "tbody" : "template");
       tpl.innerHTML = html.trim();
-      const node = tpl.content.firstElementChild;
+      const node = (tpl.content || tpl).firstElementChild;
       node.dataset.key = key;
       node.dataset.html = html;
-      node.querySelectorAll(".group-check[data-state=some]").forEach((c) => { c.indeterminate = true; });
+      node.querySelectorAll(".group-check[data-state=some], [data-indeterminate]").forEach((c) => { c.indeterminate = true; });
       if (node.matches(".group-check[data-state=some]")) node.indeterminate = true;
       return node;
     });
@@ -342,18 +326,54 @@
     while (list.children.length > nodes.length) list.lastElementChild.remove();
   }
 
-  function renderLibrary() {
+  async function run(fn, success) {
+    try {
+      const out = await fn();
+      if (success) toast(success);
+      return out;
+    } catch (e) {
+      if (e.status !== 401) toast(e.message, "error");
+    } finally {
+      refresh();
+    }
+  }
+
+  function setMode(d, mode) {
+    const what = mode === "visual" ? "page images" : "extracted text";
+    run(() => api(`/api/documents/${d.id}`, { method: "PATCH", json: { mode } }), `${d.name}: prefilling from ${what}`);
+    if (mode === "visual" && !state.status?.engine?.vision) {
+      toast("The running model has no vision projector: add one (mmproj) to the preset in Settings → Model.", "error");
+    }
+  }
+
+  // ---------------------------------------------------------------- chat: document picker
+
+  function docRow(d) {
+    const selected = state.selected.has(d.id);
+    return `<li class="doc${selected ? " selected" : ""}${d.queryable ? "" : " disabled"}" data-id="${esc(d.id)}">
+      <input type="checkbox" ${selected ? "checked" : ""} ${d.queryable ? "" : "disabled"} aria-label="Select ${esc(d.name)}">
+      <div class="doc-name" title="${esc(d.name)}">${esc(d.name)}</div>
+      <div class="doc-actions">
+        <button class="icon-btn" data-act="view" title="${d.mode === "visual" ? "View pages" : "View extracted text"}">${ICONS.eye}</button>
+        <button class="icon-btn" data-act="doc-menu" title="More actions" aria-haspopup="menu">${ICONS.more}</button>
+      </div>
+      <div class="doc-meta">${statusPill(d)}${esc(docMeta(d))}</div>
+      ${d.status === "ingesting" ? `<div class="progress"><span style="width:${Math.round((d.progress || 0) * 100)}%"></span></div>` : ""}
+      ${d.error && !["ready", "queued"].includes(d.status) ? `<div class="doc-error">${esc(d.error)}</div>` : ""}
+    </li>`;
+  }
+
+  function renderPicker() {
     const q = state.filter.trim().toLowerCase();
     const match = (d) => !q || d.name.toLowerCase().includes(q);
     const items = [];
-    if (!state.docs.length && !state.collections.length) {
-      items.push({ key: "empty", html: '<li class="library-empty">No documents yet. Upload files or paste text to build the library.</li>' });
+    if (!state.docs.length) {
+      items.push({ key: "empty", html: '<li class="library-empty">No documents yet. Add them in the <a href="#library">Library</a>.</li>' });
     } else {
       for (const g of groups()) {
         const all = docsIn(g.id);
         const shown = all.filter(match);
-        if (g.id === null && !all.length && state.collections.length) continue;
-        if (q && !shown.length) continue;
+        if (!all.length || (q && !shown.length)) continue;
         const selectable = all.filter((d) => d.queryable);
         const nSel = selectable.filter((d) => state.selected.has(d.id)).length;
         const check = !selectable.length ? "none" : nSel === selectable.length ? "all" : nSel ? "some" : "none";
@@ -364,15 +384,8 @@
           <input type="checkbox" class="group-check" ${check === "all" ? "checked" : ""} data-state="${check}" ${selectable.length ? "" : "disabled"} aria-label="Select all documents in ${esc(g.name)}">
           <span class="group-name" title="${esc(g.name)}">${g.id ? ICONS.folder : ICONS.inbox}<span>${esc(g.name)}</span></span>
           <span class="group-count">${nSel ? `${nSel}/` : ""}${all.length}</span>
-          <span class="group-actions">
-            <button class="icon-btn" data-act="upload" title="Upload into ${esc(g.name)}">${ICONS.upload}</button>
-            ${g.id ? `<button class="icon-btn" data-act="coll-menu" title="Collection actions" aria-haspopup="menu">${ICONS.more}</button>` : ""}
-          </span>
         </li>` });
         if (collapsed) continue;
-        if (!shown.length) {
-          items.push({ key: `e:${key}`, html: '<li class="group-empty">Empty. Drop files or drag documents here.</li>' });
-        }
         for (const d of shown) items.push({ key: `d:${d.id}`, html: docRow(d) });
       }
       if (!items.length) items.push({ key: "nomatch", html: '<li class="library-empty">No documents match the filter.</li>' });
@@ -382,22 +395,6 @@
     $("#library-foot").textContent = s
       ? `${s.documents.count} documents · ${s.documents.ready} ready · ${fmtTok(s.documents.tokens)} tokens · ${fmtBytes(s.documents.kv_bytes)} KV for this model`
       : "";
-    renderUploadTargets();
-    renderUploadMode();
-  }
-
-  function renderUploadMode() {
-    const sel = $("#upload-mode");
-    if (sel && document.activeElement !== sel) sel.value = uploadMode();
-  }
-
-  function renderUploadTargets() {
-    const sel = $("#upload-target");
-    const opts = [["", "Unfiled"], ...state.collections.map((c) => [c.id, c.name])];
-    const html = opts.map(([v, n]) => `<option value="${esc(v)}"${v === state.uploadTarget ? " selected" : ""}>${esc(n)}</option>`).join("");
-    if (sel.dataset.html !== html) { sel.innerHTML = html; sel.dataset.html = html; }
-    const paste = $("#paste-collection");
-    if (paste.dataset.html !== html) { paste.innerHTML = html; paste.dataset.html = html; }
   }
 
   function setSelected(ids, on) {
@@ -405,7 +402,7 @@
       if (on) state.selected.add(id); else state.selected.delete(id);
     }
     store.set("atlas.selected", [...state.selected]);
-    renderLibrary();
+    renderPicker();
     renderComposer();
   }
 
@@ -415,23 +412,34 @@
     setSelected([id], on ?? !state.selected.has(id));
   }
 
-  $("#doc-list").addEventListener("click", async (ev) => {
+  function docMenu(anchor, id) {
+    const d = docById(id);
+    if (!d) return;
+    const busy = ["queued", "ingesting"].includes(d.status);
+    const modeItems = !d.visual_capable ? [] : d.mode === "visual"
+      ? [{ label: "Prefill from extracted text", disabled: !d.has_text || busy, action: () => setMode(d, "text") }]
+      : [{ label: "Prefill from page images (vision)", disabled: busy, action: () => setMode(d, "visual") }];
+    openMenu(anchor, [
+      { label: d.mode === "visual" ? "View pages" : "View extracted text", action: () => openTextDialog(id) },
+      ...modeItems,
+      { label: d.status === "ready" ? "Rebuild KV cache" : "Build KV cache", disabled: busy || d.status === "waiting",
+        action: () => run(() => api(`/api/documents/${id}/reingest`, { method: "POST" }), `Rebuilding ${d.name}`) },
+      "-",
+      { label: "Show in Library", action: () => { location.hash = `#library/${id}`; } },
+    ]);
+  }
+
+  $("#doc-list").addEventListener("click", (ev) => {
     const group = ev.target.closest(".group");
     if (group) {
       const cid = group.dataset.collection || null;
-      const act = ev.target.closest("[data-act]")?.dataset.act;
       if (ev.target.matches(".group-check")) {
-        const ids = docsIn(cid).filter((d) => d.queryable).map((d) => d.id);
-        setSelected(ids, ev.target.checked);
-      } else if (act === "upload") {
-        pickFiles(cid || "");
-      } else if (act === "coll-menu") {
-        collectionMenu(ev.target.closest("button"), cid);
-      } else if (!ev.target.closest(".group-actions")) {
+        setSelected(docsIn(cid).filter((d) => d.queryable).map((d) => d.id), ev.target.checked);
+      } else {
         const key = cid || "_unfiled";
         if (state.collapsed.has(key)) state.collapsed.delete(key); else state.collapsed.add(key);
         store.set("atlas.collapsed", [...state.collapsed]);
-        renderLibrary();
+        renderPicker();
       }
       return;
     }
@@ -449,234 +457,12 @@
     else toggleSelect(id);
   });
 
-  async function run(fn, success) {
-    try {
-      await fn();
-      if (success) toast(success);
-    } catch (e) {
-      if (e.status !== 401) toast(e.message, "error");
-    }
-    refresh();
-  }
-
-  function moveDocument(id, collectionId) {
-    const d = docById(id);
-    if (!d || (d.collection_id || null) === (collectionId || null)) return;
-    run(() => api(`/api/documents/${id}`, { method: "PATCH", json: { collection_id: collectionId || null } }),
-      `Moved ${d.name} to ${collectionName(collectionId)}`);
-  }
-
-  function docMenu(anchor, id) {
-    const d = docById(id);
-    if (!d) return;
-    const busy = ["queued", "ingesting"].includes(d.status);
-    const targets = groups().filter((g) => (g.id || null) !== (d.collection_id || null));
-    const modeItems = !d.visual_capable ? [] : d.mode === "visual"
-      ? [{ label: d.has_text ? "Prefill from extracted text" : "Prefill from extracted text (no text layer)", disabled: !d.has_text || busy,
-           action: () => setMode(d, "text") }]
-      : [{ label: "Prefill from page images (vision)", disabled: busy, action: () => setMode(d, "visual") }];
-    openMenu(anchor, [
-      { label: d.mode === "visual" ? "View pages" : "View extracted text", action: () => openTextDialog(id) },
-      ...modeItems,
-      { label: d.status === "ready" ? "Rebuild KV cache" : "Build KV cache", disabled: busy || d.status === "waiting",
-        action: () => run(() => api(`/api/documents/${id}/reingest`, { method: "POST" }), `Rebuilding ${d.name}`) },
-      { label: "Rename…", action: async () => {
-        const name = await promptText("Rename document", "Name", d.name);
-        if (name && name !== d.name) run(() => api(`/api/documents/${id}`, { method: "PATCH", json: { name } }));
-      } },
-      ...(targets.length ? ["-", { heading: "Move to" }, ...targets.map((g) => ({ label: g.name, action: () => moveDocument(id, g.id) }))] : []),
-      "-",
-      { label: "Delete…", danger: true, action: async () => {
-        if (await confirmAction("Delete document", `Delete “${d.name}” and all of its KV caches?`, "Delete")) {
-          run(() => api(`/api/documents/${id}`, { method: "DELETE" }), `Deleted ${d.name}`);
-          state.selected.delete(id);
-        }
-      } },
-    ]);
-  }
-
-  function setMode(d, mode) {
-    const what = mode === "visual" ? "page images" : "extracted text";
-    run(() => api(`/api/documents/${d.id}`, { method: "PATCH", json: { mode } }), `${d.name}: prefilling from ${what}`);
-    if (mode === "visual" && !state.status?.engine?.vision) {
-      toast("The running model has no vision projector: add one (mmproj) to the preset in Settings → Model.", "error");
-    }
-  }
-
-  function collectionMenu(anchor, cid) {
-    const c = collectionById(cid);
-    if (!c) return;
-    const n = docsIn(cid).length;
-    openMenu(anchor, [
-      { label: "Upload files here…", action: () => pickFiles(cid) },
-      { label: "Paste text here…", action: () => openPaste(cid) },
-      { label: "Rename…", action: async () => {
-        const name = await promptText("Rename collection", "Name", c.name);
-        if (name && name !== c.name) run(() => api(`/api/collections/${cid}`, { method: "PATCH", json: { name } }));
-      } },
-      "-",
-      { label: "Delete collection…", danger: true, action: async () => {
-        const r = await confirmAction("Delete collection",
-          `Delete the collection “${c.name}”? Its ${n} document${n === 1 ? "" : "s"} will move to Unfiled.`, "Delete",
-          n ? { checkbox: `Delete the ${n} document${n === 1 ? "" : "s"} as well` } : {});
-        if (r) run(() => api(`/api/collections/${cid}?delete_documents=${r.checked}`, { method: "DELETE" }), `Deleted ${c.name}`);
-      } },
-    ]);
-  }
-
-  $("#new-collection").addEventListener("click", async () => {
-    const name = await promptText("New collection", "Name", "", "Create");
-    if (!name) return;
-    run(async () => {
-      const c = await (await api("/api/collections", { method: "POST", json: { name } })).json();
-      state.uploadTarget = c.id;
-      store.set("atlas.uploadTarget", c.id);
-    }, `Created ${name}`);
-  });
-
-  $("#search").addEventListener("input", (e) => { state.filter = e.target.value; renderLibrary(); });
+  $("#search").addEventListener("input", (e) => { state.filter = e.target.value; renderPicker(); });
   $("#select-all").addEventListener("click", () => {
     const q = state.filter.trim().toLowerCase();
     setSelected(state.docs.filter((d) => d.queryable && (!q || d.name.toLowerCase().includes(q))).map((d) => d.id), true);
   });
   $("#select-none").addEventListener("click", () => setSelected([...state.selected], false));
-
-  // drag documents onto collections
-  $("#doc-list").addEventListener("dragstart", (e) => {
-    const li = e.target.closest(".doc");
-    if (!li) return;
-    e.dataTransfer.setData("application/x-atlas-doc", li.dataset.id);
-    e.dataTransfer.effectAllowed = "move";
-  });
-  const dropGroup = (e) => e.target.closest?.(".group, .doc");
-  const groupOf = (el) => {
-    if (el.classList.contains("group")) return el;
-    let n = el;
-    while (n && !n.classList.contains("group")) n = n.previousElementSibling;
-    return n;
-  };
-  $("#doc-list").addEventListener("dragover", (e) => {
-    const el = dropGroup(e);
-    if (!el) return;
-    e.preventDefault();
-    document.querySelectorAll(".group.drop-target").forEach((g) => g.classList.remove("drop-target"));
-    groupOf(el)?.classList.add("drop-target");
-  });
-  $("#doc-list").addEventListener("drop", (e) => {
-    const el = dropGroup(e);
-    const g = el && groupOf(el);
-    document.querySelectorAll(".group.drop-target").forEach((x) => x.classList.remove("drop-target"));
-    if (!g) return;
-    e.preventDefault();
-    e.stopPropagation();
-    endLibraryDrag();
-    const cid = g.dataset.collection || null;
-    const docId = e.dataTransfer.getData("application/x-atlas-doc");
-    if (docId) moveDocument(docId, cid);
-    else if (e.dataTransfer.files?.length) uploadFiles([...e.dataTransfer.files], cid || "");
-  });
-  $("#doc-list").addEventListener("dragend", () => {
-    document.querySelectorAll(".group.drop-target").forEach((x) => x.classList.remove("drop-target"));
-  });
-
-  // ---------------------------------------------------------------- upload
-
-  async function uploadFiles(files, target = state.uploadTarget) {
-    if (!files.length) return;
-    const form = new FormData();
-    for (const f of files) form.append("files", f, f.name);
-    if (target) form.append("collection_id", target);
-    form.append("mode", uploadMode());
-    toast(`Uploading ${files.length} file${files.length > 1 ? "s" : ""} to ${collectionName(target)}…`);
-    try {
-      const res = await api("/api/documents", { method: "POST", body: form });
-      const { results } = await res.json();
-      let added = 0;
-      for (const r of results) {
-        if (r.error) toast(`${r.name}: ${r.error}`, "error");
-        else if (r.duplicate) toast(`${r.document.name} is already in the library (${collectionName(r.document.collection_id)})`);
-        else added++;
-        if (r.note) toast(`${r.document.name}: ${r.note}`);
-      }
-      if (added) toast(`Queued ${added} document${added > 1 ? "s" : ""} for ingestion`);
-    } catch (e) {
-      if (e.status !== 401) toast(e.message, "error");
-    }
-    refresh();
-  }
-
-  const uploadMode = () => state.uploadMode || state.status?.limits?.default_prefill || "text";
-  $("#upload-mode").addEventListener("change", (e) => {
-    state.uploadMode = e.target.value;
-    store.set("atlas.uploadMode", state.uploadMode);
-    if (state.uploadMode === "visual" && state.status && !state.status.engine?.vision) {
-      toast("Visual prefill needs a preset with a vision projector (mmproj): documents wait until one runs.");
-    }
-  });
-
-  let pickTarget = null;
-  function pickFiles(target) {
-    pickTarget = target;
-    $("#file-input").click();
-  }
-  $("#file-input").addEventListener("change", (e) => {
-    uploadFiles([...e.target.files], pickTarget ?? state.uploadTarget);
-    pickTarget = null;
-    e.target.value = "";
-  });
-  $("#upload-btn").addEventListener("click", () => pickFiles(state.uploadTarget));
-  $("#upload-target").addEventListener("change", (e) => {
-    state.uploadTarget = e.target.value;
-    store.set("atlas.uploadTarget", state.uploadTarget);
-  });
-
-  const library = $("#library");
-  let dragDepth = 0;
-  const isFileDrag = (e) => [...(e.dataTransfer?.types || [])].includes("Files");
-  function endLibraryDrag() { dragDepth = 0; library.classList.remove("dragging"); }
-  library.addEventListener("dragenter", (e) => {
-    if (!isFileDrag(e)) return;
-    e.preventDefault();
-    dragDepth++;
-    library.classList.add("dragging");
-  });
-  library.addEventListener("dragover", (e) => { if (isFileDrag(e)) e.preventDefault(); });
-  library.addEventListener("dragleave", (e) => { if (isFileDrag(e) && --dragDepth <= 0) endLibraryDrag(); });
-  library.addEventListener("drop", (e) => {
-    if (!isFileDrag(e)) return;
-    e.preventDefault();
-    endLibraryDrag();
-    uploadFiles([...(e.dataTransfer?.files || [])]);
-  });
-  $("#dropzone").addEventListener("click", (e) => {
-    if (e.target.closest("select, button")) return;
-    pickFiles(state.uploadTarget);
-  });
-
-  // paste text
-  const pasteDialog = $("#paste-dialog");
-  function openPaste(target = state.uploadTarget) {
-    renderUploadTargets();
-    $("#paste-collection").value = target || "";
-    pasteDialog.showModal();
-  }
-  $("#paste-btn").addEventListener("click", (e) => { e.stopPropagation(); openPaste(); });
-  pasteDialog.querySelectorAll("[data-close]").forEach((b) => b.addEventListener("click", () => pasteDialog.close()));
-  $("#paste-form").addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const name = $("#paste-name").value.trim(), text = $("#paste-text").value;
-    const collection_id = $("#paste-collection").value || null;
-    try {
-      const res = await api("/api/documents/text", { method: "POST", json: { name, text, collection_id } });
-      const r = await res.json();
-      toast(r.duplicate ? `${r.document.name} is already in the library` : `Queued ${name} for ingestion`);
-      pasteDialog.close();
-      e.target.reset();
-    } catch (err) {
-      if (err.status !== 401) toast(err.message, "error");
-    }
-    refresh();
-  });
 
   // text preview
   const pageUrls = [];
@@ -1143,6 +929,7 @@
         `${fmtInt(s.tokens_generated)} generated`,
       ];
       if (this.mode === "map_reduce") bits.push(`${s.n_relevant ?? 0} of ${s.n_targets} answers synthesized`);
+      if (s.history_turns) bits.push(`${s.history_turns} earlier turn${s.history_turns === 1 ? "" : "s"} sent`);
       if (s.cache_misses) bits.push(`<span style="color:var(--warn)">${s.cache_misses} cache miss${s.cache_misses > 1 ? "es" : ""}</span>`);
       if (s.truncated) bits.push(`<span style="color:var(--warn)">${s.truncated} generation${s.truncated > 1 ? "s" : ""} hit the token limit</span>`);
       this.el.foot.innerHTML = bits.join("<span>·</span>");
@@ -1233,7 +1020,7 @@
     if (docs.length) {
       state.selected = new Set(docs);
       store.set("atlas.selected", docs);
-      renderLibrary();
+      renderPicker();
       renderComposer();
     }
     closeConversations();
@@ -1367,17 +1154,53 @@
     refresh();
   });
 
-  $("#toggle-library").addEventListener("click", () => document.body.classList.toggle("library-open"));
+  $("#toggle-picker").addEventListener("click", () => document.body.classList.toggle("picker-open"));
   document.addEventListener("click", (e) => {
-    if (document.body.classList.contains("library-open") && !e.target.closest("#library, #toggle-library")) {
-      document.body.classList.remove("library-open");
+    if (document.body.classList.contains("picker-open") && !e.target.closest("#picker, #toggle-picker")) {
+      document.body.classList.remove("picker-open");
     }
   });
 
+  // ---------------------------------------------------------------- modules
+
+  // Every module is a view addressed by the URL hash (#chat, #library, #tools, #settings; a
+  // module may take a sub-path, e.g. #library/<document id>). Modules register show / hide.
+  const MODULES = ["chat", "library", "tools", "settings"];
+  const moduleHandlers = { chat: { show() { renderComposer(); question.focus(); } } };
+  let currentModule = null;
+
+  function route() {
+    const [name, ...rest] = location.hash.replace(/^#/, "").split("/");
+    const mod = MODULES.includes(name) ? name : "chat";
+    if (currentModule && currentModule !== mod) moduleHandlers[currentModule]?.hide?.();
+    currentModule = mod;
+    for (const m of MODULES) $(`#mod-${m}`).hidden = m !== mod;
+    document.querySelectorAll("#modules [data-module]").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.module === mod)));
+    document.body.dataset.module = mod;
+    document.body.classList.remove("picker-open");
+    store.set("atlas.module", mod);
+    moduleHandlers[mod]?.show?.(rest.join("/"));
+  }
+  function registerModule(name, handlers) {
+    moduleHandlers[name] = handlers;
+    if (currentModule === name) handlers.show?.(location.hash.split("/").slice(1).join("/"));
+  }
+  window.addEventListener("hashchange", route);
+  document.querySelectorAll("#modules [data-module]").forEach((b) => b.addEventListener("click", () => {
+    location.hash = `#${b.dataset.module}`;
+  }));
+  const subscribers = [];
+
   window.Atlas = {
     api, getJSON, esc, toast, refresh, openModal, confirmAction, promptText, openMenu,
-    fmtInt, fmtTok, fmtBytes, fmtMs, fmtAgo, state,
+    fmtInt, fmtTok, fmtBytes, fmtMs, fmtAgo, state, store, ICONS, STATUS_LABELS,
+    docMeta, statusPill, groups, docsIn, docById, collectionById, collectionName, patchList, run, setMode,
+    openTextDialog, setSelected,
+    subscribe: (fn) => subscribers.push(fn),
+    registerModule, current: () => currentModule,
   };
+  if (!location.hash) history.replaceState(null, "", `#${store.get("atlas.module", "chat")}`);
+  route();
 
   renderComposer();
   refresh().then(() => {

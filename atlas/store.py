@@ -447,6 +447,15 @@ class Store:
             out.append(d)
         return out
 
+    def document_caches(self, doc_id: str) -> list[dict]:
+        """A document's caches in every configuration, newest configuration first."""
+        rows = self._exec(f"""
+            SELECT {", ".join("c." + col.strip() for col in CACHE_COLUMNS.split(","))}, cf.label, cf.last_used
+            FROM caches c LEFT JOIN configs cf ON cf.fingerprint = c.fingerprint
+            WHERE c.doc_id = ? ORDER BY cf.last_used DESC
+        """, (doc_id,)).fetchall()
+        return [dict(r) for r in rows]
+
     # --- configs -----------------------------------------------------------------------
 
     def touch_config(self, fingerprint: str, label: str, details: dict) -> None:

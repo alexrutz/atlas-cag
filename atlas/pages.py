@@ -7,12 +7,17 @@ a hash of its file bytes. Pages are therefore rendered once per resolution and k
 import io
 import os
 import shutil
+import threading
 from pathlib import Path, PurePath
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
 VISUAL_EXTENSIONS = IMAGE_EXTENSIONS | {".pdf"}
 MAX_PAGES = 2000
 MAX_IMAGE_SIDE = 4096  # uploaded images larger than this are scaled down first
+
+
+# pdfium is not thread-safe: every use from worker threads must hold this lock, or the process crashes.
+PDFIUM = threading.Lock()
 
 
 class PageError(ValueError):
@@ -36,7 +41,12 @@ def page_count(filename: str, data: bytes) -> int:
     if ext == ".pdf":
         import pypdfium2 as pdfium
         try:
-            return len(pdfium.PdfDocument(data))
+            with PDFIUM:
+                pdf = pdfium.PdfDocument(data)
+                try:
+                    return len(pdf)
+                finally:
+                    pdf.close()  # explicitly, under the lock, not later by the garbage collector
         except Exception as e:  # pdfium raises its own error types
             raise PageError(f"cannot open PDF: {e}") from e
     return 0
@@ -61,6 +71,19 @@ def _png(img) -> bytes:
     buf = io.BytesIO()
     img.save(buf, "PNG", compress_level=6)
     return buf.getvalue()
+
+
+def render_page(pdf, index: int, scale: float):
+    """Render one page to a PIL image that no longer depends on pdfium memory. Hold PDFIUM."""
+    page = pdf[index]
+    try:
+        bitmap = page.render(scale=scale)
+        try:
+            return bitmap.to_pil().copy()
+        finally:
+            bitmap.close()
+    finally:
+        page.close()
 
 
 def page_dir(doc_dir: Path, dpi: int) -> Path:
@@ -89,15 +112,22 @@ def ensure_pages(original: Path, doc_dir: Path, dpi: int) -> list[Path]:
             (tmp / "page-0001.png").write_bytes(_png(img))
         elif ext == ".pdf":
             import pypdfium2 as pdfium
+            with PDFIUM:
+                try:
+                    pdf = pdfium.PdfDocument(data)
+                except Exception as e:
+                    raise PageError(f"cannot open PDF: {e}") from e
+                n = len(pdf)
+            if n > MAX_PAGES:
+                raise PageError(f"{n} pages; visual prefill supports at most {MAX_PAGES}")
             try:
-                pdf = pdfium.PdfDocument(data)
-            except Exception as e:
-                raise PageError(f"cannot open PDF: {e}") from e
-            if len(pdf) > MAX_PAGES:
-                raise PageError(f"{len(pdf)} pages; visual prefill supports at most {MAX_PAGES}")
-            for i in range(len(pdf)):
-                bitmap = pdf[i].render(scale=dpi / 72)
-                (tmp / f"page-{i + 1:04d}.png").write_bytes(_png(bitmap.to_pil()))
+                for i in range(n):
+                    with PDFIUM:  # page by page, so thumbnails elsewhere are not blocked for long
+                        image = render_page(pdf, i, dpi / 72)
+                    (tmp / f"page-{i + 1:04d}.png").write_bytes(_png(image))
+            finally:
+                with PDFIUM:
+                    pdf.close()
         else:
             raise PageError(f"visual prefill supports PDFs and images, not '{ext}'")
         (tmp / ".complete").touch()

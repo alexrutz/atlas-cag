@@ -9,7 +9,7 @@
 </head>
 <body>
   <header class="topbar">
-    <button class="icon-btn only-narrow" id="toggle-library" aria-label="Toggle library">
+    <button class="icon-btn only-narrow" id="toggle-picker" aria-label="Documents">
       <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
     </button>
     <div class="brand">
@@ -17,39 +17,26 @@
         <svg viewBox="0 0 32 32"><path d="M9 23 16 8l7 15M11.5 18h9"/></svg>
       </span>
       <span class="brand-name">Atlas</span>
-      <span class="brand-sub">Cache-augmented generation</span>
     </div>
+    <nav class="modules" id="modules" role="tablist" aria-label="Modules">
+      <button role="tab" data-module="chat"><svg viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12Z"/></svg><span>Chat</span></button>
+      <button role="tab" data-module="library"><svg viewBox="0 0 24 24"><path d="M4 5h5v14H4zM10 5h5v14h-5zM16 6l4 1-3 13-4-1z"/></svg><span>Library</span></button>
+      <button role="tab" data-module="tools"><svg viewBox="0 0 24 24"><path d="M6 3h9l4 4v14H6zM14 3v5h5M9 13h6M9 17h6"/></svg><span>PDF tools</span></button>
+      <button role="tab" data-module="settings"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3h0a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5h0a1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8v0a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></svg><span>Settings</span></button>
+    </nav>
     <div class="engine" id="engine">
       <span class="dot" id="engine-dot"></span>
       <span id="engine-text">Connecting…</span>
       <span class="slots" id="slots" aria-label="Slot usage"></span>
     </div>
-    <button class="icon-btn settings-toggle" id="open-settings" title="Settings" aria-label="Settings" aria-pressed="false">
-      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3h0a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5h0a1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8v0a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></svg>
-    </button>
   </header>
 
-  <div class="layout">
-    <aside class="library" id="library">
-      <div class="library-head">
-        <h2>Library</h2>
-        <div class="library-actions">
-          <button class="btn subtle" id="new-collection" title="Create a collection">New collection</button>
-          <button class="btn primary" id="upload-btn" title="Upload documents">Upload</button>
-          <input type="file" id="file-input" multiple hidden>
-        </div>
-      </div>
-      <div class="dropzone" id="dropzone">
-        <div>Drop files here to ingest into
-          <select id="upload-target" aria-label="Upload into collection"></select></div>
-        <span class="muted">PDF, DOCX, HTML, Markdown, text, code, images · <button class="link-btn" id="paste-btn" type="button">paste text</button></span>
-        <label class="upload-mode" title="How PDFs and images are prefilled. Visual prefill sends page images to a vision model (needs a preset with a vision projector); it reads tables, charts and scans that text extraction misses.">
-          PDFs &amp; images:
-          <select id="upload-mode" aria-label="Prefill mode for PDFs and images">
-            <option value="text">extracted text</option>
-            <option value="visual">page images (vision)</option>
-          </select>
-        </label>
+  <!-- ============================================================ Chat -->
+  <section class="module chat-module" id="mod-chat" hidden>
+    <aside class="picker" id="picker">
+      <div class="picker-head">
+        <h2>Documents</h2>
+        <a class="link-btn" href="#library">Manage library</a>
       </div>
       <div class="library-tools">
         <input type="search" id="search" placeholder="Filter documents" autocomplete="off">
@@ -83,11 +70,11 @@
         <div class="empty" id="empty">
           <h1>Ask your documents</h1>
           <p class="muted">Each document is prefilled into llama.cpp once and its KV cache is persisted to disk.
-            A query restores that cache into a slot and only evaluates your question.</p>
+            A question restores that cache into a slot and only evaluates the conversation and your question.</p>
           <ol class="steps">
-            <li><strong>Choose a model</strong><span>Open Settings to create a llama-server preset or download a model.</span></li>
-            <li><strong>Ingest</strong><span>Upload files into collections. Atlas prefills each one with zero output tokens and saves the slot.</span></li>
-            <li><strong>Ask</strong><span>Tick documents or whole collections. One document answers directly; several are answered one by one and then combined.</span></li>
+            <li><strong>Choose a model</strong><span><a href="#settings">Settings</a>: create a llama-server preset or download a model.</span></li>
+            <li><strong>Add documents</strong><span><a href="#library">Library</a>: upload files into collections; <a href="#tools">PDF tools</a> cut large PDFs into shards first.</span></li>
+            <li><strong>Chat</strong><span>Tick documents or whole collections on the left and ask. Follow-up questions keep the conversation.</span></li>
           </ol>
         </div>
       </section>
@@ -95,7 +82,7 @@
       <form class="composer" id="composer">
         <div class="chips" id="chips"></div>
         <div class="composer-row">
-          <textarea id="question" rows="1" placeholder="Select documents, then ask a question…" maxlength="20000"></textarea>
+          <textarea id="question" rows="1" placeholder="Select documents, then ask a question…"></textarea>
           <div class="composer-side">
             <label class="toggle" id="thinking-wrap" hidden title="Let the model reason before answering">
               <input type="checkbox" id="thinking"> Thinking
@@ -105,22 +92,36 @@
           </div>
         </div>
       </form>
-
-      <section class="settings" id="settings" hidden>
-        <div class="settings-head">
-          <h1>Settings</h1>
-          <nav class="tabs" role="tablist">
-            <button role="tab" data-tab="model" aria-selected="true">Model</button>
-            <button role="tab" data-tab="models" aria-selected="false">Model files</button>
-            <button role="tab" data-tab="generation" aria-selected="false">Generation</button>
-            <button role="tab" data-tab="storage" aria-selected="false">Storage</button>
-          </nav>
-          <button class="btn subtle" id="close-settings">Back to chat</button>
-        </div>
-        <div class="settings-body" id="settings-body"></div>
-      </section>
     </main>
-  </div>
+  </section>
+
+  <!-- ============================================================ Library -->
+  <section class="module page-module" id="mod-library" hidden>
+    <div class="page" id="library-root"></div>
+  </section>
+
+  <!-- ============================================================ PDF tools -->
+  <section class="module page-module" id="mod-tools" hidden>
+    <div class="page" id="tools-root"></div>
+  </section>
+
+  <!-- ============================================================ Settings -->
+  <section class="module page-module" id="mod-settings" hidden>
+    <div class="settings" id="settings">
+      <div class="settings-head">
+        <h1>Settings</h1>
+        <nav class="tabs" role="tablist">
+          <button role="tab" data-tab="model" aria-selected="true">Model</button>
+          <button role="tab" data-tab="models" aria-selected="false">Model files</button>
+          <button role="tab" data-tab="generation" aria-selected="false">Generation</button>
+          <button role="tab" data-tab="storage" aria-selected="false">Storage</button>
+        </nav>
+      </div>
+      <div class="settings-body" id="settings-body"></div>
+    </div>
+  </section>
+
+  <input type="file" id="file-input" multiple hidden>
 
   <dialog id="text-dialog" class="dialog wide">
     <form method="dialog" class="dialog-head">
@@ -167,6 +168,8 @@
 
   <div class="toasts" id="toasts" aria-live="polite"></div>
   <script src="/static/app.js"></script>
+  <script src="/static/library.js"></script>
+  <script src="/static/tools.js"></script>
   <script src="/static/settings.js"></script>
 </body>
 </html>
