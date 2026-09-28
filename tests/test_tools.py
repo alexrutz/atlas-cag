@@ -105,3 +105,23 @@ async def test_thumbnails_can_be_rendered_concurrently(atlas):
     rs = await asyncio.gather(*(atlas.get(f"/api/tools/pdf/{a['id']}/thumb/{n}?width={w}")
                                 for n in range(1, 6) for w in (100, 140, 180)))
     assert all(r.status_code == 200 for r in rs)
+
+
+def test_shards_do_not_drag_in_linked_pages():
+    """Link annotations to other pages must not pull the rest of the PDF into a shard."""
+    from pypdf.annotations import Link
+    from pypdf.generic import Fit
+
+    from atlas import pdftools
+    writer = PdfWriter()
+    for i in range(40):
+        writer.append(PdfReader(io.BytesIO(text_pdf(f"Page {i}: " + "rule text " * 200))))
+    for i in range(40):  # every page links to every tenth page, like a cross-referenced rule book
+        for target in range(0, 40, 10):
+            writer.add_annotation(i, Link(rect=(50, 50, 100, 60), target_page_index=target, fit=Fit.fit()))
+    buf = io.BytesIO()
+    writer.write(buf)
+    source = buf.getvalue()
+    shard = pdftools.build_shard(source, [5, 6])
+    assert len(PdfReader(io.BytesIO(shard)).pages) == 2
+    assert len(shard) < len(source) / 10, (len(shard), len(source))  # was 15% of the source before the fix

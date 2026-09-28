@@ -528,11 +528,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         s = st(request)
         data = (tool_workspace(ws_id) / "source.pdf").read_bytes()
         collection_id = check_collection(s, body.collection_id)
+        try:
+            source = await asyncio.to_thread(pdftools.reader, data)  # parsed once for all shards
+        except pdftools.PdfToolError as e:
+            raise HTTPException(400, str(e)) from e
         results, taken = [], set()
         for shard in body.shards:
             name = pdftools.shard_filename(shard.name, taken)
             try:
-                shard_data = await asyncio.to_thread(pdftools.build_shard, data, shard.pages)
+                shard_data = await asyncio.to_thread(pdftools.build_shard, source, shard.pages)
                 prepared = await asyncio.to_thread(prepare_upload, name, shard_data, body.mode or settings.default_prefill)
             except (pdftools.PdfToolError, ExtractionError, page_images.PageError) as e:
                 results.append({"name": name, "error": str(e)})

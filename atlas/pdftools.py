@@ -80,18 +80,30 @@ def thumbnail(data: bytes, page: int, width: int) -> bytes:
     return buf.getvalue()
 
 
-def build_shard(data: bytes, pages: list[int]) -> bytes:
-    """A new PDF of the given 1-based pages, in the given order."""
+# Page keys not copied into shards. Link annotations point to other pages; copying a page follows
+# them, and through the link graph of a cross-referenced PDF (rule books, manuals) pulls most of the
+# document into every shard: 54 MB and 48 s for a 67-page shard of a 4,417-page PDF, instead of
+# 0.7 MB and 2 s. Links out of a shard cannot work anyway, and prefill does not use annotations.
+SHARD_EXCLUDED_KEYS = ("/Annots", "/B")
+
+
+def build_shard(source, pages: list[int]) -> bytes:
+    """A new PDF of the given 1-based pages, in the given order. `source`: PDF bytes or a PdfReader
+    (pass one reader for several shards of the same PDF, so it is parsed only once)."""
     from pypdf import PdfWriter
-    reader = _reader(data)
+    reader = _reader(source) if isinstance(source, bytes) else source
     if not pages or any(not 1 <= p <= len(reader.pages) for p in pages):
         raise PdfToolError("shard pages out of range")
     writer = PdfWriter()
     for p in pages:
-        writer.add_page(reader.pages[p - 1])
+        writer.add_page(reader.pages[p - 1], excluded_keys=SHARD_EXCLUDED_KEYS)
     buf = io.BytesIO()
     writer.write(buf)
     return buf.getvalue()
+
+
+def reader(data: bytes):
+    return _reader(data)
 
 
 def shard_filename(name: str, taken: set[str]) -> str:
@@ -106,9 +118,10 @@ def shard_filename(name: str, taken: set[str]) -> str:
 def build_zip(data: bytes, shards: list[tuple[str, list[int]]]) -> bytes:
     buf = io.BytesIO()
     taken: set[str] = set()
+    source = _reader(data)
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         for name, pages in shards:
-            z.writestr(shard_filename(name, taken), build_shard(data, pages))
+            z.writestr(shard_filename(name, taken), build_shard(source, pages))
     return buf.getvalue()
 
 
