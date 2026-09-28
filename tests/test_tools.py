@@ -125,3 +125,16 @@ def test_shards_do_not_drag_in_linked_pages():
     shard = pdftools.build_shard(source, [5, 6])
     assert len(PdfReader(io.BytesIO(shard)).pages) == 2
     assert len(shard) < len(source) / 10, (len(shard), len(source))  # was 15% of the source before the fix
+
+
+async def test_long_shard_names_are_shortened_not_rejected(atlas):
+    """Bookmark titles can be long (a rule book had 250-character shard names)."""
+    a = await analyze(atlas, files={"file": ("manual.pdf", BOOK)})
+    long = "RINA RULES interactive version - 1 January 2026 – SubArticle - 2.5 Assignment of a Dual Class " + "word " * 40
+    r = await atlas.post(f"/api/tools/pdf/{a['id']}/shards", json={"shards": [{"name": long, "pages": [1]}]})
+    assert r.status_code == 200, r.text
+    name = r.json()["results"][0]["document"]["name"]
+    assert len(name) <= 200 and name.endswith("….pdf") and name.startswith("RINA RULES interactive version")
+
+    r = await atlas.post(f"/api/tools/pdf/{a['id']}/shards", json={"shards": [{"name": "ok", "pages": [1]}, {"name": "", "pages": [2]}]})
+    assert r.status_code == 422 and r.json()["detail"].startswith("shards › #2 › name:"), r.json()

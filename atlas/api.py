@@ -10,7 +10,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path, PurePath
 
 from fastapi import APIRouter, Depends, FastAPI, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from typing import Literal
 
@@ -60,7 +61,7 @@ class QueryRequest(BaseModel):
 
 
 class ShardSpec(BaseModel):
-    name: str = Field(min_length=1, max_length=200)
+    name: str = Field(min_length=1, max_length=5000)  # shortened to a file name when the shard is stored
     pages: list[int] = Field(min_length=1, max_length=10000)
 
 
@@ -130,6 +131,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             store.close()
 
     app = FastAPI(title="Atlas CAG", version=__version__, lifespan=lifespan)
+
+    @app.exception_handler(RequestValidationError)
+    async def readable_validation_error(request: Request, exc: RequestValidationError):
+        """Say which field is wrong ("shards › 13 › name: …"), not only what is wrong."""
+        def where(loc) -> str:
+            parts = [f"#{p + 1}" if isinstance(p, int) else str(p) for p in loc if p not in ("body", "query", "path")]
+            return " › ".join(parts)
+        messages = [f"{where(e['loc'])}: {e['msg']}" if where(e["loc"]) else e["msg"] for e in exc.errors()]
+        return JSONResponse({"detail": "; ".join(messages)}, status_code=422)
     keys = settings.api_key_set
 
     async def require_auth(request: Request) -> None:

@@ -106,8 +106,13 @@ def reader(data: bytes):
     return _reader(data)
 
 
+FILENAME_CHARS = 180  # document names are at most 200 characters (with suffix and counter)
+
+
 def shard_filename(name: str, taken: set[str]) -> str:
-    base = re.sub(r"[\\/:*?\"<>|\x00-\x1f]+", " ", name).strip().removesuffix(".pdf").strip()[:180] or "shard"
+    base = re.sub(r"[\\/:*?\"<>|\x00-\x1f]+", " ", name).strip().removesuffix(".pdf").strip() or "shard"
+    if len(base) > FILENAME_CHARS:  # bookmark titles can be long: cut at a word, keep it readable
+        base = base[:FILENAME_CHARS].rsplit(" ", 1)[0].rstrip(" -–,;:") + "…"
     candidate, k = f"{base}.pdf", 2
     while candidate.lower() in taken:
         candidate, k = f"{base} ({k}).pdf", k + 1
