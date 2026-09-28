@@ -28,6 +28,9 @@ CANARY_SUFFIX = ","
 # Allowance for tokens merging differently where a measured prompt meets its padding.
 MEASURE_MARGIN = 8
 
+# With no answer limit, a document part must still leave at least this much room for an answer.
+MIN_ANSWER_ROOM = 1024
+
 PieceCallback = Callable[[str, str], Awaitable[None]]
 ProgressCallback = Callable[[int, int], None]
 
@@ -52,6 +55,19 @@ class EngineInfo:
 
     def to_json(self) -> dict:
         return dict(self.__dict__)
+
+
+@dataclass
+class ChatSuffix:
+    """What follows a cached document: earlier turns, the question and the generation prompt."""
+    tokens: list[int]  # for text documents
+    text: str  # for visual documents (multimodal prompt string; content defused)
+    layout: prompts.Layout
+    n_history: int  # earlier turns included
+
+    @property
+    def n_tokens(self) -> int:
+        return len(self.tokens)
 
 
 @dataclass
@@ -103,6 +119,8 @@ class Engine:
         self.pool: SlotPool | None = None
         self.info = EngineInfo()
         self._layouts: dict[tuple[str, bool], prompts.Layout] = {}
+        self._chats: dict[tuple, prompts.ChatRender] = {}
+        self._plain_cache: dict[str, list[int]] = {}
         self._template_tokens: dict[tuple[str, bool], list[int]] = {}
         self._ident: dict = {}
         self._instance: str | None = None
@@ -184,6 +202,8 @@ class Engine:
         if changed:
             log.warning("model fingerprint changed %s -> %s", self.info.fingerprint, fingerprint)
             self._layouts.clear()
+            self._chats.clear()
+            self._plain_cache.clear()
             self._template_tokens.clear()
         if self.pool is None:
             self.pool = SlotPool(n_slots)
@@ -449,6 +469,17 @@ class Engine:
     async def count(self, text: str) -> int:
         return len(await self.plain(text))
 
+    async def plain_cached(self, text: str) -> list[int]:
+        """Plain tokens of text that recurs (earlier turns of a conversation are sent with every part)."""
+        if text not in self._plain_cache:
+            if len(self._plain_cache) > 512:
+                self._plain_cache.clear()
+            self._plain_cache[text] = await self.plain(text)
+        return self._plain_cache[text]
+
+    async def count_cached(self, text: str) -> int:
+        return len(await self.plain_cached(text))
+
     async def prefix_overhead(self) -> tuple[list[int], list[int]]:
         lay = await self.layout(self.settings.system_prompt, self.settings.enable_thinking)
         return await self._template(lay.head, first=True), await self._template(lay.mid)
@@ -458,21 +489,59 @@ class Engine:
         body = await self.plain(prompts.document_block(name, idx, n_parts, text))
         return head + body + mid
 
-    async def question_suffix(self, block: str, thinking: bool) -> tuple[list[int], prompts.Layout]:
-        lay = await self.layout(self.settings.system_prompt, thinking)
-        return await self.plain(block) + await self._template(lay.tail), lay
+    def reserve_tokens(self) -> int:
+        """Room kept free in a slot when splitting documents: set, or 1/8 of the slot (4k–64k)."""
+        n_ctx = self.info.n_ctx_slot
+        reserve = self.settings.reserve_tokens or min(max(n_ctx // 8, 4096), 65536)
+        return min(reserve, n_ctx // 2)
 
-    async def synthesis_prompt(self, findings: list[tuple[str, str]], question: str,
-                               thinking: bool) -> tuple[list[int], prompts.Layout]:
-        lay = await self.layout(self.settings.synthesis_prompt, thinking)
-        tokens = (
-            await self._template(lay.head, first=True)
-            + await self.plain(prompts.findings_block(findings))
-            + await self._template(lay.mid)
-            + await self.plain(prompts.synthesis_question_block(question))
-            + await self._template(lay.tail)
-        )
-        return tokens, lay
+    # --- chat --------------------------------------------------------------------------
+
+    async def render_chat(self, system_prompt: str, n_turns: int, thinking: bool, with_doc: bool) -> prompts.ChatRender:
+        key = (system_prompt, n_turns, thinking, with_doc)
+        if key not in self._chats:
+            rendered = await self.llama.apply_template(prompts.chat_messages(system_prompt, n_turns, with_doc),
+                                                       {"enable_thinking": thinking})
+            self._chats[key] = prompts.split_chat(rendered, n_turns, with_doc)
+        return self._chats[key]
+
+    async def _assemble(self, render: prompts.ChatRender, contents: list[str], skip_first: bool) -> tuple[list[int], str]:
+        tokens: list[int] = []
+        text = ""
+        for i, content in enumerate(contents):
+            if not (i == 0 and skip_first):
+                tokens += await self._template(render.glue[i])
+                text += render.glue[i]
+            tokens += await self.plain_cached(content)
+            text += prompts.defuse(content)
+        tokens += await self._template(render.tail)
+        return tokens, text + render.tail
+
+    async def chat_suffix(self, history: list[tuple[str, str]], block: str, thinking: bool) -> ChatSuffix:
+        """The conversation after a cached document: earlier turns, then the question block."""
+        cached = await self.layout(self.settings.system_prompt, self.settings.enable_thinking)
+        contents = prompts.history_turns(history) + [block]
+        try:
+            render = await self.render_chat(self.settings.system_prompt, len(contents), thinking, with_doc=True)
+            fits_cache = render.head == cached.head and render.glue[0] == cached.mid
+        except prompts.TemplateError:
+            fits_cache = False
+        if not fits_cache:
+            # the template renders the first turn differently in a longer chat: the cached prefix
+            # would not match, so the earlier turns go into the question as text instead
+            contents = [prompts.history_block(history) + block if history else block]
+            render = await self.render_chat(self.settings.system_prompt, 1, thinking, with_doc=True)
+        tokens, text = await self._assemble(render, contents, skip_first=True)
+        return ChatSuffix(tokens, text, prompts.Layout(render.head, render.glue[0], render.tail), len(history))
+
+    async def synthesis_prompt(self, findings: list[tuple[str, str]], question: str, thinking: bool,
+                               history: list[tuple[str, str]] = ()) -> tuple[list[int], prompts.Layout]:
+        contents = prompts.history_turns(list(history)) + [
+            prompts.findings_block(findings) + prompts.synthesis_question_block(question)]
+        render = await self.render_chat(self.settings.synthesis_prompt, len(contents), thinking, with_doc=False)
+        tokens, _ = await self._assemble(render, contents, skip_first=False)
+        tokens = await self._template(render.head, first=True) + tokens
+        return tokens, prompts.Layout(render.head, "", render.tail)
 
     # --- visual prefill ------------------------------------------------------------------
 
@@ -485,10 +554,6 @@ class Engine:
     async def visual_prefix(self, name: str, idx: int, n_parts: int, page_numbers: list[int]) -> str:
         lay = await self.layout(self.settings.system_prompt, self.settings.enable_thinking)
         return lay.head + prompts.visual_document_block(name, idx, n_parts, page_numbers) + lay.mid
-
-    async def visual_suffix(self, block: str, thinking: bool) -> tuple[str, prompts.Layout]:
-        lay = await self.layout(self.settings.system_prompt, thinking)
-        return prompts.defuse(block) + lay.tail, lay
 
     def multimodal(self, text: str, images: list[bytes]) -> dict:
         marker = self.info.media_marker
@@ -530,19 +595,8 @@ class Engine:
         raise LlamaError("llama-server accepted a prompt larger than its context: turn off context shift "
                          "(--no-context-shift) for visual prefill")
 
-    async def condense_prompt(self, history: list[tuple[str, str]], question: str) -> tuple[list[int], prompts.Layout]:
-        lay = await self.layout(prompts.CONDENSE_SYSTEM_PROMPT, False)
-        tokens = (
-            await self._template(lay.head, first=True)
-            + await self.plain(prompts.history_block(history))
-            + await self._template(lay.mid)
-            + await self.plain(prompts.followup_block(question))
-            + await self._template(lay.tail)
-        )
-        return tokens, lay
-
-    async def synthesis_overhead(self, question: str, thinking: bool) -> int:
-        tokens, _ = await self.synthesis_prompt([], question, thinking)
+    async def synthesis_overhead(self, question: str, thinking: bool, history: list[tuple[str, str]] = ()) -> int:
+        tokens, _ = await self.synthesis_prompt([], question, thinking, history)
         return len(tokens)
 
     # --- execution ---------------------------------------------------------------------
@@ -565,25 +619,28 @@ class Engine:
             raise LlamaError(f"prefill evaluated {final.get('tokens_evaluated')} of {len(tokens)} tokens")
         return final
 
-    async def generate(self, slot: int, tokens: list[int] | dict, layout: prompts.Layout, answer_cap: int,
+    async def generate(self, slot: int, tokens: list[int] | dict, layout: prompts.Layout, answer_cap: int | None,
                        on_piece: PieceCallback | None = None, temperature: float | None = None,
                        n_prompt: int | None = None) -> GenResult:
-        """Decode an answer of up to `answer_cap` tokens (plus the thinking budget, if thinking is on).
+        """Decode an answer. Without `answer_cap` (or thinking budget) generation runs until the model
+        stops or the slot is full; with both it is capped at answer + thinking budget.
 
         `tokens` may be a multimodal prompt; `n_prompt` then gives its length in tokens."""
         thinking_open = layout.thinking_open
-        cap = answer_cap + (self.settings.max_thinking_tokens if thinking_open else 0)
+        budget = self.settings.max_thinking_tokens if thinking_open else 0
         prompt_len = len(tokens) if isinstance(tokens, list) else (n_prompt or 0)
+        free = self.info.n_ctx_slot - prompt_len - 1
+        capped = bool(answer_cap) and (not thinking_open or bool(budget))
         payload = {
             "prompt": tokens,
-            "n_predict": max(1, min(cap, self.info.n_ctx_slot - prompt_len - 1)),
+            "n_predict": max(1, min(answer_cap + (budget or 0), free) if capped else free),
             "id_slot": slot,
             "cache_prompt": True,
             **self.sampling,
         }
         if temperature is not None:
             payload["temperature"] = temperature
-        if thinking_open:
+        if thinking_open and budget:
             # llama-server forces the end tag once the budget is spent, so an answer always follows.
             # The message key must be present: only its handler sets the tokens that get forced.
             payload.update({

@@ -81,8 +81,5 @@ async def test_sampling_is_sent_with_every_generation(atlas, fake):
 
     atlas.app.state.engine.sampling = {"temperature": 0.7, "top_k": 20, "top_p": 0.8, "min_p": 0.0}
     await query(atlas, "Why?", [a["id"]], conversation_id=cid)
-    rewrite, answer = [e for e in fake.log if e["n_predict"] > 1][-2:]
-    assert "Follow-up question:" in rewrite["prompt_text"]
-    assert rewrite["sampling"] == {"temperature": 0.0, "top_k": 20, "top_p": 0.8, "min_p": 0.0}, \
-        "follow-up rewrites are deterministic"
+    answer = [e for e in fake.log if e["n_predict"] > 1][-1]
     assert answer["sampling"] == {"temperature": 0.7, "top_k": 20, "top_p": 0.8, "min_p": 0.0}

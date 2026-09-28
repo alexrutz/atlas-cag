@@ -96,7 +96,7 @@ async def test_image_is_prefilled_visually_and_restored(atlas, fake):
     assert page.status_code == 200 and page.headers["content-type"] == "image/png"
 
 
-@pytest.mark.parametrize("atlas", [{"visual_dpi": 300}], indirect=True)
+@pytest.mark.parametrize("atlas", [{"visual_dpi": 300, "reserve_tokens": 1024}], indirect=True)
 async def test_large_pages_are_split_into_parts_by_measuring(atlas, fake):
     """At 300 dpi one page takes ~2100 tokens: only one fits a 4096-token slot per part."""
     fake.vision = True
@@ -107,7 +107,7 @@ async def test_large_pages_are_split_into_parts_by_measuring(atlas, fake):
     doc = await ready(atlas, result["document"]["id"])
     parts = atlas.app.state.store.get_parts(doc["id"], doc["fingerprint"])
     assert [(p.char_start, p.char_end) for p in parts] == [(0, 1), (1, 2), (2, 3)]
-    limit = 4096 - 256 - 256
+    limit = 4096 - 1024  # the reserve kept for conversation and answer
     assert all(p.n_tokens <= limit for p in parts)
 
     events = await query(atlas, "What is the pump pressure?", [doc["id"]])

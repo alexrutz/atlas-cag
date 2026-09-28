@@ -71,17 +71,21 @@ class Settings(BaseSettings):
     # ends with a self-rated coverage and answers rated "none" are dropped before synthesis,
     # which is faster over many documents but trusts the model's rating.
     relevance_filter: bool = False
-    max_question_tokens: int = 1024
-    max_answer_tokens: int = 1024  # per-document answers (map phase and single-document mode)
-    max_final_tokens: int = 2048  # synthesized answer (reduce phase)
+    # Token limits; 0 or empty = no limit (generation runs until the model stops or the slot is
+    # full; the Stop button ends it). Set them to bound answer time.
+    max_question_tokens: int | None = None
+    max_answer_tokens: int | None = None  # per-document answers (map phase and single-document mode)
+    max_final_tokens: int | None = None  # synthesized answer (reduce phase)
     # Sampling (temperature, top-p, …) belongs to presets; see atlas/sampling.py.
     # Default for chat templates that support a thinking switch (Qwen3, etc.). Overridable per query.
-    enable_thinking: bool = False
-    # Reasoning tokens allowed per generation when thinking is on (added to the answer budget).
-    max_thinking_tokens: int = 2048
-    # Rewrite follow-up questions into standalone questions using the conversation before they
-    # are asked (each document cache holds only its document, not the conversation).
-    condense_followups: bool = True
+    enable_thinking: bool = True
+    max_thinking_tokens: int | None = None  # reasoning budget per generation when thinking is on
+    # Room kept free in every slot when a document is split into parts, for the conversation, the
+    # question, thinking and the answer. Empty = automatic: 1/8 of the slot, 4k to 64k tokens.
+    reserve_tokens: int | None = None
+    # Send the conversation's earlier questions and answers with every question (never the
+    # documents or the model's thinking).
+    chat_history: bool = True
 
     system_prompt: str = (
         "You are Atlas, an enterprise document assistant. You answer questions strictly "
@@ -143,12 +147,13 @@ def get_settings() -> Settings:
 class RuntimeSettings(BaseModel):
     """Settings editable at runtime from the UI. Values are persisted and override the env."""
 
-    max_question_tokens: int = Field(ge=64, le=65536)
-    max_answer_tokens: int = Field(ge=64, le=65536)
-    max_final_tokens: int = Field(ge=64, le=65536)
+    max_question_tokens: int | None = Field(ge=0, le=4_194_304)  # 0 / None: no limit
+    max_answer_tokens: int | None = Field(ge=0, le=4_194_304)
+    max_final_tokens: int | None = Field(ge=0, le=4_194_304)
     enable_thinking: bool
-    max_thinking_tokens: int = Field(ge=0, le=131072)
-    condense_followups: bool
+    max_thinking_tokens: int | None = Field(ge=0, le=4_194_304)
+    reserve_tokens: int | None = Field(ge=0, le=4_194_304)  # 0 / None: automatic
+    chat_history: bool
     relevance_filter: bool
     ingest_concurrency: int = Field(ge=1, le=32)
     part_overlap_tokens: int = Field(ge=0, le=16384)

@@ -1,7 +1,8 @@
 """Query execution.
 
-follow-up question   : rewritten into a standalone question from the conversation first
-single document part : restore slot file -> append question -> stream answer
+conversation         : the earlier questions and answers are sent as chat turns after the cached
+                       document (never the documents or the model's thinking)
+single document part : restore slot file -> append conversation + question -> stream answer
 several parts / docs : map  - every part is answered individually and in parallel (bounded by slots)
                        reduce - the relevant answers are concatenated and the original question is
                                 run against them to synthesize the final answer (hierarchically if
@@ -18,7 +19,7 @@ from dataclasses import dataclass, field
 from . import pages as page_images
 from . import prompts
 from .config import Settings
-from .engine import Engine, GenResult, cache_rejected
+from .engine import MIN_ANSWER_ROOM, ChatSuffix, Engine, GenResult, cache_rejected
 from .ingest import Ingestor
 from .llama import LlamaError
 from .slots import PRIORITY_QUERY
@@ -29,7 +30,6 @@ log = logging.getLogger("atlas.query")
 Emit = Callable[[dict], Awaitable[None]]
 
 NOTHING_FOUND = "None of the selected documents contain information relevant to this question."
-HISTORY_TURNS = 4  # recent turns used to rewrite a follow-up question
 TITLE_CHARS = 80
 
 
@@ -79,6 +79,9 @@ class Plan:
     conversation: dict = field(default_factory=dict)
     history: list[tuple[str, str]] = field(default_factory=list)  # (question, answer), oldest first
     asked: str = ""  # the question as the user typed it
+    suffixes: dict = field(default_factory=dict)  # (question block, oldest turns dropped) -> ChatSuffix
+    synthesis_history: list[tuple[str, str]] = field(default_factory=list)
+    history_sent: int | None = None  # fewest earlier turns that fit next to a document part
 
     @property
     def mode(self) -> str:
@@ -155,14 +158,15 @@ class QueryService:
             for p in parts:
                 targets.append(Target(len(targets) + 1, doc, p, len(parts), dpi))
 
-        n_q = await self.engine.count(question)
-        if n_q > self.settings.max_question_tokens:
-            raise QueryError(f"question has {n_q} tokens, limit is {self.settings.max_question_tokens}")
+        if self.settings.max_question_tokens:
+            n_q = await self.engine.count(question)
+            if n_q > self.settings.max_question_tokens:
+                raise QueryError(f"question has {n_q} tokens, limit is {self.settings.max_question_tokens}")
 
         thinking = self.settings.enable_thinking if thinking is None else thinking
         history = []
-        if conversation:
-            turns = self.store.conversation_turns(conversation["id"], limit=HISTORY_TURNS)
+        if conversation and self.settings.chat_history:
+            turns = self.store.conversation_turns(conversation["id"])
             history = [(t["question"], t["answer"]) for t in turns if t["answer"] and not t["error"]]
         else:
             conversation = self.store.create_conversation(conversation_title(question))
@@ -210,8 +214,8 @@ class QueryService:
 
         try:
             await emit({"type": "plan", "query_id": plan.id, "mode": plan.mode,
-                        "conversation": plan.conversation, "targets": [t.describe() for t in plan.targets]})
-            await self._rewrite_followup(plan, emit, tally)
+                        "conversation": plan.conversation, "targets": [t.describe() for t in plan.targets],
+                        "history": len(plan.history)})
             if plan.mode == "single":
                 answer = await self._single(plan, plan.targets[0], emit, tally)
             else:
@@ -225,26 +229,36 @@ class QueryService:
             error = str(e) or type(e).__name__
             await emit({"type": "error", "message": error})
         finally:
-            standalone = plan.question if plan.question != plan.asked else None
             self.store.log_query(plan.id, plan.asked, plan.doc_ids, plan.mode, answer,
                                  self._stats(plan, tally, started), error, plan.conversation.get("id"),
-                                 standalone, record.detail())
+                                 None, record.detail())
 
-    async def _rewrite_followup(self, plan: Plan, emit: Emit, tally: Tally) -> None:
-        """Turn a follow-up into a standalone question, since each cache only holds its document."""
-        if not plan.history or not self.settings.condense_followups:
-            return
-        await emit({"type": "rewrite", "stage": "start"})
+    async def _suffix(self, plan: Plan, t: Target, block: str) -> ChatSuffix:
+        """The conversation for one document part: as many earlier turns as fit next to it."""
         eng = self.engine
-        tokens, layout = await eng.condense_prompt(plan.history, plan.asked)
-        async with eng.pool.lease(PRIORITY_QUERY, "follow-up rewrite") as slot:
-            res = await eng.generate(slot, tokens, layout, self.settings.max_question_tokens, temperature=0.0)
-        tally.add(res)
-        rewritten = prompts.clean_standalone(res.answer)
-        if rewritten and res.stop_type != "limit":
-            plan.question = rewritten
-        tally.extra["rewrite"] = {**res.stats(), "question": plan.question}
-        await emit({"type": "rewrite", "stage": "done", "question": plan.question})
+        room = self.settings.max_answer_tokens or MIN_ANSWER_ROOM
+        limit = eng.info.n_ctx_slot - t.part.n_tokens - room
+        history, drop = plan.history, 0
+
+        async def render(drop: int) -> ChatSuffix:
+            key = (block, drop)
+            if key not in plan.suffixes:
+                plan.suffixes[key] = await eng.chat_suffix(history[drop:], block, plan.thinking)
+            return plan.suffixes[key]
+
+        suffix = await render(0)
+        while suffix.n_tokens > limit and drop < len(history):
+            over, freed = suffix.n_tokens - limit, 0
+            while drop < len(history) and freed < over:  # drop the oldest turns that cover the excess
+                freed += sum([await eng.count_cached(text) for text in history[drop]])
+                drop += 1
+            suffix = await render(drop)
+        if suffix.n_tokens > limit:
+            raise QueryError(f"the question does not fit next to '{t.label}' ({suffix.n_tokens} tokens, "
+                             f"{max(0, limit)} free)", 400)
+        plan.history_sent = min(plan.history_sent if plan.history_sent is not None else len(history),
+                                len(history) - drop)
+        return suffix
 
     def _stats(self, plan: Plan, tally: Tally, started: float) -> dict:
         return {
@@ -257,6 +271,7 @@ class QueryService:
             "cache_misses": tally.cache_misses,
             "truncated": tally.truncated,
             "llm_calls": tally.llm_calls,
+            "history_turns": len(plan.history) if plan.history_sent is None else plan.history_sent,
             "sampling": dict(self.engine.sampling),
             **tally.extra,
         }
@@ -264,12 +279,10 @@ class QueryService:
     async def _answer_target(self, plan: Plan, t: Target, block: str, emit: Emit, tally: Tally,
                              on_piece: Callable[[str, str], Awaitable[None]]) -> tuple[GenResult, dict]:
         eng = self.engine
+        suffix = await self._suffix(plan, t, block)
+        layout = suffix.layout
         if t.part.visual:
-            suffix_text, layout = await eng.visual_suffix(block, plan.thinking)
-            n_suffix = await eng.count(suffix_text)
             images = await asyncio.to_thread(self._page_bytes, t)
-        else:
-            suffix, layout = await eng.question_suffix(block, plan.thinking)
         await emit({"type": "target", "key": t.key, "status": "queued"})
         async with eng.pool.lease(PRIORITY_QUERY, f"query · {t.label}") as slot:
             if eng.info.fingerprint != plan.fingerprint:
@@ -279,10 +292,10 @@ class QueryService:
                 raise QueryError(f"'{t.doc.name}' was deleted or re-ingested during the query", 409)
             if t.part.visual:
                 # the same page images again: llama-server matches them to the restored cache by hash
-                prompt = eng.multimodal(t.part.prefix_text + suffix_text, images)
-                n_prompt = t.part.n_tokens + n_suffix
+                prompt = eng.multimodal(t.part.prefix_text + suffix.text, images)
+                n_prompt = t.part.n_tokens + suffix.n_tokens
             else:
-                prompt = prefix + suffix
+                prompt = prefix + suffix.tokens
                 n_prompt = len(prompt)
             await emit({"type": "target", "key": t.key, "status": "restoring", "slot": slot})
             t0 = time.perf_counter()
@@ -389,10 +402,17 @@ class QueryService:
 
     async def _synthesize(self, plan: Plan, items: list[tuple[str, str]], emit: Emit, tally: Tally) -> str:
         eng = self.engine
-        overhead = await eng.synthesis_overhead(plan.question, plan.thinking)
-        budget = eng.info.n_ctx_slot - self.settings.max_final_tokens - overhead - 16
+        n_ctx = eng.info.n_ctx_slot
+        room = self.settings.max_final_tokens or eng.reserve_tokens()
+        history = plan.history[len(plan.history) - (plan.history_sent or 0):] if plan.history_sent else []
+        overhead = await eng.synthesis_overhead(plan.question, plan.thinking, history)
+        while history and n_ctx - room - overhead < n_ctx // 4:  # findings get at least a quarter
+            history = history[1:]
+            overhead = await eng.synthesis_overhead(plan.question, plan.thinking, history)
+        plan.synthesis_history = history
+        budget = n_ctx - room - overhead - 16
         if budget < 256:
-            raise QueryError("slot context too small for synthesis; lower ATLAS_MAX_FINAL_TOKENS", 500)
+            raise QueryError("slot context too small for synthesis; lower the final answer limit", 500)
         level = 0
         while True:
             sizes = [await eng.count(f"{label}\n{text}\n\n") for label, text in items]
@@ -412,7 +432,7 @@ class QueryService:
         tally.extra["synthesis_levels"] = level + 1
 
         await emit({"type": "synthesis", "stage": "final", "level": level, "n_findings": len(items)})
-        prompt, layout = await eng.synthesis_prompt(items, plan.question, plan.thinking)
+        prompt, layout = await eng.synthesis_prompt(items, plan.question, plan.thinking, plan.synthesis_history)
 
         async def on_piece(channel: str, text: str) -> None:
             await emit({"type": "delta", "channel": channel, "text": text})

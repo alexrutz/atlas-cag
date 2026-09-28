@@ -847,15 +847,19 @@
 
   const FIELDS = [
     { section: "Answers", note: "Sampling (temperature, top-p, top-k, min-p) belongs to each preset: Settings → Model → Edit preset." },
-    { key: "max_answer_tokens", label: "Max tokens per document answer", type: "number", step: 64, min: 64, help: "Reserved in every slot, so it also limits how large a document part can be." },
-    { key: "max_final_tokens", label: "Max tokens of the combined answer", type: "number", step: 64, min: 64 },
-    { key: "max_question_tokens", label: "Max question length (tokens)", type: "number", step: 64, min: 64 },
+    { key: "max_answer_tokens", label: "Max tokens per document answer", type: "limit", step: 256,
+      help: "Empty: no limit, the answer may use the rest of the slot (Stop ends it)." },
+    { key: "max_final_tokens", label: "Max tokens of the combined answer", type: "limit", step: 256 },
+    { key: "max_question_tokens", label: "Max question length (tokens)", type: "limit", step: 256 },
     { section: "Thinking" },
     { key: "enable_thinking", label: "Think before answering by default (models with a thinking switch)", type: "checkbox" },
-    { key: "max_thinking_tokens", label: "Thinking budget (tokens)", type: "number", step: 128, min: 0, help: "llama-server forces the model to stop thinking and answer once this is spent." },
-    { section: "Conversations" },
-    { key: "condense_followups", label: "Rewrite follow-up questions into standalone questions using the conversation", type: "checkbox",
-      help: "Document caches hold only their document, so “and why?” is first turned into e.g. “Why did the gearbox fail?”. One short extra generation per follow-up." },
+    { key: "max_thinking_tokens", label: "Thinking budget (tokens)", type: "limit", step: 256,
+      help: "Empty: think as long as needed. With a budget, llama-server makes the model stop thinking and answer once it is spent." },
+    { section: "Chat" },
+    { key: "chat_history", label: "Send the conversation's earlier questions and answers with every question", type: "checkbox",
+      help: "As chat turns after each document; never the documents or the model's thinking. The oldest turns are left out only if they do not fit." },
+    { key: "reserve_tokens", label: "Room kept free per slot when splitting documents (tokens)", type: "limit", step: 1024, empty: "automatic",
+      help: "For the conversation, the question, thinking and the answer. Empty: 1/8 of the slot, 4k to 64k tokens." },
     { section: "Several documents" },
     { key: "relevance_filter", label: "Drop answers from documents that rate themselves as not covering the question", type: "checkbox",
       help: "Off (recommended): every per-document answer goes into the combined answer. On: faster with many documents, but relies on the model’s self-rating." },
@@ -881,7 +885,7 @@
     const fields = FIELDS.map((f) => {
       if (f.section) return `<h3 class="form-section">${esc(f.section)}</h3>${f.note ? `<p class="muted small span2 form-note">${esc(f.note)}</p>` : ""}`;
       const v = s.values[f.key], d = s.defaults[f.key];
-      const changed = JSON.stringify(v) !== JSON.stringify(d);
+      const changed = f.type === "limit" ? (v || 0) !== (d || 0) : JSON.stringify(v) !== JSON.stringify(d);
       const reset = changed ? `<button type="button" class="link-btn small" data-act="reset-setting" data-key="${f.key}">reset to default</button>` : "";
       const def = f.type === "textarea" ? "" : `<span class="muted small">default: ${esc(String(d))}</span>`;
       const help = f.help ? `<span class="muted small">${esc(f.help)}</span>` : "";
@@ -890,6 +894,11 @@
       }
       if (f.type === "textarea") {
         return `<label class="field span2${changed ? " changed" : ""}">${esc(f.label)}<textarea name="${f.key}" rows="5">${esc(v)}</textarea>${help}${reset}</label>`;
+      }
+      if (f.type === "limit") {
+        const shown = v ? v : "";
+        const defText = d ? String(d) : (f.empty || "no limit");
+        return `<label class="field${changed ? " changed" : ""}">${esc(f.label)}<input name="${f.key}" type="number" min="0" step="${f.step}" value="${shown}" placeholder="${esc(f.empty || "no limit")}"><span class="muted small">default: ${esc(defText)}</span>${help}${reset}</label>`;
       }
       if (f.type === "select") {
         return `<label class="field${changed ? " changed" : ""}">${esc(f.label)}<select name="${f.key}">${f.options.map(([o, l]) =>
@@ -906,8 +915,10 @@
       for (const f of FIELDS) {
         if (!f.key) continue;
         const el = e.target.elements[f.key];
-        const v = f.type === "checkbox" ? el.checked : f.type === "number" ? Number(el.value) : el.value;
-        if (JSON.stringify(v) !== JSON.stringify(view.settings.values[f.key])) changes[f.key] = v;
+        const v = f.type === "checkbox" ? el.checked : f.type === "number" ? Number(el.value)
+          : f.type === "limit" ? (el.value.trim() === "" ? 0 : Number(el.value)) : el.value;
+        const was = view.settings.values[f.key];
+        if (f.type === "limit" ? (v || 0) !== (was || 0) : JSON.stringify(v) !== JSON.stringify(was)) changes[f.key] = v;
       }
       if (!Object.keys(changes).length) return toast("Nothing changed");
       if ("system_prompt" in changes &&

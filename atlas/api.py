@@ -168,6 +168,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "max_question_tokens": settings.max_question_tokens,
                 "max_answer_tokens": settings.max_answer_tokens,
                 "max_final_tokens": settings.max_final_tokens,
+                "reserve_tokens": s.engine.reserve_tokens() if s.engine.info.n_ctx_slot else None,
+                "max_part_tokens": (s.engine.info.n_ctx_slot - s.engine.reserve_tokens()) if s.engine.info.n_ctx_slot else None,
                 "max_upload_mb": settings.max_upload_mb,
                 "enable_thinking": settings.enable_thinking,
                 "default_prefill": settings.default_prefill,

@@ -13,15 +13,13 @@ from . import pages as page_images
 from . import prompts
 from .chunking import plan_parts
 from .config import Settings
-from .engine import Engine
+from .engine import MIN_ANSWER_ROOM, Engine
 from .llama import LlamaError
 from .slots import PRIORITY_INGEST
 from .store import Document, Part, Store, new_id
 
 log = logging.getLogger("atlas.ingest")
 
-# Tokens reserved for the question instructions wrapped around the user's question.
-QUESTION_BLOCK_OVERHEAD = 96
 # Transient llama-server failures (restart, network) are retried this often before giving up.
 MAX_RETRIES = 5
 RETRY_BASE_DELAY_S = 5.0
@@ -163,7 +161,7 @@ class Ingestor:
             if cache.status == "failed" or wanted is None:
                 continue  # a visual cache without the projector stays as is for when it is back
             parts = self.store.get_parts(doc.id, fp, with_tokens=False)
-            too_big = any(p.n_tokens + self.settings.max_answer_tokens > n_ctx for p in parts)
+            too_big = any(p.n_tokens + (self.settings.max_answer_tokens or MIN_ANSWER_ROOM) > n_ctx for p in parts)
             missing = any(not (self.settings.kv_dir / p.kv_file).exists() for p in parts)
             valid = bool(parts) and not too_big and not missing
             status = cache.status
@@ -238,18 +236,11 @@ class Ingestor:
             await asyncio.sleep(0.5)
 
     async def _prefix_limit(self) -> int:
-        """Largest cached prefix that leaves room for question, instructions, template tail and answer.
-
-        (The thinking budget is not reserved: with thinking on, generation is capped by the free context.)
-        """
+        """Largest cached prefix: the slot minus the room kept for conversation, question and answer."""
         n_ctx = self.engine.info.n_ctx_slot
-        tail, _ = await self.engine.question_suffix("", self.settings.enable_thinking)
-        reserve = self.settings.max_question_tokens + QUESTION_BLOCK_OVERHEAD + len(tail) + self.settings.max_answer_tokens
+        reserve = max(self.engine.reserve_tokens(), MIN_ANSWER_ROOM)
         if n_ctx - reserve < 512:
-            raise ValueError(
-                f"slot context ({n_ctx} tokens) is too small: {reserve} tokens are reserved for question "
-                "and answer. Give the preset more context per slot or reduce the answer budgets."
-            )
+            raise ValueError(f"slot context ({n_ctx} tokens) is too small: give the preset more context per slot")
         return n_ctx - reserve
 
     async def _ingest(self, doc_id: str) -> None:

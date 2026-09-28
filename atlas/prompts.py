@@ -19,6 +19,7 @@ from dataclasses import dataclass
 
 DOC_SENTINEL = "[[ATLAS-DOCUMENT-SLOT-5c1e]]"
 QUESTION_SENTINEL = "[[ATLAS-QUESTION-SLOT-5c1e]]"
+TURN_SENTINEL = "[[ATLAS-TURN-{}-5c1e]]"
 NO_INFO = "NO_RELEVANT_INFORMATION"
 
 # Bump whenever the structure of the persisted prefix changes, so stored KV caches get rebuilt.
@@ -56,6 +57,56 @@ def layout_messages(system_prompt: str) -> list[dict]:
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": DOC_SENTINEL + QUESTION_SENTINEL},
     ]
+
+
+# --- chat ------------------------------------------------------------------------------
+# A question in a conversation is sent as a real chat: the cached document opens the first user
+# turn, followed by the earlier questions and answers and the new question:
+#
+#   [system] [user: <DOC> q1] [assistant: a1] [user: q2] … [user: question] [generation prompt]
+#
+# The template is rendered with one sentinel per turn, so the template's own text (tokenized with
+# special tokens) and the turns' content (tokenized as plain text) are kept apart.
+
+
+@dataclass(frozen=True)
+class ChatRender:
+    head: str  # template text before the document (or before the first turn without one)
+    glue: tuple[str, ...]  # template text before each turn, then the generation prompt (n + 1 pieces)
+
+    @property
+    def tail(self) -> str:
+        return self.glue[-1]
+
+
+def chat_messages(system_prompt: str, n_turns: int, with_doc: bool) -> list[dict]:
+    messages = [{"role": "system", "content": system_prompt}]
+    for i in range(n_turns):
+        content = TURN_SENTINEL.format(i)
+        if i == 0 and with_doc:
+            content = DOC_SENTINEL + content
+        messages.append({"role": "user" if i % 2 == 0 else "assistant", "content": content})
+    return messages
+
+
+def split_chat(rendered: str, n_turns: int, with_doc: bool) -> ChatRender:
+    marks = ([DOC_SENTINEL] if with_doc else []) + [TURN_SENTINEL.format(i) for i in range(n_turns)]
+    pieces, pos = [], 0
+    for mark in marks:
+        if rendered.count(mark) != 1 or rendered.index(mark) < pos:
+            raise TemplateError("chat template did not keep the conversation's turns in order")
+        i = rendered.index(mark)
+        pieces.append(rendered[pos:i])
+        pos = i + len(mark)
+    pieces.append(rendered[pos:])
+    if with_doc:
+        return ChatRender(pieces[0], tuple(pieces[1:]))
+    return ChatRender(pieces[0], ("", *pieces[1:]))
+
+
+def history_turns(history: list[tuple[str, str]]) -> list[str]:
+    """Earlier (question, answer) pairs as alternating user / assistant contents."""
+    return [text for question, answer in history for text in (question, answer)]
 
 
 def _attr(s: str) -> str:
@@ -141,47 +192,10 @@ def synthesis_question_block(question: str) -> str:
     return f"Question: {question}"
 
 
-# --- follow-up questions ---------------------------------------------------------------
-# Document caches hold one document each, so a follow-up ("and why?") is first rewritten into a
-# standalone question from the conversation; that question then runs like any other.
-
-CONDENSE_SYSTEM_PROMPT = (
-    "You rewrite follow-up questions. Given the conversation so far and a follow-up question, write "
-    "one standalone question that can be understood without the conversation: resolve references "
-    "such as pronouns, \"that\", \"the second point\" or \"the same for X\" from the conversation, "
-    "keep every constraint and instruction of the follow-up, and keep its language. If the follow-up "
-    "is already standalone, repeat it unchanged. Reply with the standalone question only."
-)
-HISTORY_QUESTION_CHARS = 2000
-HISTORY_ANSWER_CHARS = 1500
-
-
-def _clip(text: str, limit: int) -> str:
-    text = text.strip()
-    return text if len(text) <= limit else text[:limit].rsplit(" ", 1)[0] + " […]"
-
-
-def history_block(turns: list[tuple[str, str]]) -> str:
-    """turns: (question, answer) pairs, oldest first."""
-    lines = []
-    for question, answer in turns:
-        lines += [f"User: {_clip(question, HISTORY_QUESTION_CHARS)}", f"Assistant: {_clip(answer, HISTORY_ANSWER_CHARS)}"]
-    return "Conversation so far:\n\n" + "\n\n".join(lines) + "\n\n"
-
-
-def followup_block(question: str) -> str:
-    return f"Follow-up question: {question}\n\nStandalone question:"
-
-
-_LABEL_RE = re.compile(r"^\s*(\*\*)?(standalone question|question)\s*:\s*(\*\*)?\s*", re.I)
-
-
-def clean_standalone(text: str) -> str:
-    """The model's rewrite without reasoning, labels or quotes; empty if nothing usable."""
-    text = _LABEL_RE.sub("", strip_reasoning(text)).strip()
-    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'`“”":
-        text = text[1:-1].strip()
-    return re.sub(r"\s+", " ", text.strip("“”")).strip()
+def history_block(history: list[tuple[str, str]]) -> str:
+    """Earlier turns as text inside the question, for chat templates that cannot render them as turns."""
+    lines = [f"User: {q.strip()}\n\nAssistant: {a.strip()}" for q, a in history]
+    return "Conversation so far:\n\n" + "\n\n".join(lines) + "\n\nNew message:\n"
 
 
 _THINK_RE = re.compile(r"<think>.*?(</think>|$)", re.S)
