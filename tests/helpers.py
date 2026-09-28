@@ -49,9 +49,11 @@ async def add_text(client, name: str, text: str, collection_id: str | None = Non
     return doc
 
 
-async def query(client, question: str, doc_ids: list[str], collection_ids: list[str] | None = None) -> list[dict]:
+async def query(client, question: str, doc_ids: list[str], collection_ids: list[str] | None = None,
+                conversation_id: str | None = None) -> list[dict]:
     events = []
-    body = {"question": question, "document_ids": doc_ids, "collection_ids": collection_ids or []}
+    body = {"question": question, "document_ids": doc_ids, "collection_ids": collection_ids or [],
+            "conversation_id": conversation_id}
     async with client.stream("POST", "/api/query", json=body) as r:
         assert r.status_code == 200, await r.aread()
         async for line in r.aiter_lines():

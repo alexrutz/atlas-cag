@@ -1,5 +1,6 @@
 """Query execution.
 
+follow-up question   : rewritten into a standalone question from the conversation first
 single document part : restore slot file -> append question -> stream answer
 several parts / docs : map  - every part is answered individually and in parallel (bounded by slots)
                        reduce - the relevant answers are concatenated and the original question is
@@ -27,6 +28,8 @@ log = logging.getLogger("atlas.query")
 Emit = Callable[[dict], Awaitable[None]]
 
 NOTHING_FOUND = "None of the selected documents contain information relevant to this question."
+HISTORY_TURNS = 4  # recent turns used to rewrite a follow-up question
+TITLE_CHARS = 80
 
 
 class QueryError(Exception):
@@ -61,11 +64,14 @@ class Target:
 @dataclass
 class Plan:
     id: str
-    question: str
+    question: str  # what the documents are asked: the standalone rewrite of a follow-up
     thinking: bool
     targets: list[Target]
     doc_ids: list[str]
     fingerprint: str | None
+    conversation: dict = field(default_factory=dict)
+    history: list[tuple[str, str]] = field(default_factory=list)  # (question, answer), oldest first
+    asked: str = ""  # the question as the user typed it
 
     @property
     def mode(self) -> str:
@@ -102,10 +108,13 @@ class QueryService:
     # --- planning ----------------------------------------------------------------------
 
     async def prepare(self, question: str, doc_ids: list[str], thinking: bool | None,
-                      collection_ids: list[str] | None = None) -> Plan:
+                      collection_ids: list[str] | None = None, conversation_id: str | None = None) -> Plan:
         question = question.strip()
         if not question:
             raise QueryError("question is empty")
+        conversation = self.store.get_conversation(conversation_id) if conversation_id else None
+        if conversation_id and conversation is None:
+            raise QueryError("conversation not found", 404)
         if not self.engine.ready:
             raise QueryError(self.engine.status_message or "llama-server is not ready", 503)
         fp = self.engine.info.fingerprint
@@ -138,7 +147,14 @@ class QueryService:
             raise QueryError(f"question has {n_q} tokens, limit is {self.settings.max_question_tokens}")
 
         thinking = self.settings.enable_thinking if thinking is None else thinking
-        return Plan(new_id(), question, thinking, targets, doc_ids, self.engine.info.fingerprint)
+        history = []
+        if conversation:
+            turns = self.store.conversation_turns(conversation["id"], limit=HISTORY_TURNS)
+            history = [(t["question"], t["answer"]) for t in turns if t["answer"] and not t["error"]]
+        else:
+            conversation = self.store.create_conversation(conversation_title(question))
+        return Plan(new_id(), question, thinking, targets, doc_ids, self.engine.info.fingerprint,
+                    conversation=conversation, history=history, asked=question)
 
     # --- execution ---------------------------------------------------------------------
 
@@ -168,14 +184,21 @@ class QueryService:
             if not task.done():
                 task.cancel()
 
-    async def _run(self, plan: Plan, emit: Emit) -> None:
+    async def _run(self, plan: Plan, send: Emit) -> None:
         started = time.perf_counter()
         tally = Tally()
         answer: str | None = None
         error: str | None = None
+        record = TurnRecord()
+
+        async def emit(event: dict) -> None:
+            record.observe(event)
+            await send(event)
+
         try:
             await emit({"type": "plan", "query_id": plan.id, "mode": plan.mode,
-                        "targets": [t.describe() for t in plan.targets]})
+                        "conversation": plan.conversation, "targets": [t.describe() for t in plan.targets]})
+            await self._rewrite_followup(plan, emit, tally)
             if plan.mode == "single":
                 answer = await self._single(plan, plan.targets[0], emit, tally)
             else:
@@ -189,8 +212,26 @@ class QueryService:
             error = str(e) or type(e).__name__
             await emit({"type": "error", "message": error})
         finally:
-            self.store.log_query(plan.id, plan.question, plan.doc_ids, plan.mode, answer,
-                                 self._stats(plan, tally, started), error)
+            standalone = plan.question if plan.question != plan.asked else None
+            self.store.log_query(plan.id, plan.asked, plan.doc_ids, plan.mode, answer,
+                                 self._stats(plan, tally, started), error, plan.conversation.get("id"),
+                                 standalone, record.detail())
+
+    async def _rewrite_followup(self, plan: Plan, emit: Emit, tally: Tally) -> None:
+        """Turn a follow-up into a standalone question, since each cache only holds its document."""
+        if not plan.history or not self.settings.condense_followups:
+            return
+        await emit({"type": "rewrite", "stage": "start"})
+        eng = self.engine
+        tokens, layout = await eng.condense_prompt(plan.history, plan.asked)
+        async with eng.pool.lease(PRIORITY_QUERY, "follow-up rewrite") as slot:
+            res = await eng.generate(slot, tokens, layout, self.settings.max_question_tokens, temperature=0.0)
+        tally.add(res)
+        rewritten = prompts.clean_standalone(res.answer)
+        if rewritten and res.stop_type != "limit":
+            plan.question = rewritten
+        tally.extra["rewrite"] = {**res.stats(), "question": plan.question}
+        await emit({"type": "rewrite", "stage": "done", "question": plan.question})
 
     def _stats(self, plan: Plan, tally: Tally, started: float) -> dict:
         return {
@@ -356,6 +397,35 @@ class QueryService:
         tally.add(res)
         cites = " ".join(c for label, _ in group for c in re.findall(r"\[\d+\]", label))
         return f"Combined findings from {cites}", res.answer
+
+
+class TurnRecord:
+    """Collects a turn's per-document answers and reasoning from its events, to show it again later."""
+
+    FIELDS = ("status", "answer", "coverage", "stats", "error")
+
+    def __init__(self):
+        self.targets: dict[str, dict] = {}
+        self.reasoning: list[str] = []
+
+    def observe(self, event: dict) -> None:
+        kind = event.get("type")
+        if kind == "plan":
+            self.targets = {t["key"]: dict(t) for t in event["targets"]}
+        elif kind == "target" and event.get("key") in self.targets:
+            self.targets[event["key"]].update({k: event[k] for k in self.FIELDS if k in event})
+        elif kind == "delta" and event.get("channel") == "reasoning":
+            self.reasoning.append(event["text"])
+
+    def detail(self) -> dict:
+        return {"targets": list(self.targets.values()), "reasoning": "".join(self.reasoning)}
+
+
+def conversation_title(question: str) -> str:
+    text = " ".join(question.split())
+    if len(text) <= TITLE_CHARS:
+        return text
+    return text[:TITLE_CHARS].rsplit(" ", 1)[0].rstrip(",.;:") + "…"
 
 
 async def _passthrough(item: tuple[str, str]) -> tuple[str, str]:

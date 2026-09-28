@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS collections (
@@ -87,17 +87,32 @@ CREATE TABLE IF NOT EXISTS app_state (
     value  TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS queries (
+CREATE TABLE IF NOT EXISTS conversations (
     id          TEXT PRIMARY KEY,
+    title       TEXT NOT NULL,
     created_at  REAL NOT NULL,
-    question    TEXT NOT NULL,
-    doc_ids     TEXT NOT NULL,
-    mode        TEXT,
-    answer      TEXT,
-    stats       TEXT,
-    error       TEXT
+    updated_at  REAL NOT NULL
 );
+
+-- one row per question; a conversation's turns in created_at order
+CREATE TABLE IF NOT EXISTS queries (
+    id              TEXT PRIMARY KEY,
+    created_at      REAL NOT NULL,
+    question        TEXT NOT NULL,
+    doc_ids         TEXT NOT NULL,
+    mode            TEXT,
+    answer          TEXT,
+    stats           TEXT,
+    error           TEXT,
+    conversation_id TEXT REFERENCES conversations(id) ON DELETE CASCADE,
+    standalone      TEXT,  -- the follow-up rewritten as a standalone question, if it was
+    detail          TEXT   -- JSON: per-document answers and reasoning, for showing the turn again
+);
+CREATE INDEX IF NOT EXISTS queries_conversation ON queries(conversation_id, created_at);
 """
+
+EARLIER_QUESTIONS = "Earlier questions"
+QUERY_COLUMNS = "id, created_at, question, doc_ids, mode, answer, stats, error, conversation_id, standalone, detail"
 
 DOC_COLUMNS = "id, name, collection_id, mime, sha256, size_bytes, n_chars, created_at, updated_at"
 CACHE_COLUMNS = "doc_id, fingerprint, status, error, n_tokens, n_parts, kv_bytes, ingest_ms, created_at, updated_at"
@@ -211,6 +226,34 @@ class Store:
         return [r[1] for r in self._db.execute(f"PRAGMA table_info({table})")]
 
     def _migrate(self) -> None:
+        self._migrate_v2()
+        self._migrate_v3()
+
+    def _migrate_v3(self) -> None:
+        """v3 groups questions into conversations; earlier questions go into one conversation."""
+        columns = self._columns("queries")
+        if not columns or "conversation_id" in columns:
+            return
+        self._db.execute("BEGIN")
+        try:
+            self._db.execute("CREATE TABLE IF NOT EXISTS conversations (id TEXT PRIMARY KEY, title TEXT NOT NULL, "
+                             "created_at REAL NOT NULL, updated_at REAL NOT NULL)")
+            self._db.execute("ALTER TABLE queries ADD COLUMN conversation_id TEXT "
+                             "REFERENCES conversations(id) ON DELETE CASCADE")
+            self._db.execute("ALTER TABLE queries ADD COLUMN standalone TEXT")
+            self._db.execute("ALTER TABLE queries ADD COLUMN detail TEXT")
+            first, last = self._db.execute("SELECT MIN(created_at), MAX(created_at) FROM queries").fetchone()
+            if first is not None:
+                cid = new_id()
+                self._db.execute("INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                                 (cid, EARLIER_QUESTIONS, first, last))
+                self._db.execute("UPDATE queries SET conversation_id = ?", (cid,))
+            self._db.execute("COMMIT")
+        except BaseException:
+            self._db.execute("ROLLBACK")
+            raise
+
+    def _migrate_v2(self) -> None:
         """v1 kept one cache per document in the documents table; v2 keeps one per configuration."""
         if "status" not in self._columns("documents"):
             return
@@ -465,24 +508,67 @@ class Store:
     # --- query log ---------------------------------------------------------------------
 
     def log_query(self, query_id: str, question: str, doc_ids: list[str], mode: str | None,
-                  answer: str | None, stats: dict | None, error: str | None) -> None:
-        self._exec(
-            "INSERT OR REPLACE INTO queries (id, created_at, question, doc_ids, mode, answer, stats, error) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (query_id, time.time(), question, json.dumps(doc_ids), mode, answer,
-             json.dumps(stats) if stats is not None else None, error),
-        )
+                  answer: str | None, stats: dict | None, error: str | None, conversation_id: str | None = None,
+                  standalone: str | None = None, detail: dict | None = None) -> None:
+        now = time.time()
+        with self._lock:
+            if conversation_id and self.get_conversation(conversation_id) is None:
+                conversation_id = None  # deleted while the question was being answered
+            self._exec(
+                f"INSERT OR REPLACE INTO queries ({QUERY_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (query_id, now, question, json.dumps(doc_ids), mode, answer,
+                 json.dumps(stats) if stats is not None else None, error, conversation_id, standalone,
+                 json.dumps(detail) if detail is not None else None),
+            )
+            if conversation_id:
+                self._exec("UPDATE conversations SET updated_at = ? WHERE id = ?", (now, conversation_id))
+
+    @staticmethod
+    def _query_row(r: sqlite3.Row) -> dict:
+        d = dict(r)
+        d["doc_ids"] = json.loads(d["doc_ids"])
+        for key in ("stats", "detail"):
+            d[key] = json.loads(d[key]) if d[key] else None
+        return d
 
     def list_queries(self, limit: int = 50) -> list[dict]:
+        rows = self._exec(f"SELECT {QUERY_COLUMNS} FROM queries ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+        return [self._query_row(r) for r in rows]
+
+    # --- conversations -----------------------------------------------------------------
+
+    def create_conversation(self, title: str) -> dict:
+        cid, now = new_id(), time.time()
+        self._exec("INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                   (cid, title, now, now))
+        return self.get_conversation(cid)
+
+    def get_conversation(self, conversation_id: str) -> dict | None:
+        row = self._exec("SELECT id, title, created_at, updated_at FROM conversations WHERE id = ?",
+                         (conversation_id,)).fetchone()
+        return dict(row) if row else None
+
+    def list_conversations(self) -> list[dict]:
         rows = self._exec(
-            "SELECT id, created_at, question, doc_ids, mode, answer, stats, error FROM queries "
-            "ORDER BY created_at DESC LIMIT ?",
-            (limit,),
+            "SELECT c.id, c.title, c.created_at, c.updated_at, COUNT(q.id) AS n_turns, "
+            "(SELECT question FROM queries WHERE conversation_id = c.id ORDER BY created_at DESC LIMIT 1) "
+            "AS last_question FROM conversations c LEFT JOIN queries q ON q.conversation_id = c.id "
+            "GROUP BY c.id ORDER BY c.updated_at DESC"
         ).fetchall()
-        out = []
-        for r in rows:
-            d = dict(r)
-            d["doc_ids"] = json.loads(d["doc_ids"])
-            d["stats"] = json.loads(d["stats"]) if d["stats"] else None
-            out.append(d)
-        return out
+        return [dict(r) for r in rows]
+
+    def rename_conversation(self, conversation_id: str, title: str) -> None:
+        self._exec("UPDATE conversations SET title = ? WHERE id = ?", (title, conversation_id))
+
+    def delete_conversation(self, conversation_id: str) -> None:
+        with self._lock:
+            self._exec("DELETE FROM queries WHERE conversation_id = ?", (conversation_id,))
+            self._exec("DELETE FROM conversations WHERE id = ?", (conversation_id,))
+
+    def conversation_turns(self, conversation_id: str, limit: int | None = None) -> list[dict]:
+        """Turns oldest first; with `limit`, only the most recent ones."""
+        rows = self._exec(
+            f"SELECT {QUERY_COLUMNS} FROM queries WHERE conversation_id = ? ORDER BY created_at DESC LIMIT ?",
+            (conversation_id, limit if limit is not None else -1),
+        ).fetchall()
+        return [self._query_row(r) for r in reversed(rows)]

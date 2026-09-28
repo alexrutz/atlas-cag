@@ -54,6 +54,10 @@ class FakeLlama:
         self.app = self._build()
 
     def _answer(self, text: str) -> str:
+        if "Follow-up question:" in text:  # rewrite: append the longest word of the last question
+            followup = text.rsplit("Follow-up question: ", 1)[1].split("\n\n", 1)[0]
+            last_question = re.findall(r"User: (.*)", text)[-1]
+            return f"Standalone question: {followup} ({max(re.findall(r'[A-Za-z]{4,}', last_question), key=len)})"
         if "Findings:" in text:
             return f"Synthesized from {text.count('Source:')} findings [1]."
         if "Quote the passages" in text:  # map phase
@@ -149,6 +153,7 @@ class FakeLlama:
                         "completion_probabilities": [{"id": token, "token": "x", "logprob": -0.05}],
                         "timings": {"cache_n": n, "prompt_n": len(prompt) - n}}
             text = detokenize(prompt)
+            fake.log[-1]["prompt_text"] = text
             answer = "" if body["n_predict"] == 0 else fake._answer(text)
             pieces = [answer[i:i + 7] for i in range(0, len(answer), 7)]
             slow = body["n_predict"] > 0 and "slowly" in text

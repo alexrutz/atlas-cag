@@ -121,6 +121,49 @@ def synthesis_question_block(question: str) -> str:
     return f"Question: {question}"
 
 
+# --- follow-up questions ---------------------------------------------------------------
+# Document caches hold one document each, so a follow-up ("and why?") is first rewritten into a
+# standalone question from the conversation; that question then runs like any other.
+
+CONDENSE_SYSTEM_PROMPT = (
+    "You rewrite follow-up questions. Given the conversation so far and a follow-up question, write "
+    "one standalone question that can be understood without the conversation: resolve references "
+    "such as pronouns, \"that\", \"the second point\" or \"the same for X\" from the conversation, "
+    "keep every constraint and instruction of the follow-up, and keep its language. If the follow-up "
+    "is already standalone, repeat it unchanged. Reply with the standalone question only."
+)
+HISTORY_QUESTION_CHARS = 2000
+HISTORY_ANSWER_CHARS = 1500
+
+
+def _clip(text: str, limit: int) -> str:
+    text = text.strip()
+    return text if len(text) <= limit else text[:limit].rsplit(" ", 1)[0] + " […]"
+
+
+def history_block(turns: list[tuple[str, str]]) -> str:
+    """turns: (question, answer) pairs, oldest first."""
+    lines = []
+    for question, answer in turns:
+        lines += [f"User: {_clip(question, HISTORY_QUESTION_CHARS)}", f"Assistant: {_clip(answer, HISTORY_ANSWER_CHARS)}"]
+    return "Conversation so far:\n\n" + "\n\n".join(lines) + "\n\n"
+
+
+def followup_block(question: str) -> str:
+    return f"Follow-up question: {question}\n\nStandalone question:"
+
+
+_LABEL_RE = re.compile(r"^\s*(\*\*)?(standalone question|question)\s*:\s*(\*\*)?\s*", re.I)
+
+
+def clean_standalone(text: str) -> str:
+    """The model's rewrite without reasoning, labels or quotes; empty if nothing usable."""
+    text = _LABEL_RE.sub("", strip_reasoning(text)).strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'`“”":
+        text = text[1:-1].strip()
+    return re.sub(r"\s+", " ", text.strip("“”")).strip()
+
+
 _THINK_RE = re.compile(r"<think>.*?(</think>|$)", re.S)
 
 

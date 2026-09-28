@@ -425,6 +425,17 @@ class Engine:
         )
         return tokens, lay
 
+    async def condense_prompt(self, history: list[tuple[str, str]], question: str) -> tuple[list[int], prompts.Layout]:
+        lay = await self.layout(prompts.CONDENSE_SYSTEM_PROMPT, False)
+        tokens = (
+            await self._template(lay.head, first=True)
+            + await self.plain(prompts.history_block(history))
+            + await self._template(lay.mid)
+            + await self.plain(prompts.followup_block(question))
+            + await self._template(lay.tail)
+        )
+        return tokens, lay
+
     async def synthesis_overhead(self, question: str, thinking: bool) -> int:
         tokens, _ = await self.synthesis_prompt([], question, thinking)
         return len(tokens)
@@ -448,7 +459,7 @@ class Engine:
         return final.get("timings") or {}
 
     async def generate(self, slot: int, tokens: list[int], layout: prompts.Layout, answer_cap: int,
-                       on_piece: PieceCallback | None = None) -> GenResult:
+                       on_piece: PieceCallback | None = None, temperature: float | None = None) -> GenResult:
         """Decode an answer of up to `answer_cap` tokens (plus the thinking budget, if thinking is on)."""
         thinking_open = layout.thinking_open
         cap = answer_cap + (self.settings.max_thinking_tokens if thinking_open else 0)
@@ -457,7 +468,7 @@ class Engine:
             "n_predict": max(1, min(cap, self.info.n_ctx_slot - len(tokens) - 1)),
             "id_slot": slot,
             "cache_prompt": True,
-            "temperature": self.settings.temperature,
+            "temperature": self.settings.temperature if temperature is None else temperature,
             "top_p": self.settings.top_p,
         }
         if thinking_open:

@@ -214,6 +214,21 @@ Every document lives in one collection or in *Unfiled*. In the library:
 
 The query API takes `document_ids`, `collection_ids` or both.
 
+## Conversations
+
+Questions are grouped into conversations. The bar above the answers shows the open conversation:
+click its title to search and switch conversations, rename or delete them, or start a new one.
+Asking in a new conversation creates it, titled after the first question. Opening a conversation
+shows its earlier turns again, with their per-document answers, and selects the documents its
+last question used. The open conversation is restored when the page is reloaded.
+
+Each document cache holds only its document, not the conversation, so a follow-up such as "and
+why did it happen?" is first rewritten into a standalone question ("Why did the gearbox fail?")
+from the last four turns. This is one short generation without any document (temperature 0,
+no thinking). The rewrite then runs like any other question, single-document or map-reduce, and
+is shown under the follow-up ("Asked the documents: …"). Switch it off under **Settings →
+Generation → Conversations** (`ATLAS_CONDENSE_FOLLOWUPS=false`) to send follow-ups unchanged.
+
 ## How it works
 
 **Prompt layout.** A cached prefix must be a strict token prefix of every later query prompt.
@@ -310,6 +325,7 @@ override the environment.
 | `HF_TOKEN` | *(empty)* | for gated or private Hugging Face repositories |
 | `ATLAS_MAX_QUESTION_TOKENS` / `_ANSWER_` / `_FINAL_` | 1024 / 1024 / 2048 | also in the UI; question and answer budgets are reserved in every slot |
 | `ATLAS_ENABLE_THINKING`, `ATLAS_MAX_THINKING_TOKENS` | false, 2048 | also in the UI |
+| `ATLAS_CONDENSE_FOLLOWUPS` | true | also in the UI; rewrite follow-ups into standalone questions |
 | `ATLAS_RELEVANCE_FILTER` | false | also in the UI; see the prompt findings below |
 | `ATLAS_AUTO_BUILD_CACHES` | true | also in the UI |
 | `ATLAS_BUILD_UPDATES` | install | `off` / `install` / `apply`; also in the UI |
@@ -356,7 +372,8 @@ answer:
 | `POST /api/documents/text` | `{name, text, collection_id?}` |
 | `GET` / `PATCH /api/documents/{id}` | details (parts) / rename or move (`{name?, collection_id?}`) |
 | `GET /api/documents/{id}/text` · `POST …/reingest` · `DELETE …` | |
-| `POST /api/query` | `{question, document_ids?, collection_ids?, thinking?}` → Server-Sent Events |
+| `POST /api/query` | `{question, document_ids?, collection_ids?, thinking?, conversation_id?}` → Server-Sent Events |
+| `GET /api/conversations` · `POST` · `GET /{id}` (with turns) · `PATCH /{id}` · `DELETE /{id}` | conversations |
 | `GET /api/presets` · `POST` · `PUT /{id}` · `DELETE /{id}` · `POST /{id}/activate` | presets (managed mode) |
 | `GET /api/server` · `POST /api/server/restart` · `POST /api/server/stop` | llama-server state, log, GPU |
 | `GET /api/models` · `GET /api/models/hf?repo=` · `POST /api/models/download` · `GET /api/models/downloads` | model files |
@@ -367,14 +384,15 @@ answer:
 | `GET /api/queries` | query log with stats |
 | `GET /healthz` | unauthenticated liveness |
 
-Query events: `plan`, `target` (status `queued`, `restoring`, `generating`, `done`, `irrelevant`
+Query events: `plan` (includes the conversation), `rewrite` (stage `start`, then `done` with the
+standalone question), `target` (status `queued`, `restoring`, `generating`, `done`, `irrelevant`
 or `error`, with per-call stats), `target_delta`, `synthesis`, `delta` (channel `answer` or
 `reasoning`), `done` (answer and stats), `error`, and `ping` as a keep-alive.
 
 ## Development
 
 ```bash
-uv run pytest    # 76 tests, no GPU needed: a fake llama-server (tests/fake_llama.py) and its
+uv run pytest    # 82 tests, no GPU needed: a fake llama-server (tests/fake_llama.py) and its
                  # command-line wrapper let the supervisor spawn, switch and crash real processes
 uv run python scripts/benchmark.py cases.json --runs 3    # answer quality of a running instance
 ```
@@ -385,7 +403,7 @@ atlas/
   supervisor.py  managed mode: presets, llama-server process, drain / switch / crash restart
   engine.py      discovery, fingerprints and canaries, prompt assembly, prefill and generation
   ingest.py      ingestion queue per configuration: split, prefill, save; repairs, orphan sweep
-  query.py       single-document and map-reduce execution, synthesis
+  query.py       follow-up rewriting, single-document and map-reduce execution, synthesis
   models.py      GGUF discovery, metadata and tensor layout, memory estimates, GPU info
   builds.py      llama-server build discovery and checks (format, libraries, flags, architectures)
   updater.py     standard build updates from GitHub releases, CUDA runtime, pinning, rollback
@@ -393,7 +411,8 @@ atlas/
   gguf.py        dependency-free GGUF header reader
   prompts.py     chat-template layout via sentinels, prompt blocks, reasoning splitter
   slots.py       prioritized exclusive slot leases (pausable, resizable)
-  store.py       SQLite: collections, documents, caches per configuration, parts, presets, settings
+  store.py       SQLite: collections, documents, caches per configuration, parts, presets, settings,
+                 conversations and their turns
   chunking.py    token-budgeted splitting at natural boundaries
   extract.py     PDF / DOCX / HTML / text extraction
   static/        single-page UI (no build step, no external assets)

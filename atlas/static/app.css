@@ -523,7 +523,7 @@ svg { width: 18px; height: 18px; stroke: currentColor; stroke-width: 2; fill: no
 
 /* ================================================================ settings */
 .settings { display: flex; flex-direction: column; flex: 1; min-height: 0; overflow-y: auto; }
-body.settings-open .thread, body.settings-open .composer { display: none; }
+body.settings-open .thread, body.settings-open .composer, body.settings-open .thread-head { display: none; }
 .settings-toggle[aria-pressed=true] { background: var(--accent-soft); color: var(--accent); }
 .settings-head {
   display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
@@ -645,3 +645,32 @@ dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; ma
 .updates > * + * { margin-top: 4px; }
 .notice { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 8px 10px; border-radius: var(--radius-sm);
   background: var(--accent-soft, var(--surface)); border: 1px solid var(--border); font-size: 13px; }
+
+/* conversations */
+.thread-head { position: relative; display: flex; align-items: center; gap: 6px; padding: 8px clamp(16px, 4vw, 48px);
+  border-bottom: 1px solid var(--border); background: var(--surface); }
+.thread-head .spacer { flex: 1; }
+.thread-head .btn svg { width: 15px; height: 15px; margin-right: 2px; vertical-align: -3px; fill: none; stroke: currentColor; stroke-width: 2; }
+.conv-switch { display: flex; align-items: center; gap: 8px; min-width: 0; max-width: min(560px, 60vw); padding: 6px 10px;
+  border: 1px solid transparent; border-radius: var(--radius-sm); background: none; cursor: pointer; font-size: 14px; font-weight: 600; color: inherit; }
+.conv-switch:hover, .conv-switch[aria-expanded="true"] { background: var(--surface-2); border-color: var(--border); }
+.conv-switch span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conv-switch svg { flex: none; width: 17px; height: 17px; fill: none; stroke: var(--muted); stroke-width: 1.8; stroke-linejoin: round; }
+.conv-switch .caret-down { width: 14px; height: 14px; }
+.conv-panel { position: absolute; z-index: 40; top: calc(100% + 4px); left: clamp(12px, 4vw, 44px); width: min(420px, calc(100% - 24px));
+  max-height: 65vh; display: flex; flex-direction: column; padding: 8px; background: var(--surface);
+  border: 1px solid var(--border-strong); border-radius: 10px; box-shadow: 0 16px 40px rgba(0, 0, 0, .18); }
+.conv-panel input { height: 32px; padding: 0 10px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); background: var(--surface); margin-bottom: 6px; }
+.conv-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; }
+.conv-item { display: flex; align-items: center; gap: 6px; padding: 7px 8px; border-radius: 6px; cursor: pointer; }
+.conv-item:hover { background: var(--surface-2); }
+.conv-item.current { background: var(--accent-soft); }
+.conv-item .conv-text { flex: 1; min-width: 0; }
+.conv-item .conv-name { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conv-item .conv-meta { font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conv-item .icon-btn { opacity: 0; }
+.conv-item:hover .icon-btn, .conv-item .icon-btn:focus-visible { opacity: 1; }
+.conv-empty { padding: 14px; text-align: center; color: var(--muted); font-size: 13px; }
+.rewritten { display: flex; justify-content: flex-end; margin: -6px 0 10px; font-size: 12px; color: var(--muted); }
+.rewritten span { max-width: 80%; text-align: right; }
+.rewritten em { font-style: normal; color: var(--text); }

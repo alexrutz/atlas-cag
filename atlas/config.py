@@ -75,6 +75,9 @@ class Settings(BaseSettings):
     enable_thinking: bool = False
     # Reasoning tokens allowed per generation when thinking is on (added to the answer budget).
     max_thinking_tokens: int = 2048
+    # Rewrite follow-up questions into standalone questions using the conversation before they
+    # are asked (each document cache holds only its document, not the conversation).
+    condense_followups: bool = True
 
     system_prompt: str = (
         "You are Atlas, an enterprise document assistant. You answer questions strictly "
@@ -143,6 +146,7 @@ class RuntimeSettings(BaseModel):
     max_final_tokens: int = Field(ge=64, le=65536)
     enable_thinking: bool
     max_thinking_tokens: int = Field(ge=0, le=131072)
+    condense_followups: bool
     relevance_filter: bool
     ingest_concurrency: int = Field(ge=1, le=32)
     part_overlap_tokens: int = Field(ge=0, le=16384)

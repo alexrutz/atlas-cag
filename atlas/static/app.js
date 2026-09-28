@@ -37,6 +37,14 @@
     if (ms >= 1000) return (ms / 1000).toFixed(1) + " s";
     return Math.round(ms) + " ms";
   };
+  const fmtAgo = (t) => {
+    if (!t) return "never";
+    const s = Date.now() / 1000 - t;
+    if (s < 90) return "just now";
+    if (s < 5400) return `${Math.round(s / 60)} min ago`;
+    if (s < 129600) return `${Math.round(s / 3600)} h ago`;
+    return `${Math.round(s / 86400)} days ago`;
+  };
 
   const ICONS = {
     eye: '<svg viewBox="0 0 24 24"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg>',
@@ -66,6 +74,8 @@
     busy: false,
     abort: null,
     thinkingTouched: false,
+    conversation: null,  // {id, title} of the open conversation; null = a new one starts with the next question
+    conversations: [],
   };
   const docById = (id) => state.docs.find((d) => d.id === id);
   const collectionById = (id) => state.collections.find((c) => c.id === id);
@@ -858,6 +868,7 @@
 
   class Turn {
     constructor(q, docs) {
+      this.question = q;
       this.targets = new Map();
       this.answer = "";
       this.reasoning = "";
@@ -870,6 +881,7 @@
       node.innerHTML = `
         <div class="question"><div class="question-bubble">${esc(q)}</div></div>
         <div class="question-docs">${docs.map((d) => `<span>${esc(d.name)}</span>`).join("")}</div>
+        <div class="rewritten" hidden></div>
         <div class="response">
           <div class="response-status"></div>
           <details class="findings" open hidden>
@@ -892,6 +904,7 @@
         answer: $(".answer", node),
         error: $(".response-error", node),
         foot: $(".response-foot", node),
+        rewritten: $(".rewritten", node),
       };
       thread.appendChild(node);
       this.setStatus("Planning…");
@@ -920,6 +933,10 @@
           // keep the final answer in view; the per-document answers stay one click away
           if (ev.stage === "final" && this.targets.size > 3) this.el.findings.open = false;
           return;
+        case "rewrite":
+          if (ev.stage === "start") this.setStatus("Rewriting the follow-up as a standalone question…");
+          else this.showRewritten(ev.question);
+          return;
         case "delta": return this.onDelta(ev);
         case "done": return this.onDone(ev);
         case "error": return this.fail(ev.message);
@@ -927,7 +944,14 @@
       }
     }
 
+    showRewritten(q) {
+      if (!q || q === this.question) return;
+      this.el.rewritten.innerHTML = `<span>Asked the documents: <em>${esc(q)}</em></span>`;
+      this.el.rewritten.hidden = false;
+    }
+
     onPlan(ev) {
+      if (ev.conversation) setConversation(ev.conversation);
       this.mode = ev.mode;
       for (const t of ev.targets) this.targets.set(t.key, { ...t, state: "queued", text: "", stats: null });
       if (ev.mode === "map_reduce") {
@@ -1045,6 +1069,7 @@
       this.el.answer.classList.remove("cursor");
       this.el.answer.innerHTML = renderMarkdown(this.answer, this.cite);
       const s = ev.stats;
+      if (!s) return;
       const bits = [
         `<strong>${fmtMs(s.total_ms)}</strong>`,
         `<span class="hero">${fmtInt(s.tokens_restored)} tokens restored from KV cache in ${fmtMs(s.restore_ms)}</span>`,
@@ -1072,7 +1097,157 @@
       if (aborted) this.fail("Stopped.");
       else this.fail("The response ended unexpectedly.");
     }
+
+    // A stored turn of a conversation, shown again from what was recorded when it ran.
+    static fromStored(t) {
+      const targets = t.detail?.targets || [];
+      const names = [...new Set(targets.map((x) => x.doc_name))];
+      const docs = names.length ? names.map((name) => ({ name }))
+        : t.doc_ids.map((id) => ({ name: docById(id)?.name || "deleted document" }));
+      const turn = new Turn(t.question, docs);
+      if (targets.length) {
+        turn.handle({ type: "plan", mode: t.mode, targets });
+        for (const x of targets) {
+          if (x.status) turn.handle({ type: "target", key: x.key, status: x.status, answer: x.answer, coverage: x.coverage, stats: x.stats, error: x.error });
+        }
+        turn.el.findings.open = targets.length <= 3;
+      } else {
+        turn.mode = t.mode;
+      }
+      turn.showRewritten(t.standalone);
+      if (t.detail?.reasoning) turn.handle({ type: "delta", channel: "reasoning", text: t.detail.reasoning });
+      if (t.error && !t.answer) turn.fail(t.error === "cancelled by client" ? "Stopped." : t.error);
+      else turn.onDone({ answer: t.answer || "", stats: t.stats });
+      turn.el.answer.innerHTML = renderMarkdown(turn.answer, turn.cite);
+      return turn;
+    }
   }
+
+  // ---------------------------------------------------------------- conversations
+
+  const convPanel = $("#conv-panel");
+  const convSwitch = $("#conv-switch");
+
+  function setConversation(c) {
+    state.conversation = c ? { id: c.id, title: c.title } : null;
+    store.set("atlas.conversation", c ? c.id : null);
+    $("#conv-title").textContent = c ? c.title : "New conversation";
+    convSwitch.title = c ? c.title : "Conversations";
+    $("#conv-rename").hidden = !c;
+  }
+
+  function clearThread() {
+    thread.querySelectorAll(".turn").forEach((n) => n.remove());
+    $("#empty").hidden = false;
+  }
+
+  function newConversation() {
+    if (state.busy) return toast("Stop the running answer first.");
+    setConversation(null);
+    clearThread();
+    closeConversations();
+    question.focus();
+  }
+
+  async function openConversation(id, { quiet = false } = {}) {
+    if (state.busy) return toast("Stop the running answer first.");
+    let conv;
+    try {
+      conv = await getJSON(`/api/conversations/${encodeURIComponent(id)}`);
+    } catch (e) {
+      if (e.status === 404) { setConversation(null); if (!quiet) toast("This conversation no longer exists.", "error"); return; }
+      throw e;
+    }
+    setConversation(conv);
+    clearThread();
+    for (const t of conv.turns) Turn.fromStored(t);
+    // continue with the documents the conversation used last
+    const last = conv.turns[conv.turns.length - 1];
+    const docs = (last?.doc_ids || []).filter((d) => docById(d)?.queryable);
+    if (docs.length) {
+      state.selected = new Set(docs);
+      store.set("atlas.selected", docs);
+      renderLibrary();
+      renderComposer();
+    }
+    closeConversations();
+    scrollDown(true);
+  }
+
+  async function loadConversations() {
+    try {
+      state.conversations = await getJSON("/api/conversations");
+    } catch { return; }
+    renderConversations();
+  }
+
+  function renderConversations() {
+    const q = $("#conv-search").value.trim().toLowerCase();
+    const list = state.conversations.filter((c) => !q || c.title.toLowerCase().includes(q) || (c.last_question || "").toLowerCase().includes(q));
+    $("#conv-list").innerHTML = list.length ? list.map((c) => `
+      <li class="conv-item${c.id === state.conversation?.id ? " current" : ""}" data-id="${esc(c.id)}">
+        <div class="conv-text">
+          <div class="conv-name">${esc(c.title)}</div>
+          <div class="conv-meta">${c.n_turns} question${c.n_turns === 1 ? "" : "s"} · ${fmtAgo(c.updated_at)}${c.last_question && c.n_turns > 1 ? ` · ${esc(c.last_question)}` : ""}</div>
+        </div>
+        <button class="icon-btn" data-act="conv-menu" title="More" aria-label="More">${ICONS.more}</button>
+      </li>`).join("")
+      : `<li class="conv-empty">${q ? "No matching conversations." : "No conversations yet. Ask a question to start one."}</li>`;
+  }
+
+  function toggleConversations(open = convPanel.hidden) {
+    convPanel.hidden = !open;
+    convSwitch.setAttribute("aria-expanded", String(open));
+    if (open) {
+      renderConversations();
+      loadConversations();
+      $("#conv-search").focus();
+    }
+  }
+  const closeConversations = () => toggleConversations(false);
+
+  async function renameConversation(c) {
+    const title = await promptText("Rename conversation", "Title", c.title, "Rename");
+    if (!title?.trim()) return;
+    try {
+      const updated = await (await api(`/api/conversations/${c.id}`, { method: "PATCH", json: { title: title.trim() } })).json();
+      if (state.conversation?.id === c.id) setConversation(updated);
+      loadConversations();
+    } catch (e) { toast(e.message, "error"); }
+  }
+
+  async function deleteConversation(c) {
+    if (!(await confirmAction("Delete conversation", `Delete “${c.title}” and its ${c.n_turns ?? ""} question(s)? Documents and caches are not affected.`, "Delete"))) return;
+    try {
+      await api(`/api/conversations/${c.id}`, { method: "DELETE" });
+      if (state.conversation?.id === c.id) newConversation();
+      loadConversations();
+    } catch (e) { toast(e.message, "error"); }
+  }
+
+  convSwitch.addEventListener("click", () => toggleConversations());
+  $("#conv-new").addEventListener("click", newConversation);
+  $("#conv-rename").addEventListener("click", () => state.conversation && renameConversation(state.conversation));
+  $("#conv-search").addEventListener("input", renderConversations);
+  $("#conv-list").addEventListener("click", (e) => {
+    const item = e.target.closest(".conv-item");
+    if (!item) return;
+    const c = state.conversations.find((x) => x.id === item.dataset.id);
+    if (!c) return;
+    const menuBtn = e.target.closest("[data-act='conv-menu']");
+    if (menuBtn) {
+      openMenu(menuBtn, [
+        { label: "Rename…", action: () => renameConversation(c) },
+        { label: "Delete…", danger: true, action: () => deleteConversation(c) },
+      ]);
+      return;
+    }
+    openConversation(c.id).catch((err) => toast(err.message, "error"));
+  });
+  document.addEventListener("pointerdown", (e) => {
+    if (!convPanel.hidden && !e.target.closest("#conv-panel, #conv-switch, .menu, dialog")) closeConversations();
+  });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !convPanel.hidden && !openMenuEl) closeConversations(); });
 
   async function ask(q) {
     const docs = selectedQueryable();
@@ -1087,7 +1262,7 @@
       const thinking = $("#thinking-wrap").hidden ? null : $("#thinking").checked;
       const res = await api("/api/query", {
         method: "POST",
-        json: { question: q, document_ids: docs.map((d) => d.id), thinking },
+        json: { question: q, document_ids: docs.map((d) => d.id), thinking, conversation_id: state.conversation?.id || null },
         signal: ctrl.signal,
       });
       await readSSE(res, (ev) => turn.handle(ev));
@@ -1100,6 +1275,7 @@
       state.abort = null;
       renderComposer();
       refresh();
+      if (!convPanel.hidden) loadConversations();
     }
   }
 
@@ -1134,9 +1310,12 @@
 
   window.Atlas = {
     api, getJSON, esc, toast, refresh, openModal, confirmAction, promptText, openMenu,
-    fmtInt, fmtTok, fmtBytes, fmtMs, state,
+    fmtInt, fmtTok, fmtBytes, fmtMs, fmtAgo, state,
   };
 
   renderComposer();
-  refresh();
+  refresh().then(() => {
+    const id = store.get("atlas.conversation", null);
+    if (id) openConversation(id, { quiet: true }).catch(() => setConversation(null));
+  });
 })();

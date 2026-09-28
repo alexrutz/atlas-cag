@@ -50,6 +50,11 @@ class QueryRequest(BaseModel):
     document_ids: list[str] = Field(default_factory=list, max_length=2000)
     collection_ids: list[str] = Field(default_factory=list, max_length=200)
     thinking: bool | None = None
+    conversation_id: str | None = None  # empty: the question starts a new conversation
+
+
+class ConversationBody(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
 
 
 class DownloadRequest(BaseModel):
@@ -339,7 +344,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def query(request: Request, body: QueryRequest):
         s = st(request)
         try:
-            plan = await s.queries.prepare(body.question, body.document_ids, body.thinking, body.collection_ids)
+            plan = await s.queries.prepare(body.question, body.document_ids, body.thinking, body.collection_ids,
+                                           body.conversation_id)
         except QueryError as e:
             raise HTTPException(e.status, str(e)) from e
 
@@ -356,6 +362,42 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @api.get("/queries")
     async def list_queries(request: Request, limit: int = 50):
         return st(request).store.list_queries(max(1, min(limit, 500)))
+
+    # --- conversations -----------------------------------------------------------------
+
+    def get_conversation_or_404(s, conversation_id: str) -> dict:
+        conversation = s.store.get_conversation(conversation_id)
+        if conversation is None:
+            raise HTTPException(404, "conversation not found")
+        return conversation
+
+    @api.get("/conversations")
+    async def list_conversations(request: Request):
+        return st(request).store.list_conversations()
+
+    @api.post("/conversations")
+    async def create_conversation(request: Request, body: ConversationBody):
+        return st(request).store.create_conversation(body.title.strip())
+
+    @api.get("/conversations/{conversation_id}")
+    async def get_conversation(request: Request, conversation_id: str):
+        s = st(request)
+        conversation = get_conversation_or_404(s, conversation_id)
+        return {**conversation, "turns": s.store.conversation_turns(conversation_id)}
+
+    @api.patch("/conversations/{conversation_id}")
+    async def rename_conversation(request: Request, conversation_id: str, body: ConversationBody):
+        s = st(request)
+        get_conversation_or_404(s, conversation_id)
+        s.store.rename_conversation(conversation_id, body.title.strip())
+        return s.store.get_conversation(conversation_id)
+
+    @api.delete("/conversations/{conversation_id}")
+    async def delete_conversation(request: Request, conversation_id: str):
+        s = st(request)
+        get_conversation_or_404(s, conversation_id)
+        s.store.delete_conversation(conversation_id)
+        return {"deleted": conversation_id}
 
     # --- runtime settings --------------------------------------------------------------
 

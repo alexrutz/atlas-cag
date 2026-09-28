@@ -68,3 +68,44 @@ def test_query_log(tmp_path):
     store.log_query("q1", "why?", ["d1"], "single", "because", {"total_ms": 1}, None)
     [q] = store.list_queries()
     assert q["doc_ids"] == ["d1"] and q["stats"] == {"total_ms": 1}
+
+
+def test_migration_to_conversations(tmp_path):
+    import sqlite3
+    store = Store(tmp_path / "db.sqlite")
+    store.close()
+    db = sqlite3.connect(tmp_path / "db.sqlite")  # turn it back into a v2 database with two questions
+    db.executescript("""
+        DROP INDEX queries_conversation; DROP TABLE queries; DROP TABLE conversations;
+        CREATE TABLE queries (id TEXT PRIMARY KEY, created_at REAL NOT NULL, question TEXT NOT NULL,
+            doc_ids TEXT NOT NULL, mode TEXT, answer TEXT, stats TEXT, error TEXT);
+        INSERT INTO queries VALUES ('q1', 10, 'first?', '["d1"]', 'single', 'one', NULL, NULL);
+        INSERT INTO queries VALUES ('q2', 20, 'second?', '["d1"]', 'single', 'two', NULL, NULL);
+        PRAGMA user_version = 2;
+    """)
+    db.commit()
+    db.close()
+    store = Store(tmp_path / "db.sqlite")
+    [conv] = store.list_conversations()
+    assert conv["title"] == "Earlier questions" and conv["n_turns"] == 2 and conv["last_question"] == "second?"
+    assert [t["question"] for t in store.conversation_turns(conv["id"])] == ["first?", "second?"]
+    assert [t["question"] for t in store.conversation_turns(conv["id"], limit=1)] == ["second?"]
+    Store(tmp_path / "db.sqlite")  # idempotent
+    assert len(store.list_conversations()) == 1
+
+
+def test_conversations(tmp_path):
+    store = Store(tmp_path / "db.sqlite")
+    a = store.create_conversation("Gearbox")
+    b = store.create_conversation("Holidays")
+    store.log_query("q1", "why?", ["d1"], "single", "because", None, None, a["id"], None, {"targets": []})
+    assert [c["id"] for c in store.list_conversations()] == [a["id"], b["id"]], "most recently used first"
+    [turn] = store.conversation_turns(a["id"])
+    assert turn["detail"] == {"targets": []} and turn["conversation_id"] == a["id"]
+    store.rename_conversation(a["id"], "Gearbox failure")
+    assert store.get_conversation(a["id"])["title"] == "Gearbox failure"
+    store.delete_conversation(a["id"])
+    assert store.get_conversation(a["id"]) is None and store.list_queries() == []
+    # a question finishing after its conversation was deleted is still logged, without it
+    store.log_query("q2", "late?", ["d1"], "single", "yes", None, None, a["id"])
+    assert store.list_queries()[0]["conversation_id"] is None

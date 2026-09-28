@@ -2,7 +2,7 @@
 
 (() => {
   const A = window.Atlas;
-  const { api, getJSON, esc, toast, fmtInt, fmtTok, fmtBytes } = A;
+  const { api, getJSON, esc, toast, fmtInt, fmtTok, fmtBytes, fmtAgo } = A;
   const $ = (sel, root = document) => root.querySelector(sel);
   const store = {
     get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch { return d; } },
@@ -20,14 +20,6 @@
   const CTX_STEPS = [8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576];
   const GiB = 2 ** 30;
   const fmtGB = (b) => `${(b / GiB).toFixed(b >= 10 * GiB ? 1 : 2)} GB`;
-  const fmtAgo = (t) => {
-    if (!t) return "never";
-    const s = Date.now() / 1000 - t;
-    if (s < 90) return "just now";
-    if (s < 5400) return `${Math.round(s / 60)} min ago`;
-    if (s < 129600) return `${Math.round(s / 3600)} h ago`;
-    return `${Math.round(s / 86400)} days ago`;
-  };
 
   const tildify = (path) => String(path || "").replace(/^\/home\/[^/]+/, "~");
 
@@ -722,6 +714,9 @@
     { section: "Thinking" },
     { key: "enable_thinking", label: "Think before answering by default (models with a thinking switch)", type: "checkbox" },
     { key: "max_thinking_tokens", label: "Thinking budget (tokens)", type: "number", step: 128, min: 0, help: "llama-server forces the model to stop thinking and answer once this is spent." },
+    { section: "Conversations" },
+    { key: "condense_followups", label: "Rewrite follow-up questions into standalone questions using the conversation", type: "checkbox",
+      help: "Document caches hold only their document, so “and why?” is first turned into e.g. “Why did the gearbox fail?”. One short extra generation per follow-up." },
     { section: "Several documents" },
     { key: "relevance_filter", label: "Drop answers from documents that rate themselves as not covering the question", type: "checkbox",
       help: "Off (recommended): every per-document answer goes into the combined answer. On: faster with many documents, but relies on the model’s self-rating." },
