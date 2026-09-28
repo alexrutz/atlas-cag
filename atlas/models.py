@@ -47,6 +47,8 @@ class ModelInfo:
     sliding_window: int | None = None
     hybrid: bool = False
     kv_bytes_per_token_f16: int | None = None  # all attention layers, K + V (+ indexer keys), f16
+    # part of the above in sliding-window layers: without --swa-full they only cache the window
+    kv_swa_bytes_per_token_f16: int = 0
     recurrent_bytes_per_slot: int = 0
     # weight bytes by where llama.cpp can place them (see estimate())
     expert_bytes_by_layer: dict[int, int] | None = None
@@ -107,8 +109,18 @@ def _describe(info: ModelInfo) -> None:
     info.n_attn_layers = len(per_layer)
     # sparse-attention indexer (e.g. qwen4exp) caches one extra key per attention layer and token
     indexer = a("attention.indexer.key_length") or 0
-    info.kv_bytes_per_token_f16 = int(sum(h * (k_len + v_len) + indexer for h in per_layer) * 2) or None
     info.sliding_window = a("attention.sliding_window")
+    # which attention layers use the sliding window: per-layer flags, or every Nth layer is global
+    pattern = a("attention.sliding_window_pattern")
+    swa = [False] * len(per_layer)
+    if info.sliding_window and len(per_layer) == n_layers:
+        if isinstance(pattern, list):
+            swa = [bool(x) for x in pattern[:n_layers]] + [False] * max(0, n_layers - len(pattern))
+        elif isinstance(pattern, int) and pattern > 1:
+            swa = [(i + 1) % pattern != 0 for i in range(n_layers)]
+    layer_bytes = [(h * (k_len + v_len) + indexer) * 2 for h in per_layer]
+    info.kv_bytes_per_token_f16 = int(sum(layer_bytes)) or None
+    info.kv_swa_bytes_per_token_f16 = int(sum(b for b, s in zip(layer_bytes, swa) if s))
     info.hybrid = info.n_attn_layers < n_layers
     inner, state = a("ssm.inner_size"), a("ssm.state_size")
     if inner and state:  # recurrent + convolution state of linear-attention / SSM layers, kept in f32
@@ -251,8 +263,16 @@ def _flags(extra_args: str) -> dict:
     return out
 
 
+# llama.cpp sizes a sliding-window cache as window + micro-batch per sequence, padded to 256
+SWA_UBATCH = 512
+
+
+def _swa_cells(window: int, ctx: int) -> int:
+    return min(ctx, -(-(window + SWA_UBATCH) // 256) * 256)
+
+
 def estimate(model: ModelInfo | None, ctx_per_slot: int, slots: int, kv_type: str,
-             extra_args: str = "", gpu_layers: str = "all", mmproj_bytes: int = 0) -> dict:
+             extra_args: str = "", gpu_layers: str = "all", mmproj_bytes: int = 0, swa_full: bool = False) -> dict:
     """Rough memory estimate for a preset, in bytes: GPU (weights + KV + recurrent state + vision
     projector), system RAM (CPU-offloaded experts, input embeddings) and SSD (lazily read embeddings)."""
     if model is None or not model.kv_bytes_per_token_f16:
@@ -267,8 +287,11 @@ def estimate(model: ModelInfo | None, ctx_per_slot: int, slots: int, kv_type: st
         moved = int(gpu_weights * (model.n_layers - int(gpu_layers)) / model.n_layers)
         gpu_weights -= moved
         ram += moved
-    per_token = model.kv_bytes_per_token_f16 / 2 * KV_TYPE_BYTES.get(kv_type, 2.0)
-    kv = per_token * ctx_per_slot * slots
+    scale = KV_TYPE_BYTES.get(kv_type, 2.0) / 2
+    swa_part = model.kv_swa_bytes_per_token_f16 * scale
+    per_token = model.kv_bytes_per_token_f16 * scale - (0 if swa_full else swa_part)  # grows with the context
+    swa_fixed = 0 if swa_full else swa_part * _swa_cells(model.sliding_window or 0, ctx_per_slot)
+    kv = (per_token * ctx_per_slot + swa_fixed) * slots
     recurrent = model.recurrent_bytes_per_slot * slots
     if mmproj_bytes and "--no-mmproj-offload" in shlex.split(extra_args or ""):
         ram += mmproj_bytes
@@ -282,7 +305,8 @@ def estimate(model: ModelInfo | None, ctx_per_slot: int, slots: int, kv_type: st
         "ram": int(ram),
         "ssd": int(lazy_ssd),
         "kv_bytes_per_token": int(per_token),
-        "slot_file_per_100k_tokens": int(per_token * 100_000 + model.recurrent_bytes_per_slot),
+        "slot_file_per_100k_tokens": int(per_token * 100_000 + model.recurrent_bytes_per_slot
+                                         + (swa_part * (model.sliding_window or 0) if not swa_full else 0)),
     }
 
 

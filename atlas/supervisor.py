@@ -285,6 +285,9 @@ class Supervisor:
                 self.engine.extra_ident = preset_ident(preset)
                 self.engine.vision_ident = vision_ident(preset)
                 self.apply_sampling(preset)
+                model = models.describe_file(Path(preset["model_path"])) if Path(preset["model_path"]).is_file() else None
+                self.engine.swa_window = None if preset.get("swa_full") else (model.sliding_window if model else None)
+                self.engine.info.swa_restore_ok = None
                 self.engine.config_label = preset_label(preset)
                 await self._start_process()
                 await self.engine.connect()

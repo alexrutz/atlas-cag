@@ -295,3 +295,15 @@ async def test_client_disconnect_cancels_upstream_generation(fake, tmp_path):
             assert status["pool"]["leases"] == []
     finally:
         stop()
+
+
+async def test_sliding_window_restore_reuse_is_checked(atlas, fake):
+    """Stock llama-server re-prefills restored caches of sliding-window models without --swa-full."""
+    eng = atlas.app.state.engine
+    eng.swa_window = 64
+    await eng.probe_kv_dir()
+    assert eng.info.swa_restore_ok is True
+    fake.swa_restore_bug = True
+    await eng.probe_kv_dir()
+    assert eng.info.swa_restore_ok is False
+    assert not list(fake.kv_dir.glob("atlas-swa-probe*")), "the probe file is removed"

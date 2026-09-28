@@ -173,7 +173,6 @@
     const problems = [];
     if (!p.model_found) problems.push("Model file not found.");
     if (m && m.ctx_train && p.ctx_per_slot > m.ctx_train) problems.push(`Context per slot exceeds the model's trained context (${fmtInt(m.ctx_train)}).`);
-    if (m && m.sliding_window && !p.swa_full) problems.push("This model uses sliding-window attention: enable “Full SWA cache”, or cached prompts cannot be extended.");
     if (!p.mmproj_found) problems.push("Vision projector file not found.");
     problems.push(...(p.warnings || []));
     const build = p.build ? `${p.binary ? "" : "standard build · "}${p.build.label}` : "";
@@ -457,7 +456,9 @@
       m.ctx_train && `trained context ${fmtInt(m.ctx_train)} tokens`,
       m.hybrid && `hybrid: ${m.n_attn_layers} of ${m.n_layers} layers use attention`,
       m.sliding_window && `sliding window ${fmtInt(m.sliding_window)}`,
-      m.kv_bytes_per_token_f16 && `KV ${fmtBytes(m.kv_bytes_per_token_f16)}/token at f16`,
+      m.kv_bytes_per_token_f16 && (m.kv_swa_bytes_per_token_f16
+        ? `KV ${fmtBytes(m.kv_bytes_per_token_f16 - m.kv_swa_bytes_per_token_f16)}/token at f16, +${fmtBytes(m.kv_swa_bytes_per_token_f16)}/token with --swa-full`
+        : `KV ${fmtBytes(m.kv_bytes_per_token_f16)}/token at f16`),
     ].filter(Boolean);
     return `<span class="muted small">${bits.join(" · ")}</span>`;
   }
@@ -544,7 +545,9 @@
           <span class="muted small">“all”, “auto” or a number; fewer layers spill weights to system RAM (slower).</span>
         </label>
         <label class="field check-field"><span><input type="checkbox" name="swa_full" ${p.swa_full ? "checked" : ""}> Full SWA cache (--swa-full)</span>
-          <span class="muted small">Required for sliding-window models (Gemma, gpt-oss) so restored prompts can be extended.</span>
+          <span class="muted small">Sliding-window models (Gemma, gpt-oss, Spark): standard llama-server builds prefill a restored document
+            again unless this is on. Off caches only the window for sliding layers (far less memory) and needs a build with the SWA
+            restore fix; Atlas checks this when the preset starts.</span>
         </label>
         <label class="field span2">Vision projector (mmproj) for visual prefill
           <select name="mmproj_select">${projectorOptions(p.mmproj)}</select>
@@ -635,7 +638,7 @@
         let est = null;
         try {
           est = await (await api("/api/presets/estimate", { method: "POST", json: {
-            model_path: f.model_path.value.trim(), ctx_per_slot: ctx, slots: Number(f.slots.value) || 1,
+            model_path: f.model_path.value.trim(), ctx_per_slot: ctx, slots: Number(f.slots.value) || 1, swa_full: f.swa_full.checked,
             kv_type: f.kv_type.value, extra_args: f.extra_args.value, gpu_layers: f.gpu_layers.value.trim() || "all",
             binary: f.binary.value.trim(), mmproj: f.mmproj.value.trim(),
           } })).json();
@@ -777,7 +780,7 @@
         <td>${esc(m.quant || "–")}</td>
         <td class="num">${fmtBytes(m.size_bytes)}</td>
         <td class="num">${m.ctx_train ? fmtTok(m.ctx_train) : "–"}</td>
-        <td class="num" title="per 1,000 tokens at q8_0 / f16">${m.kv_bytes_per_token_f16 ? `${fmtBytes(m.kv_bytes_per_token_f16 * 1000 * 34 / 64)} / ${fmtBytes(m.kv_bytes_per_token_f16 * 1000)}` : "–"}</td>
+        <td class="num" title="per 1,000 tokens at q8_0 / f16${m.kv_swa_bytes_per_token_f16 ? "; sliding-window layers only cache their window unless --swa-full is on" : ""}">${m.kv_bytes_per_token_f16 ? (() => { const b = m.kv_bytes_per_token_f16 - (m.kv_swa_bytes_per_token_f16 || 0); return `${fmtBytes(b * 1000 * 34 / 64)} / ${fmtBytes(b * 1000)}`; })() : "–"}</td>
         <td><span class="muted small" title="${esc(m.path)}">${esc(m.source)}${m.repo ? ` · ${esc(m.repo)}` : ""}</span></td>
         <td>${m.error ? `<span class="warn-text small">${esc(m.error)}</span>` : `<button class="btn small" data-act="create-preset-from" data-path="${esc(m.path)}">Create preset</button>`}</td>
       </tr>`).join("");

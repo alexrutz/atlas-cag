@@ -45,6 +45,8 @@ class EngineInfo:
     kv_dir_ok: bool = False
     supports_thinking: bool = False
     vision: bool = False  # llama-server has a vision projector (mmproj) loaded
+    # sliding-window model without --swa-full: does a restored cache get reused? (None: not checked)
+    swa_restore_ok: bool | None = None
     media_marker: str | None = None
     meta: dict = field(default_factory=dict)
 
@@ -113,6 +115,8 @@ class Engine:
         # external llama-server: its own defaults apply (the model file's, unless its command line
         # sets others).
         self.sampling: dict = {}
+        # Set by the supervisor for sliding-window models run without --swa-full: the window size.
+        self.swa_window: int | None = None
         self._pad: tuple[int, str, int] | None = None
         self.config_label: str | None = None
         self.paused: str | None = None  # reason while llama-server is being switched or is down
@@ -344,6 +348,8 @@ class Engine:
                 if rebuild:
                     canary.unlink(missing_ok=True)
                     await self._write_canary(slot)
+                if self.swa_window and canary.exists():
+                    await self._probe_swa_restore(slot)
             self.info.fingerprint = self._fingerprint()
             self.info.kv_dir_ok = canary.exists()
             if not self.info.kv_dir_ok:
@@ -356,6 +362,33 @@ class Engine:
             self.info.error = f"slot persistence unavailable: {e}"
         if self.info.error:
             log.error(self.info.error)
+
+    async def _probe_swa_restore(self, slot: int) -> None:
+        """Check that llama-server reuses a restored cache of a sliding-window model.
+
+        Without --swa-full a slot file keeps only the window for sliding-window layers. Stock
+        llama-server builds then consider the restored state incomplete and prefill everything
+        again on every query; builds with the SWA restore fix reuse it.
+        """
+        n = self.swa_window + 64
+        words = await self.plain(" ".join(f"item{i}" for i in range(n)))
+        tokens = words[:n]
+        name = "atlas-swa-probe.bin"
+        try:
+            await self.prefill(slot, tokens)
+            await self.llama.slot_save(slot, name)
+            await self.llama.slot_erase(slot)
+            await self.llama.slot_restore(slot, name)
+            res = await self.llama.completion({"prompt": tokens + tokens[:1], "n_predict": 1, "id_slot": slot,
+                                               "cache_prompt": True, "temperature": 0})
+            reused = int((res.get("timings") or {}).get("cache_n") or 0)
+            self.info.swa_restore_ok = reused >= len(tokens)
+            if not self.info.swa_restore_ok:
+                log.warning("llama-server re-processes restored caches of this sliding-window model (%d of %d tokens "
+                            "reused): enable --swa-full in the preset or use a build with the SWA restore fix",
+                            reused, len(tokens))
+        finally:
+            (self.settings.kv_dir / name).unlink(missing_ok=True)
 
     async def kv_compatible(self, slot: int, seen_fingerprint: str | None) -> bool:
         """After a failed restore: False if the configuration's whole KV store is stale (and its

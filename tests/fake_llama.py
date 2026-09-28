@@ -67,6 +67,10 @@ class FakeLlama:
         self.active = 0  # streams currently being generated
         self.cancelled = 0  # streams aborted because the client went away
         self.vision = False  # a vision projector (--mmproj) is loaded
+        # like stock llama-server with a sliding-window model and no --swa-full: a restored slot
+        # is never reused, everything is prefilled again
+        self.swa_restore_bug = False
+        self.restored: set[int] = set()
         self.app = self._build()
 
     def multimodal(self, prompt: dict) -> tuple[list[int], str]:
@@ -161,6 +165,7 @@ class FakeLlama:
                 if not saved or saved["format"] != fake.kv_format:
                     return error(400, "Unable to restore slot: invalid slot save file")
                 fake.slots[slot] = saved["tokens"]
+                fake.restored.add(slot)
                 return {"id_slot": slot, "filename": filename, "n_restored": len(fake.slots[slot]),
                         "n_read": path.stat().st_size}
             return error(400, "Invalid action")
@@ -184,6 +189,9 @@ class FakeLlama:
                 n += 1
             if n == len(prompt):
                 n -= 1
+            if fake.swa_restore_bug and slot in fake.restored:
+                n = 0
+            fake.restored.discard(slot)
             fake.slots[slot] = list(prompt)
             fake.log.append({"slot": slot, "n_prompt": len(prompt), "cache_n": n, "n_predict": body["n_predict"],
                              "sampling": {k: body[k] for k in SAMPLING_FIELDS if k in body}})

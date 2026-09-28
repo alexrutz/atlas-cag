@@ -526,6 +526,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         warnings = builds.preset_warnings(build, info.arch if info else None, p.get("extra_args", ""))
         if missing:
             warnings.append(sampling.describe_missing(missing).capitalize())
+        if p["id"] == active and s.engine.info.swa_restore_ok is False:
+            warnings.append("This llama-server build prefills restored documents again for this sliding-window model "
+                            "(no cache reuse): enable “Full SWA cache”, or use a build with the SWA restore fix.")
         return {**p, "active": p["id"] == active, "model_found": path.is_file(),
                 "sampling_model": (info.sampling or {}) if info else {}, "sampling_effective": effective,
                 "sampling_source": source, "sampling_missing": missing,
@@ -534,7 +537,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "build": build.to_json(),
                 "warnings": warnings,
                 "estimate": models.estimate(info, p["ctx_per_slot"], p["slots"], p["kv_type"],
-                                            p.get("extra_args", ""), p.get("gpu_layers", "all"), mmproj_bytes)}
+                                            p.get("extra_args", ""), p.get("gpu_layers", "all"), mmproj_bytes,
+                                            bool(p.get("swa_full")))}
 
     @api.get("/presets")
     async def list_presets(request: Request):
@@ -576,7 +580,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return {"sampling_model": info.sampling or {},
                     **models.estimate(info, int(body.get("ctx_per_slot") or 0), int(body.get("slots") or 1),
                                       str(body.get("kv_type") or "f16"), extra, str(body.get("gpu_layers") or "all"),
-                                      mmproj_bytes),
+                                      mmproj_bytes, bool(body.get("swa_full"))),
                     "warnings": builds.preset_warnings(build, info.arch, extra), "build": build.to_json()}
         try:
             return await asyncio.to_thread(check)

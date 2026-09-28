@@ -222,3 +222,22 @@ async def test_download_resumes_and_completes(fake_hub, tmp_path):
         assert found == {"Model-Q4_K_M.gguf", "Split-Q8_0-00001-of-00002.gguf"}
     finally:
         await d.stop()
+
+
+def test_sliding_window_layers_only_cache_their_window(tmp_path):
+    """Like Spark-X2.5: 36 layers, 3 of every 4 use a 512-token window, 4 KV heads of 256."""
+    path = write_gguf(tmp_path / "spark.gguf", {
+        "general.architecture": "spark2_5", "spark2_5.block_count": 36, "spark2_5.context_length": 1048576,
+        "spark2_5.embedding_length": 2560, "spark2_5.attention.head_count": 16, "spark2_5.attention.head_count_kv": 4,
+        "spark2_5.attention.key_length": 256, "spark2_5.attention.value_length": 256,
+        "spark2_5.attention.sliding_window": 512,
+        "spark2_5.attention.sliding_window_pattern": [True, True, True, False] * 9,
+    })
+    m = models.describe_file(path)
+    assert m.kv_bytes_per_token_f16 == 36 * 4 * 512 * 2 and m.kv_swa_bytes_per_token_f16 == 27 * 4 * 512 * 2
+    full = models.estimate(m, 524288, 1, "q8_0", swa_full=True)
+    windowed = models.estimate(m, 524288, 1, "q8_0")
+    assert full["kv_cache"] == int(36 * 4 * 512 * 34 / 32 * 524288)  # ~39 GiB
+    per_token = 9 * 4 * 512 * 34 / 32
+    assert windowed["kv_cache"] == int(per_token * 524288 + 27 * 4 * 512 * 34 / 32 * 1024)  # ~9.6 GiB + window
+    assert windowed["kv_bytes_per_token"] == int(per_token)
