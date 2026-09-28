@@ -1,0 +1,31 @@
+# Atlas with a managed llama-server in one GPU container.
+#
+#   mkdir -p models data && docker compose up -d        # → http://localhost:8000
+#
+# Then open Settings: download a GGUF model (or put one into ./models) and create a preset.
+# The container runs as UID 1000 so the bind-mounted directories stay owned by you
+# (override with ATLAS_UID / ATLAS_GID).
+services:
+  atlas:
+    build: .
+    user: "${ATLAS_UID:-1000}:${ATLAS_GID:-1000}"
+    environment:
+      # read-only view of your Hugging Face cache, so GGUFs already downloaded there show up
+      HF_HUB_CACHE: /hf-cache
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - ${MODELS_DIR:-./models}:/models            # GGUF files; downloads from the UI land here too
+      - ${DATA_DIR:-./data}:/data                  # index, extracted texts and KV caches
+      - ${HF_CACHE_DIR:-~/.cache/huggingface/hub}:/hf-cache:ro
+    ports:
+      - "${ATLAS_PUBLISH:-8000}:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped

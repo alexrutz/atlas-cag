@@ -1,0 +1,283 @@
+"""Discover local GGUF models, describe them, and estimate the memory a preset needs."""
+
+import asyncio
+import os
+import re
+import shlex
+import shutil
+import struct
+from dataclasses import dataclass
+from pathlib import Path
+
+from .gguf import GGUFError, read_metadata, read_tensor_sizes
+
+# llama_ftype values (general.file_type) -> common quantization names
+FILE_TYPES = {
+    0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 7: "Q8_0", 8: "Q5_0", 9: "Q5_1", 10: "Q2_K", 11: "Q3_K_S",
+    12: "Q3_K_M", 13: "Q3_K_L", 14: "Q4_K_S", 15: "Q4_K_M", 16: "Q5_K_S", 17: "Q5_K_M", 18: "Q6_K",
+    19: "IQ2_XXS", 20: "IQ2_XS", 21: "Q2_K_S", 22: "IQ3_XS", 23: "IQ3_XXS", 24: "IQ1_S", 25: "IQ4_NL",
+    26: "IQ3_S", 27: "IQ3_M", 28: "IQ2_S", 29: "IQ2_M", 30: "IQ4_XS", 31: "IQ1_M", 32: "BF16",
+    36: "TQ1_0", 37: "TQ2_0", 38: "MXFP4",
+}
+# bytes per KV element for llama.cpp cache types
+KV_TYPE_BYTES = {"f16": 2.0, "bf16": 2.0, "q8_0": 34 / 32, "q5_1": 24 / 32, "q5_0": 22 / 32,
+                 "q4_1": 20 / 32, "q4_0": 18 / 32}
+
+_SHARD = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
+_SKIP = re.compile(r"(^|[-_.])(mmproj|imatrix)", re.I)
+
+
+@dataclass
+class ModelInfo:
+    path: str
+    file: str
+    source: str  # "models dir", "Hugging Face cache", "llama.cpp cache"
+    repo: str | None
+    size_bytes: int
+    shards: int
+    arch: str | None = None
+    name: str | None = None
+    size_label: str | None = None
+    quant: str | None = None
+    ctx_train: int | None = None
+    n_layers: int | None = None
+    n_attn_layers: int | None = None
+    sliding_window: int | None = None
+    hybrid: bool = False
+    kv_bytes_per_token_f16: int | None = None  # all attention layers, K + V (+ indexer keys), f16
+    recurrent_bytes_per_slot: int = 0
+    # weight bytes by where llama.cpp can place them (see estimate())
+    expert_bytes_by_layer: dict[int, int] | None = None
+    lazy_bytes: int = 0  # per-layer / n-gram embeddings: can stay on disk with --lazy-mode on
+    input_bytes: int = 0  # token embeddings: always kept in system RAM by llama.cpp
+    error: str | None = None
+
+    def to_json(self) -> dict:
+        return dict(self.__dict__)
+
+
+def _hub_cache() -> Path:
+    if os.environ.get("HF_HUB_CACHE"):
+        return Path(os.environ["HF_HUB_CACHE"])
+    return Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub"
+
+
+def _llama_cache() -> Path:
+    return Path(os.environ.get("LLAMA_CACHE", Path.home() / ".cache" / "llama.cpp"))
+
+
+def _describe(info: ModelInfo) -> None:
+    try:
+        meta = read_metadata(info.path)
+    except (OSError, GGUFError) as e:
+        info.error = str(e)
+        return
+    arch = meta.get("general.architecture")
+    info.arch = arch
+    name = meta.get("general.name") or meta.get("general.basename")
+    # converters sometimes store a snapshot hash as the name: fall back to the file name
+    info.name = name if name and not re.fullmatch(r"[0-9a-f]{32,}", name) else _SHARD.sub("", Path(info.file).stem)
+    info.size_label = meta.get("general.size_label")
+    info.quant = FILE_TYPES.get(meta.get("general.file_type"), None)
+
+    def a(key, default=None):
+        return meta.get(f"{arch}.{key}", default)
+
+    info.ctx_train = a("context_length")
+    n_layers = a("block_count") or 0
+    n_layers -= a("nextn_predict_layers", 0) or 0  # multi-token-prediction layers hold no KV cache
+    info.n_layers = n_layers
+    n_head = a("attention.head_count") or 1
+    if isinstance(n_head, list):
+        n_head = max(n_head) or 1
+    embd = a("embedding_length") or 0
+    k_len = a("attention.key_length") or (embd // n_head if embd else 0)
+    v_len = a("attention.value_length") or k_len
+    kv_heads = a("attention.head_count_kv", n_head)
+    if isinstance(kv_heads, list):  # per-layer (e.g. LFM2: 0 for convolution layers)
+        per_layer = [h for h in kv_heads[:n_layers] if h]
+    else:
+        interval = a("full_attention_interval")  # hybrid linear/full attention (Qwen3.5, Qwen3-Next)
+        n_attn = n_layers // interval if interval else n_layers
+        per_layer = [kv_heads] * n_attn
+    info.n_attn_layers = len(per_layer)
+    # sparse-attention indexer (e.g. qwen4exp) caches one extra key per attention layer and token
+    indexer = a("attention.indexer.key_length") or 0
+    info.kv_bytes_per_token_f16 = int(sum(h * (k_len + v_len) + indexer for h in per_layer) * 2) or None
+    info.sliding_window = a("attention.sliding_window")
+    info.hybrid = info.n_attn_layers < n_layers
+    inner, state = a("ssm.inner_size"), a("ssm.state_size")
+    if inner and state:  # recurrent + convolution state of linear-attention / SSM layers, kept in f32
+        conv = (a("ssm.conv_kernel", 1) - 1) * (inner + 2 * (a("ssm.group_count") or 0) * state)
+        info.recurrent_bytes_per_slot = int((n_layers - info.n_attn_layers) * (inner * state + conv) * 4)
+
+
+_cache: dict[tuple[str, float, int], ModelInfo] = {}
+
+
+def _info(path: Path, source: str, repo: str | None) -> ModelInfo:
+    real = path.resolve()
+    st = real.stat()
+    m = _SHARD.search(path.name)
+    shards = int(m.group(2)) if m else 1
+    size = st.st_size
+    if shards > 1:
+        size = sum((p.resolve().stat().st_size for p in path.parent.glob(_SHARD.sub("-*-of-" + m.group(2) + ".gguf",
+                                                                                    path.name))), 0)
+    key = (str(path), st.st_mtime, size)
+    if key not in _cache:
+        info = ModelInfo(path=str(path), file=path.name, source=source, repo=repo, size_bytes=size, shards=shards)
+        _describe(info)
+        if not info.error:
+            shard_files = sorted(path.parent.glob(_SHARD.sub("-*-of-" + m.group(2) + ".gguf", path.name))) if m else [path]
+            _classify(info, shard_files)
+        _cache[key] = info
+    return _cache[key]
+
+
+_EXPERTS = re.compile(r"^blk\.(\d+)\.ffn_\w*_exps\b")
+_LAZY = re.compile(r"per_layer_token_embd|^ple_|\.ple_embd")
+
+
+def _classify(info: ModelInfo, files: list[Path]) -> None:
+    """Split weights into routed experts (per layer), lazily loadable embeddings and input embeddings."""
+    experts: dict[int, int] = {}
+    try:
+        for f in files:
+            for name, size in read_tensor_sizes(f).items():
+                if m := _EXPERTS.match(name):
+                    experts[int(m.group(1))] = experts.get(int(m.group(1)), 0) + size
+                elif _LAZY.search(name):
+                    info.lazy_bytes += size
+                elif name == "token_embd.weight":
+                    info.input_bytes += size
+    except (OSError, GGUFError, struct.error):
+        return
+    info.expert_bytes_by_layer = experts or None
+
+
+def _candidates(root: Path) -> list[Path]:
+    if not root.is_dir():
+        return []
+    out = []
+    for p in root.rglob("*.gguf"):
+        if _SKIP.search(p.name):
+            continue
+        m = _SHARD.search(p.name)
+        if m and m.group(1) != "00001":
+            continue
+        out.append(p)
+    return out
+
+
+def discover(models_dirs: list[Path], scan_caches: bool = True) -> list[ModelInfo]:
+    found: dict[str, ModelInfo] = {}
+
+    def add(p: Path, source: str, repo: str | None) -> None:
+        real = str(p.resolve())
+        if real not in found and p.exists():
+            found[real] = _info(p, source, repo)
+
+    for d in models_dirs:
+        for p in _candidates(d):
+            add(p, "models dir", None)
+    if scan_caches:
+        hub = _hub_cache()
+        if hub.is_dir():
+            for repo_dir in hub.glob("models--*"):
+                repo = repo_dir.name[len("models--"):].replace("--", "/")
+                snaps = sorted((repo_dir / "snapshots").glob("*"), key=lambda p: p.stat().st_mtime, reverse=True)
+                for snap in snaps:
+                    for p in _candidates(snap):
+                        add(p, "Hugging Face cache", repo)
+        for p in _candidates(_llama_cache()):
+            add(p, "llama.cpp cache", None)
+    return sorted(found.values(), key=lambda m: (m.name or m.file).lower())
+
+
+def describe_file(path: Path) -> ModelInfo:
+    """Describe a GGUF file outside the scanned directories (e.g. a preset's custom path)."""
+    return _info(path, "custom path", None)
+
+
+def _flags(extra_args: str) -> dict:
+    try:
+        args = shlex.split(extra_args or "")
+    except ValueError:
+        args = []
+    out = {"cpu_moe": False, "n_cpu_moe": 0, "lazy": False}
+    for i, arg in enumerate(args):
+        flag, _, inline = arg.partition("=")
+        value = inline or (args[i + 1] if i + 1 < len(args) else "")
+        if flag in ("-cmoe", "--cpu-moe"):
+            out["cpu_moe"] = True
+        elif flag in ("-ncmoe", "--n-cpu-moe") and value.isdigit():
+            out["n_cpu_moe"] = int(value)
+        elif flag in ("-lzm", "--lazy-mode"):
+            out["lazy"] = value.lower() in ("on", "1", "true", "enabled")
+    return out
+
+
+def estimate(model: ModelInfo | None, ctx_per_slot: int, slots: int, kv_type: str,
+             extra_args: str = "", gpu_layers: str = "all") -> dict:
+    """Rough memory estimate for a preset, in bytes: GPU (weights + KV + recurrent state),
+    system RAM (CPU-offloaded experts, input embeddings) and SSD (lazily read embeddings)."""
+    if model is None or not model.kv_bytes_per_token_f16:
+        return {}
+    flags = _flags(extra_args)
+    experts = model.expert_bytes_by_layer or {}
+    experts_ram = sum(b for layer, b in experts.items() if flags["cpu_moe"] or layer < flags["n_cpu_moe"])
+    lazy_ssd = model.lazy_bytes if flags["lazy"] else 0
+    ram = experts_ram + model.input_bytes + (model.lazy_bytes - lazy_ssd)
+    gpu_weights = model.size_bytes - ram - lazy_ssd
+    if str(gpu_layers).isdigit() and model.n_layers and int(gpu_layers) < model.n_layers:
+        moved = int(gpu_weights * (model.n_layers - int(gpu_layers)) / model.n_layers)
+        gpu_weights -= moved
+        ram += moved
+    per_token = model.kv_bytes_per_token_f16 / 2 * KV_TYPE_BYTES.get(kv_type, 2.0)
+    kv = per_token * ctx_per_slot * slots
+    recurrent = model.recurrent_bytes_per_slot * slots
+    return {
+        "weights": int(gpu_weights),
+        "kv_cache": int(kv),
+        "recurrent": int(recurrent),
+        "total": int(gpu_weights + kv + recurrent),  # GPU
+        "ram": int(ram),
+        "ssd": int(lazy_ssd),
+        "kv_bytes_per_token": int(per_token),
+        "slot_file_per_100k_tokens": int(per_token * 100_000 + model.recurrent_bytes_per_slot),
+    }
+
+
+def system_memory() -> int:
+    """Total RAM visible to this system (inside WSL: the WSL memory limit)."""
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return 0
+
+
+async def gpu_info() -> list[dict]:
+    """GPUs as reported by nvidia-smi (empty if unavailable)."""
+    exe = shutil.which("nvidia-smi")
+    if not exe:
+        return []
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            exe, "--query-gpu=name,memory.total,memory.used", "--format=csv,noheader,nounits",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+    except (OSError, TimeoutError):
+        return []
+    gpus = []
+    for line in out.decode().strip().splitlines():
+        try:
+            name, total, used = [x.strip() for x in line.split(",")]
+            gpus.append({"name": name, "memory_total": int(total) * 2**20, "memory_used": int(used) * 2**20})
+        except ValueError:
+            continue
+    return gpus

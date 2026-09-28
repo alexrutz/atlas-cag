@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Atlas</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232f5bea'/%3E%3Cpath d='M9 23 16 8l7 15M11.5 18h9' stroke='white' stroke-width='2.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <button class="icon-btn only-narrow" id="toggle-library" aria-label="Toggle library">
+      <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+    </button>
+    <div class="brand">
+      <span class="logo" aria-hidden="true">
+        <svg viewBox="0 0 32 32"><path d="M9 23 16 8l7 15M11.5 18h9"/></svg>
+      </span>
+      <span class="brand-name">Atlas</span>
+      <span class="brand-sub">Cache-augmented generation</span>
+    </div>
+    <div class="engine" id="engine">
+      <span class="dot" id="engine-dot"></span>
+      <span id="engine-text">Connecting…</span>
+      <span class="slots" id="slots" aria-label="Slot usage"></span>
+    </div>
+    <button class="icon-btn settings-toggle" id="open-settings" title="Settings" aria-label="Settings" aria-pressed="false">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3h0a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5h0a1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8v0a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></svg>
+    </button>
+  </header>
+
+  <div class="layout">
+    <aside class="library" id="library">
+      <div class="library-head">
+        <h2>Library</h2>
+        <div class="library-actions">
+          <button class="btn subtle" id="new-collection" title="Create a collection">New collection</button>
+          <button class="btn primary" id="upload-btn" title="Upload documents">Upload</button>
+          <input type="file" id="file-input" multiple hidden>
+        </div>
+      </div>
+      <div class="dropzone" id="dropzone">
+        <div>Drop files here to ingest into
+          <select id="upload-target" aria-label="Upload into collection"></select></div>
+        <span class="muted">PDF, DOCX, HTML, Markdown, text, code · <button class="link-btn" id="paste-btn" type="button">paste text</button></span>
+      </div>
+      <div class="library-tools">
+        <input type="search" id="search" placeholder="Filter documents" autocomplete="off">
+        <button class="link-btn" id="select-all">All</button>
+        <button class="link-btn" id="select-none">None</button>
+      </div>
+      <ul class="doc-list" id="doc-list"></ul>
+      <div class="library-foot" id="library-foot"></div>
+    </aside>
+
+    <main class="main">
+      <section class="thread" id="thread">
+        <div class="empty" id="empty">
+          <h1>Ask your documents</h1>
+          <p class="muted">Each document is prefilled into llama.cpp once and its KV cache is persisted to disk.
+            A query restores that cache into a slot and only evaluates your question.</p>
+          <ol class="steps">
+            <li><strong>Choose a model</strong><span>Open Settings to create a llama-server preset or download a model.</span></li>
+            <li><strong>Ingest</strong><span>Upload files into collections. Atlas prefills each one with zero output tokens and saves the slot.</span></li>
+            <li><strong>Ask</strong><span>Tick documents or whole collections. One document answers directly; several are answered one by one and then combined.</span></li>
+          </ol>
+        </div>
+      </section>
+
+      <form class="composer" id="composer">
+        <div class="chips" id="chips"></div>
+        <div class="composer-row">
+          <textarea id="question" rows="1" placeholder="Select documents, then ask a question…" maxlength="20000"></textarea>
+          <div class="composer-side">
+            <label class="toggle" id="thinking-wrap" hidden title="Let the model reason before answering">
+              <input type="checkbox" id="thinking"> Thinking
+            </label>
+            <button type="submit" class="btn primary" id="ask">Ask</button>
+            <button type="button" class="btn danger" id="stop" hidden>Stop</button>
+          </div>
+        </div>
+      </form>
+
+      <section class="settings" id="settings" hidden>
+        <div class="settings-head">
+          <h1>Settings</h1>
+          <nav class="tabs" role="tablist">
+            <button role="tab" data-tab="model" aria-selected="true">Model</button>
+            <button role="tab" data-tab="models" aria-selected="false">Model files</button>
+            <button role="tab" data-tab="generation" aria-selected="false">Generation</button>
+            <button role="tab" data-tab="storage" aria-selected="false">Storage</button>
+          </nav>
+          <button class="btn subtle" id="close-settings">Back to chat</button>
+        </div>
+        <div class="settings-body" id="settings-body"></div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="text-dialog" class="dialog wide">
+    <form method="dialog" class="dialog-head">
+      <h3 id="text-title"></h3>
+      <button class="icon-btn" aria-label="Close"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+    </form>
+    <div class="dialog-meta" id="text-meta"></div>
+    <pre class="doc-text" id="text-body"></pre>
+  </dialog>
+
+  <dialog id="paste-dialog" class="dialog">
+    <form id="paste-form">
+      <div class="dialog-head">
+        <h3>Add text document</h3>
+        <button type="button" class="icon-btn" data-close aria-label="Close"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+      </div>
+      <div class="field-row">
+        <label class="field">Name<input id="paste-name" required maxlength="200" placeholder="meeting-notes.md"></label>
+        <label class="field">Collection<select id="paste-collection"></select></label>
+      </div>
+      <label class="field">Text<textarea id="paste-text" required rows="12"></textarea></label>
+      <div class="dialog-actions">
+        <button type="button" class="btn subtle" data-close>Cancel</button>
+        <button class="btn primary">Ingest</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="preset-dialog" class="dialog wide">
+    <form id="preset-form" novalidate></form>
+  </dialog>
+
+  <dialog id="modal" class="dialog"></dialog>
+
+  <dialog id="key-dialog" class="dialog">
+    <form id="key-form">
+      <div class="dialog-head"><h3>API key required</h3></div>
+      <p class="muted">This Atlas instance requires an API key.</p>
+      <label class="field">API key<input id="key-input" type="password" required autocomplete="current-password"></label>
+      <div class="dialog-actions"><button class="btn primary">Continue</button></div>
+    </form>
+  </dialog>
+
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+  <script src="/static/app.js"></script>
+  <script src="/static/settings.js"></script>
+</body>
+</html>

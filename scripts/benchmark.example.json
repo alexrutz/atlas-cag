@@ -1,0 +1,12 @@
+[
+  {
+    "question": "What is the remote-work stipend and what was Q3 revenue?",
+    "documents": ["hr_policy.md", "q3_report.txt", "it_security.txt"],
+    "expect": ["450", "48[.,]2"]
+  },
+  {
+    "question": "What is the capex budget for the Rotterdam site?",
+    "documents": ["q3_report.txt", "fleet_log.txt", "contract.pdf"],
+    "expect": ["\\b17\\b"]
+  }
+]
