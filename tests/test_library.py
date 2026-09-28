@@ -121,14 +121,16 @@ def test_discovery_and_estimates(tmp_path, monkeypatch):
     assert m.recurrent_bytes_per_slot == 24 * 4096 * 128 * 4
     est = models.estimate(m, 262144, 1, "q8_0")
     assert est["kv_cache"] == int(32768 / 2 * 34 / 32 * 262144)  # ~4.25 GiB
-    assert est["total"] == m.size_bytes + est["kv_cache"] + est["recurrent"]
+    assert est["total"] == m.size_bytes + est["kv_cache"] + est["recurrent"] + est["compute"]
+    assert est["compute"] == 262144 * 512 * 2 + 64 * 2**20 + 4 * 512 * 2 * 262144  # mask + one layer as f16
 
 
 def test_tensor_classes_and_offload_flags(tmp_path):
     """qwen4exp-like: routed experts, n-gram embeddings (lazy), indexer keys, conv state."""
     layers = 4
     tensors = {f"blk.{i}.ffn_{k}_exps.weight": 1024 for i in range(layers) for k in ("gate", "up", "down")}
-    tensors.update({"per_layer_token_embd.weight": 5120, "token_embd.weight": 320, "blk.3.attn_q.weight": 224})
+    tensors.update({"per_layer_token_embd.weight": 5120, "token_embd.weight": 320, "blk.3.attn_q.weight": 224,
+                    "output.weight": 256})
     path = write_gguf(tmp_path / "exp.gguf", {
         "general.architecture": "qwen4exp", "qwen4exp.block_count": layers, "qwen4exp.context_length": 262144,
         "qwen4exp.embedding_length": 256, "qwen4exp.attention.head_count": 4, "qwen4exp.attention.head_count_kv": 2,
@@ -146,7 +148,7 @@ def test_tensor_classes_and_offload_flags(tmp_path):
     all_cpu = models.estimate(m, 1000, 1, "f16", "-cmoe -lm mmap --lazy-mode on")
     assert all_cpu["ram"] == 4 * 3072 + 320 and all_cpu["ssd"] == 5120
     assert all_cpu["weights"] == m.size_bytes - all_cpu["ram"] - 5120
-    assert all_cpu["total"] == all_cpu["weights"] + all_cpu["kv_cache"] + all_cpu["recurrent"]
+    assert all_cpu["total"] == all_cpu["weights"] + all_cpu["kv_cache"] + all_cpu["recurrent"] + all_cpu["compute"]
     partial = models.estimate(m, 1000, 1, "f16", "--n-cpu-moe=2 -lzm off")
     assert partial["ram"] == 2 * 3072 + 320 + 5120 and partial["ssd"] == 0
     assert models.estimate(m, 1000, 1, "f16")["ram"] == 320 + 5120  # defaults: embeddings in RAM
@@ -241,3 +243,7 @@ def test_sliding_window_layers_only_cache_their_window(tmp_path):
     per_token = 9 * 4 * 512 * 34 / 32
     assert windowed["kv_cache"] == int(per_token * 524288 + 27 * 4 * 512 * 34 / 32 * 1024)  # ~9.6 GiB + window
     assert windowed["kv_bytes_per_token"] == int(per_token)
+    # compute buffer: f16 mask (context x 512) + one full layer's K and V dequantized to f16
+    assert windowed["compute"] == 524288 * 512 * 2 + 64 * 2**20 + 4 * 512 * 2 * 524288
+    assert models.estimate(m, 524288, 1, "q8_0", extra_args="-ub 256")["compute"] < windowed["compute"]
+    assert models.estimate(m, 524288, 1, "f16")["compute"] == 524288 * 512 * 2 + 64 * 2**20, "f16 needs no conversion"

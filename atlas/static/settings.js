@@ -107,12 +107,12 @@
     if (!est || !est.total) return '<div class="muted small">No memory estimate (model metadata unavailable).</div>';
     const ram = view.ramTotal || 0;
     // compare against what is free for llama-server: total minus the desktop / other programs
-    // (measured before llama-server starts), keeping ~1 GB for compute buffers
+    // (measured before llama-server starts), keeping 1 GiB free like llama.cpp's own fit check
     const gpu = gpuTotal() ? gpuTotal() - (view.gpuBaseline || 0) : 0;
-    const COMPUTE = GiB;
+    const MARGIN = GiB;
     const cap = Math.max(gpu, est.total);
     const pct = (b, c) => `${Math.max(0.5, (100 * b) / c)}%`;
-    const gpuOver = gpu && est.total + COMPUTE > gpu;
+    const gpuOver = gpu && est.total + MARGIN > gpu;
     const ramOver = ram && est.ram > ram * 0.9;
     return `<div class="estimate${gpuOver || ramOver ? " over" : ""}">
       <div class="est-row"><span class="est-label">GPU</span>
@@ -121,6 +121,7 @@
           <span class="seg kv" style="width:${pct(est.kv_cache, cap)}" title="KV cache ${fmtGB(est.kv_cache)}"></span>
           ${est.recurrent ? `<span class="seg recurrent" style="width:${pct(est.recurrent, cap)}" title="Recurrent state ${fmtBytes(est.recurrent)}"></span>` : ""}
           ${est.projector ? `<span class="seg projector" style="width:${pct(est.projector, cap)}" title="Vision projector ${fmtGB(est.projector)}"></span>` : ""}
+          ${est.compute ? `<span class="seg compute" style="width:${pct(est.compute, cap)}" title="Compute buffers ${fmtGB(est.compute)}"></span>` : ""}
         </div>
         <strong title="${view.gpuBaseline ? `${fmtGB(view.gpuBaseline)} of the GPU is used by other programs` : ""}">≈ ${fmtGB(est.total)}${gpu ? ` of ${fmtGB(gpu)} free` : ""}</strong></div>
       <div class="legend">
@@ -128,12 +129,13 @@
         <span><i class="kv"></i>KV cache ${fmtGB(est.kv_cache)}</span>
         ${est.recurrent ? `<span><i class="recurrent"></i>recurrent ${fmtBytes(est.recurrent)}</span>` : ""}
         ${est.projector ? `<span><i class="projector"></i>vision projector ${fmtGB(est.projector)}</span>` : ""}
+        ${est.compute ? `<span title="Attention mask and, for a quantized KV cache, one layer converted to f16; reserved for a full slot"><i class="compute"></i>compute ${fmtGB(est.compute)}</span>` : ""}
       </div>
       ${est.ram ? `<div class="est-row"><span class="est-label">RAM</span>
         <div class="bar"><span class="seg ram" style="width:${pct(est.ram, Math.max(ram, est.ram))}" title="Offloaded weights ${fmtGB(est.ram)}"></span></div>
         <strong>≈ ${fmtGB(est.ram)}${ram ? ` of ${fmtGB(ram)}` : ""}</strong></div>` : ""}
       ${est.ssd ? `<div class="muted small">${fmtGB(est.ssd)} of embeddings stay on disk and are read on demand (--lazy-mode).</div>` : ""}
-      ${gpuOver ? `<div class="warn-text">Probably does not fit: about ${fmtGB(est.total + COMPUTE)} needed including compute buffers, ${fmtGB(gpu)} free. Reduce context per slot or slots, use a smaller KV type, or offload experts (-cmoe / --n-cpu-moe N).</div>` : ""}
+      ${gpuOver ? `<div class="warn-text">Does not fit: about ${fmtGB(est.total)} needed plus 1 GB kept free for the desktop, ${fmtGB(gpu)} free. Windows would move the rest into shared system memory: slow, and the desktop can stutter or freeze. Reduce context per slot or slots, use a smaller KV type, or offload experts (-cmoe / --n-cpu-moe N).</div>` : ""}
       ${ramOver ? '<div class="warn-text">The weights kept in system RAM exceed most of the memory available to this system.</div>' : ""}
     </div>`;
   }
@@ -161,6 +163,7 @@
         <dt>Binary</dt><dd><code>${esc(tildify(sup.build || server.llama_server_bin))}</code> → <code>${esc(server.llama_url)}</code></dd>
       </dl>
       ${sup.error ? `<div class="response-error">${esc(sup.error)}</div>` : ""}
+      ${sup.fit_warning && sup.state === "running" ? `<div class="response-error">${esc(sup.fit_warning)}</div>` : ""}
       <details class="log" ${sup.state === "failed" || sup.state === "starting" ? "open" : ""}>
         <summary>Server log</summary><pre id="server-log"></pre>
       </details>
@@ -651,7 +654,7 @@
           <h4>Estimated memory</h4>${estimateBar(est)}
           <div class="muted small">Largest document per part ≈ ${fmtInt(Math.max(0, ctx - reserve))} tokens
             (larger documents are split and answered part by part)${est?.slot_file_per_100k_tokens ? ` · slot files ≈ ${fmtBytes(est.slot_file_per_100k_tokens)} per 100k document tokens` : ""}.
-            GPU figures exclude compute buffers (~0.5–1.5 GB).</div>`;
+            GPU figures include compute buffers.</div>`;
       }, 200);
     };
     presetForm.onchange = (e) => {

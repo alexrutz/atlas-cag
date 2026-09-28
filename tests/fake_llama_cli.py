@@ -50,6 +50,7 @@ def main() -> None:
     ap.add_argument("--fake-fail-start", action="store_true")
     ap.add_argument("--fake-minimal-help", action="store_true")
     ap.add_argument("--mmproj")
+    ap.add_argument("--fake-overcommit", action="store_true")
     ap.add_argument("--model", required=True)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, required=True)
@@ -60,6 +61,10 @@ def main() -> None:
     args, _unknown = ap.parse_known_args()
 
     print(f"load_model: loading model '{args.model}'", flush=True)
+    if args.fake_overcommit:  # what llama.cpp prints when a preset needs more VRAM than is free
+        print("common_params_fit_impl: projected to use 14931 MiB of device memory vs. 15266 MiB of free device memory")
+        print("common_params_fit_impl: cannot meet free memory target of 1024 MiB, need to reduce device memory by 689 MiB",
+              flush=True)
     if args.fake_fail_start:
         print("ggml_cuda_init: failed to initialize CUDA: unknown error", flush=True)
         sys.exit(1)

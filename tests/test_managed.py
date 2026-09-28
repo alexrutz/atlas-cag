@@ -199,3 +199,16 @@ async def test_builds_api_and_preset_build_validation(managed, tmp_path):
     est = (await managed.post("/api/presets/estimate", json={**preset("X", managed.models[0]),
                                                              "extra_args": "--lazy-mode on"})).json()
     assert est["warnings"] == ["Not supported by b4242: --lazy-mode"]
+
+
+async def test_llama_cpp_fit_failure_is_reported(managed):
+    """llama.cpp's startup check says the preset exceeds free VRAM: Windows would spill it to shared memory."""
+    p = (await managed.post("/api/presets", json=preset("big", managed.models[0], extra_args="--fake-overcommit"))).json()
+    status = await activate(managed, p["id"])
+    assert status["ready"]
+    await asyncio.sleep(0.3)
+    server = (await managed.get("/api/server")).json()["supervisor"]
+    assert "689 MiB more GPU memory" in server["fit_warning"] and "shared system memory" in server["fit_warning"]
+    q = (await managed.post("/api/presets", json=preset("small", managed.models[0]))).json()
+    await activate(managed, q["id"])
+    assert (await managed.get("/api/server")).json()["supervisor"]["fit_warning"] is None

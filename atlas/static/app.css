@@ -677,6 +677,7 @@ dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; ma
 
 /* visual prefill */
 .seg.projector, .legend i.projector { background: #a855f7; }
+.seg.compute, .legend i.compute { background: #94a3b8; }
 .pill.visual { background: #f3e8ff; color: #7e22ce; }
 .pill.needs_vision { background: var(--warn-soft); color: var(--warn); }
 @media (prefers-color-scheme: dark) { .pill.visual { background: #2e1a47; color: #d8b4fe; } }

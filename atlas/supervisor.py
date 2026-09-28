@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import re
 from logging.handlers import RotatingFileHandler
 import shlex
 import shutil
@@ -37,6 +38,7 @@ RESERVED_FLAGS = {
 # llama-server options that change how images become tokens (part of visual cache variants)
 IMAGE_FLAGS = {"--image-min-tokens", "--image-max-tokens"}
 CRASH_WINDOW_S = 300
+_FIT_SHORT = re.compile(r"need to reduce device memory by (\d+) MiB")
 MAX_CRASH_RESTARTS = 3
 
 
@@ -200,6 +202,8 @@ class Supervisor:
         self._pid_file = settings.data_dir / "llama-server.pid"
         self.gpu_baseline: int | None = None  # GPU memory used by other programs, measured before starting
         self.running_command: str | None = None  # llama-server build of the running process
+        # llama.cpp's own check at startup: the preset needs more GPU memory than is free
+        self.fit_warning: str | None = None
         # set by the build updater: called after a successful start, and after a failed one (True = retry)
         self.on_started: Callable[[dict, str], None] | None = None
         self.on_start_failed: Callable[[dict, str, str], Awaitable[bool]] | None = None
@@ -242,6 +246,7 @@ class Supervisor:
             "started_at": self.started_at,
             "gpu_baseline": self.gpu_baseline,
             "build": self.running_command,
+            "fit_warning": self.fit_warning,
             "command": shlex.join(build_command(self.binary_for(self.preset), self.preset, self.port,
                                                 self.settings.kv_dir)) if self.preset else None,
             "log": list(self.log)[-200:],
@@ -360,6 +365,7 @@ class Supervisor:
         lib_dir = str(Path(exe).resolve().parent)
         env["LD_LIBRARY_PATH"] = lib_dir + (":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
         self.log.append(f"$ {shlex.join(cmd)}")
+        self.fit_warning = None
         self._llama_log.info("=== starting preset %r: %s", self.preset.get("name"), shlex.join(cmd))
         self.state = "starting"
         self.error = None
@@ -396,6 +402,14 @@ class Supervisor:
             if line:
                 self.log.append(line)
                 self._llama_log.info(line)
+                if m := _FIT_SHORT.search(line):
+                    self.fit_warning = (
+                        f"llama-server needs {m.group(1)} MiB more GPU memory than is free (keeping 1 GiB for the "
+                        "desktop): Windows moves the rest into shared system memory, which makes llama-server slow "
+                        "and can make the whole desktop stutter or freeze. Lower the context per slot, the slots "
+                        "or the KV cache type.")
+                    log.warning("preset %r does not fit into free GPU memory (short by %s MiB)",
+                                (self.preset or {}).get("name"), m.group(1))
 
     async def _watch(self, proc: asyncio.subprocess.Process) -> None:
         rc = await proc.wait()

@@ -118,6 +118,17 @@ With Q4_K_M weights (5.3 GiB) plus compute buffers on a 16 GB card, **1 × 262k 
 **3 × 131k at q8_0** or **2 × 262k at q4_0** fit. The preset editor shows this estimate live
 against your GPU memory.
 
+Compute buffers grow with the context too: llama.cpp reserves, for a full slot, the attention mask
+(context × micro-batch, f16) and, with a quantized KV cache, one layer's K and V converted to f16
+for the flash-attention kernels. At 512k tokens that is 2.6 GB for Spark-X2.5-4B, which is why
+1M tokens cannot fit 16 GB at any cache type. The estimate includes them (checked against
+llama.cpp's own projection: 14,953 vs 14,931 MiB) and keeps 1 GiB free like llama.cpp does.
+
+When a preset does not fit, llama.cpp reports it at startup ("need to reduce device memory by …
+MiB") and Atlas shows it on the server card. On Windows (WSL) such a preset still starts: the
+driver moves the excess into shared system memory, which makes llama-server slow and can make
+the whole desktop stutter or freeze. Treat the warning as a real problem.
+
 The estimate reads the GGUF's tensor table and follows the preset's offload flags. Routed experts
 go to system RAM with `-cmoe` (all layers) or `--n-cpu-moe N` (the first N layers). Per-layer and
 n-gram embeddings stay on disk with `--lazy-mode on`. Token embeddings always sit in RAM. For
@@ -215,7 +226,26 @@ Presets (and `scripts/run-llama-server.sh`) always set:
 | `--no-kv-unified` | a unified KV buffer lets the server purge idle slots, including one Atlas has just restored. |
 | `--cache-ram 0` | disables the RAM prompt cache, which swaps slot contents behind Atlas's back. |
 | `--flash-attn on` | required for a quantized V cache; also faster prefill. |
-| `--swa-full` *(sliding-window models)* | Gemma 2/3, gpt-oss and similar keep only the last window of the cache unless this is set, and cannot extend a restored prefix. The preset editor turns it on when the model has a sliding window. |
+| `--swa-full` *(sliding-window models)* | see below: needed with standard llama-server builds, not with builds that have the SWA restore fix. |
+
+### Sliding-window models
+
+Gemma 2/3, gpt-oss and Spark-X2.5 use a sliding window in most layers (Spark: 27 of 36 layers see
+the last 512 tokens, 9 see everything). Without `--swa-full` those layers cache only the window, so
+the KV cache grows with the context only in the full-attention layers: Spark needs 9.6 GiB for
+512k tokens at q8_0 instead of 38 GiB.
+
+Standard llama-server builds cannot use such a cache after a slot restore. The slot file keeps
+exactly the window the next token needs, but the server's reuse check demands two positions more
+and prefills the whole document again on every question (log: "forcing full prompt re-processing
+due to lack of cache data"). With these builds, keep **Full SWA cache** on. A one-line fix of that
+check (`pos_min_thold` in `tools/server/server-context.cpp`, patch in
+`~/llama.cpp-v0.5.0-atlas/atlas-swa-restore.patch` on the development machine) makes restored
+caches reusable; verified with Spark-X2.5-4B: 3,707 restored tokens reused, 22 evaluated, output
+identical to a fresh run. Build it like any custom build and select it in the preset.
+
+Atlas checks this whenever such a preset starts without `--swa-full`: it saves, restores and
+extends a window-sized prompt, and warns on the preset if the build prefills it again.
 
 Atlas must be the only client of its llama-server: in managed mode it listens on `127.0.0.1` only.
 
@@ -455,7 +485,7 @@ or `error`, with per-call stats), `target_delta`, `synthesis`, `delta` (channel 
 ## Development
 
 ```bash
-uv run pytest    # 92 tests, no GPU needed: a fake llama-server (tests/fake_llama.py) and its
+uv run pytest    # 95 tests, no GPU needed: a fake llama-server (tests/fake_llama.py) and its
                  # command-line wrapper let the supervisor spawn, switch and crash real processes
 uv run python scripts/benchmark.py cases.json --runs 3    # answer quality of a running instance
 ```

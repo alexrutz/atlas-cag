@@ -49,11 +49,13 @@ class ModelInfo:
     kv_bytes_per_token_f16: int | None = None  # all attention layers, K + V (+ indexer keys), f16
     # part of the above in sliding-window layers: without --swa-full they only cache the window
     kv_swa_bytes_per_token_f16: int = 0
+    kv_layer_max_f16: int = 0  # largest full-attention layer, K + V per token at f16 (compute buffer)
     recurrent_bytes_per_slot: int = 0
     # weight bytes by where llama.cpp can place them (see estimate())
     expert_bytes_by_layer: dict[int, int] | None = None
     lazy_bytes: int = 0  # per-layer / n-gram embeddings: can stay on disk with --lazy-mode on
     input_bytes: int = 0  # token embeddings: always kept in system RAM by llama.cpp
+    tied_embeddings: bool = False  # no output.weight: the embeddings double as output layer, copied to the GPU
     sampling: dict | None = None  # recommended sampling from general.sampling.* (see sampling.py)
     error: str | None = None
 
@@ -121,6 +123,7 @@ def _describe(info: ModelInfo) -> None:
     layer_bytes = [(h * (k_len + v_len) + indexer) * 2 for h in per_layer]
     info.kv_bytes_per_token_f16 = int(sum(layer_bytes)) or None
     info.kv_swa_bytes_per_token_f16 = int(sum(b for b, s in zip(layer_bytes, swa) if s))
+    info.kv_layer_max_f16 = int(max((b for b, s in zip(layer_bytes, swa) if not s), default=0))
     info.hybrid = info.n_attn_layers < n_layers
     inner, state = a("ssm.inner_size"), a("ssm.state_size")
     if inner and state:  # recurrent + convolution state of linear-attention / SSM layers, kept in f32
@@ -158,9 +161,11 @@ _LAZY = re.compile(r"per_layer_token_embd|^ple_|\.ple_embd")
 def _classify(info: ModelInfo, files: list[Path]) -> None:
     """Split weights into routed experts (per layer), lazily loadable embeddings and input embeddings."""
     experts: dict[int, int] = {}
+    names: set[str] = set()
     try:
         for f in files:
             for name, size in read_tensor_sizes(f).items():
+                names.add(name)
                 if m := _EXPERTS.match(name):
                     experts[int(m.group(1))] = experts.get(int(m.group(1)), 0) + size
                 elif _LAZY.search(name):
@@ -170,6 +175,7 @@ def _classify(info: ModelInfo, files: list[Path]) -> None:
     except (OSError, GGUFError, struct.error):
         return
     info.expert_bytes_by_layer = experts or None
+    info.tied_embeddings = bool(info.input_bytes) and "output.weight" not in names
 
 
 def _candidates(root: Path, projectors: bool = False) -> list[Path]:
@@ -250,7 +256,7 @@ def _flags(extra_args: str) -> dict:
         args = shlex.split(extra_args or "")
     except ValueError:
         args = []
-    out = {"cpu_moe": False, "n_cpu_moe": 0, "lazy": False}
+    out = {"cpu_moe": False, "n_cpu_moe": 0, "lazy": False, "ubatch": 512}
     for i, arg in enumerate(args):
         flag, _, inline = arg.partition("=")
         value = inline or (args[i + 1] if i + 1 < len(args) else "")
@@ -260,6 +266,8 @@ def _flags(extra_args: str) -> dict:
             out["n_cpu_moe"] = int(value)
         elif flag in ("-lzm", "--lazy-mode"):
             out["lazy"] = value.lower() in ("on", "1", "true", "enabled")
+        elif flag in ("-ub", "--ubatch-size") and value.isdigit():
+            out["ubatch"] = int(value)
     return out
 
 
@@ -282,7 +290,7 @@ def estimate(model: ModelInfo | None, ctx_per_slot: int, slots: int, kv_type: st
     experts_ram = sum(b for layer, b in experts.items() if flags["cpu_moe"] or layer < flags["n_cpu_moe"])
     lazy_ssd = model.lazy_bytes if flags["lazy"] else 0
     ram = experts_ram + model.input_bytes + (model.lazy_bytes - lazy_ssd)
-    gpu_weights = model.size_bytes - ram - lazy_ssd
+    gpu_weights = model.size_bytes - ram - lazy_ssd + (model.input_bytes if model.tied_embeddings else 0)
     if str(gpu_layers).isdigit() and model.n_layers and int(gpu_layers) < model.n_layers:
         moved = int(gpu_weights * (model.n_layers - int(gpu_layers)) / model.n_layers)
         gpu_weights -= moved
@@ -292,6 +300,12 @@ def estimate(model: ModelInfo | None, ctx_per_slot: int, slots: int, kv_type: st
     per_token = model.kv_bytes_per_token_f16 * scale - (0 if swa_full else swa_part)  # grows with the context
     swa_fixed = 0 if swa_full else swa_part * _swa_cells(model.sliding_window or 0, ctx_per_slot)
     kv = (per_token * ctx_per_slot + swa_fixed) * slots
+    # llama.cpp reserves the compute buffer for a full slot: the attention mask (context x
+    # micro-batch, f16) and, for a quantized cache, one layer's K and V converted to f16 for the
+    # flash-attention kernels. At 512k tokens this is gigabytes.
+    compute = ctx_per_slot * flags["ubatch"] * 2 + 64 * 2**20
+    if kv_type not in ("f16", "bf16"):
+        compute += model.kv_layer_max_f16 * ctx_per_slot
     recurrent = model.recurrent_bytes_per_slot * slots
     if mmproj_bytes and "--no-mmproj-offload" in shlex.split(extra_args or ""):
         ram += mmproj_bytes
@@ -301,7 +315,8 @@ def estimate(model: ModelInfo | None, ctx_per_slot: int, slots: int, kv_type: st
         "kv_cache": int(kv),
         "recurrent": int(recurrent),
         "projector": int(mmproj_bytes),
-        "total": int(gpu_weights + kv + recurrent + mmproj_bytes),  # GPU
+        "compute": int(compute),
+        "total": int(gpu_weights + kv + recurrent + mmproj_bytes + compute),  # GPU
         "ram": int(ram),
         "ssd": int(lazy_ssd),
         "kv_bytes_per_token": int(per_token),
