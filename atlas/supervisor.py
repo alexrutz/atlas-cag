@@ -38,6 +38,9 @@ RESERVED_FLAGS = {
 # llama-server options that change how images become tokens (part of visual cache variants)
 IMAGE_FLAGS = {"--image-min-tokens", "--image-max-tokens"}
 CRASH_WINDOW_S = 300
+# llama.cpp's startup check; the first line is printed at the default log level, the second (with
+# the amount) only at -lv 4
+_FIT_FAILED = re.compile(r"failed to fit params to free device memory")
 _FIT_SHORT = re.compile(r"need to reduce device memory by (\d+) MiB")
 MAX_CRASH_RESTARTS = 3
 
@@ -366,6 +369,7 @@ class Supervisor:
         env["LD_LIBRARY_PATH"] = lib_dir + (":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
         self.log.append(f"$ {shlex.join(cmd)}")
         self.fit_warning = None
+        self._fit_short: str | None = None
         self._llama_log.info("=== starting preset %r: %s", self.preset.get("name"), shlex.join(cmd))
         self.state = "starting"
         self.error = None
@@ -403,13 +407,16 @@ class Supervisor:
                 self.log.append(line)
                 self._llama_log.info(line)
                 if m := _FIT_SHORT.search(line):
+                    self._fit_short = m.group(1)
+                if _FIT_FAILED.search(line):
+                    amount = f"{self._fit_short} MiB more" if self._fit_short else "more"
                     self.fit_warning = (
-                        f"llama-server needs {m.group(1)} MiB more GPU memory than is free (keeping 1 GiB for the "
-                        "desktop): Windows moves the rest into shared system memory, which makes llama-server slow "
-                        "and can make the whole desktop stutter or freeze. Lower the context per slot, the slots "
-                        "or the KV cache type.")
-                    log.warning("preset %r does not fit into free GPU memory (short by %s MiB)",
-                                (self.preset or {}).get("name"), m.group(1))
+                        f"llama-server needs {amount} GPU memory than is free (keeping 1 GiB for the desktop): "
+                        "Windows moves the rest into shared system memory, which makes llama-server slow and can "
+                        "make the whole desktop stutter or freeze. Lower the context per slot, the slots or the KV "
+                        "cache type.")
+                    log.warning("preset %r does not fit into free GPU memory (%s)", (self.preset or {}).get("name"),
+                                line.strip()[-120:])
 
     async def _watch(self, proc: asyncio.subprocess.Process) -> None:
         rc = await proc.wait()
