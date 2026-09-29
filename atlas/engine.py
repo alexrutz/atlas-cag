@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -82,6 +83,12 @@ class GenResult:
     gen_ms: float
     stop_type: str
     truncated: bool
+    ttft_ms: float | None = None  # request sent -> first generated token (includes evaluating the prompt)
+    first_answer_ms: float | None = None  # request sent -> first token of the answer (after any thinking)
+    wall_ms: float = 0.0
+    n_reasoning: int = 0  # generated tokens inside the thinking block (streamed chunks, ≈ tokens)
+    draft_n: int = 0  # speculative decoding: tokens the draft proposed / the model accepted
+    draft_accepted: int = 0
 
     def stats(self) -> dict:
         return {
@@ -89,9 +96,16 @@ class GenResult:
             "n_cached": self.n_cached,
             "n_processed": self.n_processed,
             "prompt_ms": round(self.prompt_ms, 1),
+            "prompt_tps": round(self.n_processed / (self.prompt_ms / 1000), 1) if self.prompt_ms > 0 else None,
             "n_gen": self.n_gen,
+            "n_reasoning": min(self.n_reasoning, self.n_gen),
             "gen_ms": round(self.gen_ms, 1),
             "gen_tps": round(self.n_gen / (self.gen_ms / 1000), 1) if self.gen_ms > 0 else None,
+            "ttft_ms": round(self.ttft_ms, 1) if self.ttft_ms is not None else None,
+            "first_answer_ms": round(self.first_answer_ms, 1) if self.first_answer_ms is not None else None,
+            "wall_ms": round(self.wall_ms, 1),
+            "draft_n": self.draft_n,
+            "draft_accepted": self.draft_accepted,
             "stop_type": self.stop_type,
             "truncated": self.truncated,
         }
@@ -691,15 +705,25 @@ class Engine:
         splitter = prompts.ThinkSplitter(thinking_open)
         parts: dict[str, list[str]] = {"answer": [], "reasoning": []}
         final: dict = {}
+        t0 = time.perf_counter()
+        ttft = first_answer = None
+        n_reasoning = 0
 
         async def emit(pieces: list[tuple[str, str]]) -> None:
+            nonlocal first_answer
             for kind, piece in pieces:
                 parts[kind].append(piece)
+                if kind == "answer" and first_answer is None and piece.strip():
+                    first_answer = (time.perf_counter() - t0) * 1000
                 if on_piece:
                     await on_piece(kind, piece)
 
         async for chunk in self.llama.completion_stream(payload):
             if chunk.get("content"):
+                if ttft is None:
+                    ttft = (time.perf_counter() - t0) * 1000
+                if splitter.in_reasoning:  # llama-server streams one chunk per token
+                    n_reasoning += 1
                 await emit(splitter.feed(chunk["content"]))
             if chunk.get("stop"):
                 final = chunk
@@ -717,4 +741,10 @@ class Engine:
             gen_ms=float(t.get("predicted_ms") or 0.0),
             stop_type=str(final.get("stop_type") or ""),
             truncated=bool(final.get("truncated")),
+            ttft_ms=ttft,
+            first_answer_ms=first_answer,
+            wall_ms=(time.perf_counter() - t0) * 1000,
+            n_reasoning=n_reasoning,
+            draft_n=int(t.get("draft_n") or 0),
+            draft_accepted=int(t.get("draft_n_accepted") or 0),
         )

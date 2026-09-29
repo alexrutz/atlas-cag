@@ -176,6 +176,8 @@ def test_tensor_classes_and_offload_flags(tmp_path):
     big = models.estimate(m, 1000, 1, "f16", "-cmoe -ub 4096 -b 4096")
     assert big["ubatch"] == 4096 and big["compute"] - all_cpu["compute"] == 1000 * (4096 - 512) * 2
     assert models.estimate(m, 1000, 1, "f16")["streamed_experts"] == 0
+    # the preset's -cmoe switch counts like the flag in the extra arguments
+    assert models.estimate(m, 1000, 1, "f16", "-lm mmap --lazy-mode on", cpu_moe=True)["ram"] == all_cpu["ram"]
 
 
 # --- downloads --------------------------------------------------------------------------

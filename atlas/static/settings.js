@@ -369,12 +369,16 @@
     if (!u) return "";
     const job = u.job || {};
     const std = u.installed.find((i) => i.tag === u.standard_tag);
-    const working = ["checking", "downloading", "installing"].includes(job.state);
+    const working = ["checking", "downloading", "installing", "building"].includes(job.state);
     let progress = "";
     if (job.state === "downloading") {
       const pct = job.total ? Math.round((100 * job.done) / job.total) : 0;
       progress = `<div class="muted small">Downloading ${esc(job.tag)} · ${fmtBytes(job.done)} of ${fmtBytes(job.total)}</div>
         <div class="progress wide"><span style="width:${pct}%"></span></div>`;
+    } else if (job.state === "building") {
+      const pct = job.step === "compiling" ? job.percent || 0 : null;
+      progress = `<div class="muted small"><span class="spinner"></span> Building ${esc(job.tag)} from source · ${esc(job.step || "")}${pct !== null ? ` ${pct}%` : ""}…
+        <span class="muted">(runs at low priority; a few minutes)</span></div>${pct !== null ? `<div class="progress wide"><span style="width:${pct}%"></span></div>` : ""}`;
     } else if (working) {
       progress = `<div class="muted small"><span class="spinner"></span> ${job.state === "checking" ? "Checking for a new release"
         : `Installing ${esc(job.tag || "")}${job.detail ? ` · ${esc(job.detail)}` : ""}`}…</div>`;
@@ -385,11 +389,23 @@
         <label class="field">Automatic updates
           <select data-setting="build_updates">${UPDATE_MODES.map(([v, l]) => `<option value="${v}" ${u.mode === v ? "selected" : ""}>${esc(l)}</option>`).join("")}</select>
         </label>
-        <button class="btn subtle" data-act="check-updates" ${working ? "disabled" : ""}>Check now</button>
+        <label class="field">Build from
+          <select data-setting="build_update_source">
+            <option value="release" ${u.source === "release" ? "selected" : ""}>Prebuilt releases (${esc(u.repo)})</option>
+            <option value="patched" ${u.source === "patched" ? "selected" : ""}>Source, with Atlas's fixes (SWA restore, slot count)</option>
+          </select>
+        </label>
+        <button class="btn subtle" data-act="check-updates" ${working ? "disabled" : ""}>${u.source === "patched" && !(u.standard_tag || "").endsWith("+atlas") ? "Build now" : "Check now"}</button>
       </div>
+      ${u.source === "patched" ? `<div class="muted small">Each release is built here from <code>${esc(u.source_repo)}</code> with Atlas's patches
+        (${u.patches.map(esc).join(", ")}) and installed as <code>&lt;tag&gt;+atlas</code>: restored documents of sliding-window models
+        (Gemma, gpt-oss, Spark) are reused without <code>--swa-full</code>, and slot files load after changing the number of slots.
+        If a patch no longer applies to a new release, the current build stays.</div>
+        ${u.toolchain.length ? `<div class="warn-text">Building needs ${u.toolchain.map(esc).join(", ")}${u.toolchain.includes("nvcc") ? " (the CUDA toolkit)" : ""}, which ${u.toolchain.length === 1 ? "is" : "are"} not installed.</div>` : ""}` : ""}
       <dl class="kv">
         <dt>Standard build</dt><dd>${std
-          ? `<strong>${esc(u.standard_tag)}</strong> <span class="muted small">released ${esc((std.published_at || "").slice(0, 10))} · installed ${fmtAgo(std.installed_at)}</span>`
+          ? `<strong>${esc(u.standard_tag)}</strong> <span class="muted small">released ${esc((std.published_at || "").slice(0, 10))} · installed ${fmtAgo(std.installed_at)}${
+            std.patched ? ` · built from source with ${Object.entries(std.patched).map(([n, st]) => `${esc(n.replace(/^\d+-/, ""))} (${esc(st)})`).join(", ")}` : ""}</span>`
           : `<code>${esc(tildify(u.standard) || "none")}</code> <span class="muted small">ATLAS_LLAMA_SERVER_BIN</span>`}</dd>
         <dt>Source</dt><dd><a href="https://github.com/${esc(u.repo)}/releases" target="_blank" rel="noopener">${esc(u.repo)}</a>
           <span class="muted small">${esc(u.asset)}</span></dd>
@@ -609,8 +625,10 @@
       kv_type: base.kv_type ?? "q8_0",
       flash_attn: base.flash_attn ?? "on",
       gpu_layers: base.gpu_layers ?? "all",
+      // older presets carry -cmoe in their extra arguments: shown as the switch from now on
+      cpu_moe: !!base.cpu_moe || /(^|\s)(-cmoe|--cpu-moe)(?=\s|$)/.test(base.extra_args || ""),
       swa_full: base.swa_full ?? !!model?.sliding_window,
-      extra_args: base.extra_args ?? "",
+      extra_args: (base.extra_args ?? "").replace(/(^|\s)(-cmoe|--cpu-moe)(?=\s|$)/g, " ").replace(/\s+/g, " ").trim(),
       binary: base.binary ?? "",
       mmproj: base.mmproj ?? "",
       draft_model: base.draft_model ?? "",
@@ -646,8 +664,12 @@
           <select name="flash_attn">${["on", "auto", "off"].map((v) => `<option ${v === p.flash_attn ? "selected" : ""}>${v}</option>`).join("")}</select>
         </label>
         <label class="field">GPU layers
-          <input name="gpu_layers" value="${esc(p.gpu_layers)}" placeholder="all">
-          <span class="muted small">“all”, “auto” or a number; fewer layers spill weights to system RAM (slower).</span>
+          <span class="input-row">
+            <input name="gpu_layers" value="${esc(p.cpu_moe ? "-cmoe" : p.gpu_layers)}" placeholder="all" data-layers="${esc(p.gpu_layers)}" ${p.cpu_moe ? "disabled" : ""}>
+            <button type="button" class="btn small toggle-btn" data-cmoe aria-pressed="${p.cpu_moe}"
+              title="Keep the mixture-of-experts weights in system RAM (--cpu-moe); attention and shared weights stay on the GPU">-cmoe</button>
+          </span>
+          <span class="muted small gpu-layers-help"></span>
         </label>
         <label class="field check-field"><span><input type="checkbox" name="swa_full" ${p.swa_full ? "checked" : ""}> Full SWA cache (--swa-full)</span>
           <span class="muted small">Sliding-window models (Gemma, gpt-oss, Spark): standard llama-server builds prefill a restored document
@@ -704,6 +726,30 @@
 
     const f = presetForm.elements;
     const currentModel = () => view.models.find((m) => m.path === f.model_path.value);
+    const autoName = (m) => (m ? `${m.name || m.file}${m.quant ? ` ${m.quant}` : ""}` : "");
+    let nameTouched = !!preset;  // a new preset is named after its model until the name is edited
+    const cmoeButton = $("[data-cmoe]", presetForm);
+    const cmoeOn = () => cmoeButton.getAttribute("aria-pressed") === "true";
+    const gpuLayers = () => (cmoeOn() ? f.gpu_layers.dataset.layers || "all" : f.gpu_layers.value.trim() || "all");
+    const setCmoe = (on) => {
+      if (on === cmoeOn()) return;
+      if (on) f.gpu_layers.dataset.layers = f.gpu_layers.value.trim() || "all";  // back when switched off
+      cmoeButton.setAttribute("aria-pressed", String(on));
+      f.gpu_layers.disabled = on;
+      f.gpu_layers.value = on ? "-cmoe" : f.gpu_layers.dataset.layers || "all";
+    };
+    const hasExperts = (m) => !!m && Object.keys(m.expert_bytes_by_layer || {}).length > 0;
+    const syncCmoe = () => {
+      const m = currentModel();
+      const moe = hasExperts(m) || !m;  // a custom path cannot be checked: allow it
+      if (!moe && cmoeOn()) setCmoe(false);
+      cmoeButton.disabled = !moe;
+      cmoeButton.title = moe ? "Keep the mixture-of-experts weights in system RAM (--cpu-moe); attention and shared weights stay on the GPU"
+        : "Only for mixture-of-experts models";
+      $(".gpu-layers-help", presetForm).textContent = cmoeOn()
+        ? "Experts stay in system RAM (--cpu-moe), everything else on the GPU: for MoE models larger than the GPU."
+        : "“all”, “auto” or a number; fewer layers spill weights to system RAM (slower).";
+    };
     const ownSampling = () => Object.fromEntries(SAMPLING.map((x) => {
       const raw = f[`s_${x.key}`].value.trim();
       return [x.key, raw === "" ? null : Number(raw)];
@@ -738,6 +784,7 @@
     };
     const update = () => {
       const m = currentModel();
+      syncCmoe();
       $(".model-info", presetForm).innerHTML = modelSummary(m);
       // the projector is optional: offer the one next to the model instead of choosing it
       const suggestion = !f.mmproj.value.trim() && suggestProjector(m?.path);
@@ -762,7 +809,7 @@
         try {
           est = await (await api("/api/presets/estimate", { method: "POST", json: {
             model_path: f.model_path.value.trim(), ctx_per_slot: ctx, slots: Number(f.slots.value) || 1, swa_full: f.swa_full.checked,
-            kv_type: f.kv_type.value, extra_args: f.extra_args.value, gpu_layers: f.gpu_layers.value.trim() || "all",
+            kv_type: f.kv_type.value, extra_args: f.extra_args.value, gpu_layers: gpuLayers(), cpu_moe: cmoeOn(),
             binary: f.binary.value.trim(), mmproj: f.mmproj.value.trim(), draft_model: f.draft_model.value.trim(),
           } })).json();
         } catch { /* shown as "no estimate" */ }
@@ -804,6 +851,7 @@
         if (!custom) {
           f.model_path.value = e.target.value;
           const m = currentModel();
+          if (!nameTouched) f.name.value = autoName(m);
           if (m?.sliding_window) f.swa_full.checked = true;
           // drafts that fit the new model first; a draft that no longer fits stays visible but flagged
           f.draft_select.innerHTML = draftOptions(f.draft_model.value.trim(), m?.path);
@@ -815,12 +863,14 @@
       update();
     };
     presetForm.oninput = (e) => {
+      if (e.target.name === "name") nameTouched = true;
       if (e.target.name?.startsWith("s_")) return renderSampling();  // no new estimate needed
       update();
     };
     presetForm.onclick = (e) => {
       const b = e.target.closest("[data-ctx]");
       if (b) { f.ctx_per_slot.value = b.dataset.ctx; update(); }
+      if (e.target.closest("[data-cmoe]")) { setCmoe(!cmoeOn()); update(); }
       const use = e.target.closest("[data-use-projector]");
       if (use) {
         f.mmproj.value = use.dataset.useProjector;
@@ -839,7 +889,7 @@
       const payload = {
         name: f.name.value.trim(), model_path: f.model_path.value.trim(),
         ctx_per_slot: Number(f.ctx_per_slot.value), slots: Number(f.slots.value),
-        kv_type: f.kv_type.value, flash_attn: f.flash_attn.value, gpu_layers: f.gpu_layers.value.trim() || "all",
+        kv_type: f.kv_type.value, flash_attn: f.flash_attn.value, gpu_layers: gpuLayers(), cpu_moe: cmoeOn(),
         swa_full: f.swa_full.checked, extra_args: f.extra_args.value.trim(), binary: f.binary.value.trim(),
         mmproj: f.mmproj.value.trim(), draft_model: f.draft_model.value.trim(), sampling: ownSampling(),
       };

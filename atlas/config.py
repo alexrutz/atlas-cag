@@ -40,6 +40,13 @@ class Settings(BaseSettings):
     # Part of the release asset's file name; empty = the CUDA package for this machine's CPU.
     build_update_asset: str = ""
     build_update_interval_h: float = 6.0
+    # "release": the prebuilt packages above. "patched": the same llama.cpp release built here from
+    # source with Atlas's fixes (atlas/patches/llama.cpp: restored slots keep the sliding-window
+    # cache; slot files load with any slot count). Needs git, cmake, a C++ compiler and nvcc.
+    build_update_source: Literal["release", "patched"] = "release"
+    build_source_repo: str = "https://github.com/ggml-org/llama.cpp"
+    build_cuda_arch: str = ""  # CMAKE_CUDA_ARCHITECTURES; empty = this machine's GPU (nvidia-smi)
+    build_jobs: int = 0  # parallel compile jobs; 0 = every CPU core (compiling runs at low priority)
     github_api: str = "https://api.github.com"
     pypi_url: str = "https://pypi.org"  # CUDA runtime wheels, only if no local copy is found
 
@@ -173,6 +180,7 @@ class RuntimeSettings(BaseModel):
     default_prefill: Literal["text", "visual"]
     visual_dpi: int = Field(ge=36, le=400)
     build_updates: Literal["off", "install", "apply"]
+    build_update_source: Literal["release", "patched"]
     system_prompt: str = Field(min_length=1, max_length=20000)
     synthesis_prompt: str = Field(min_length=1, max_length=20000)
 

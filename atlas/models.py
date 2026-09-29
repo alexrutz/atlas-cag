@@ -321,12 +321,13 @@ def draft_problem(model: ModelInfo | None, draft: ModelInfo | None) -> str | Non
 
 def estimate(model: ModelInfo | None, ctx_per_slot: int, slots: int, kv_type: str,
              extra_args: str = "", gpu_layers: str = "all", mmproj_bytes: int = 0, swa_full: bool = False,
-             draft: ModelInfo | None = None) -> dict:
+             draft: ModelInfo | None = None, cpu_moe: bool = False) -> dict:
     """Rough memory estimate for a preset, in bytes: GPU (weights + KV + recurrent state + vision
     projector), system RAM (CPU-offloaded experts, input embeddings) and SSD (lazily read embeddings)."""
     if model is None or not model.kv_bytes_per_token_f16:
         return {}
     flags = _flags(extra_args)
+    flags["cpu_moe"] = flags["cpu_moe"] or cpu_moe
     experts = model.expert_bytes_by_layer or {}
     experts_ram = sum(b for layer, b in experts.items() if flags["cpu_moe"] or layer < flags["n_cpu_moe"])
     lazy_ssd = model.lazy_bytes if flags["lazy"] else 0

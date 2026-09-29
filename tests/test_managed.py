@@ -221,6 +221,13 @@ async def test_draft_model_is_optional_and_keeps_the_caches(managed, tmp_path):
     assert est["draft"] > est["draft_kv"] > 0 and est["total"] == base["total"] + est["draft"]
     assert listed["With draft"]["draft"]["name"] == "Tiny Draft" and not listed["With draft"]["warnings"]
 
+    # experts on the CPU: --cpu-moe on the command line (checked with the estimate of a MoE model elsewhere)
+    cmoe = (await managed.post("/api/presets", json=preset("cmoe", model_a, cpu_moe=True))).json()
+    assert cmoe["cpu_moe"] is True
+    from atlas.supervisor import build_command
+    assert "--cpu-moe" in build_command(["llama-server"], cmoe, 1, tmp_path)
+    assert "--cpu-moe" not in build_command(["llama-server"], plain, 1, tmp_path)
+
     # a draft with another vocabulary is flagged before llama-server refuses it
     other = write_gguf(tmp_path / "models" / "other-vocab.gguf", {
         "general.architecture": "llama", "general.name": "Other", "tokenizer.ggml.model": "llama",

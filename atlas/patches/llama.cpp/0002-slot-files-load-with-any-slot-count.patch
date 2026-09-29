@@ -1,0 +1,28 @@
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 332d1ab..f330acf 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -2152,7 +2152,12 @@ const slot_info_vec_t *   sinfos_in) {
+ 
+     uint32_t n_stream_cur;
+     io.read(&n_stream_cur, sizeof(n_stream_cur));
+-    if (n_stream_cur != n_stream) {
++    // Atlas patch: a single sequence is loaded into its own stream (seq_to_stream[seq_id]) no matter
++    // which stream it was saved from, so a sequence file saved with a different number of streams
++    // (e.g. another --parallel with --no-kv-unified) restores fine. Only whole-context restores and
++    // mirrored caches need the same stream layout.
++    const bool any_layout = seq_id != -1 && !sinfos_in && !sinfos_out;
++    if (n_stream_cur != n_stream && !any_layout) {
+         throw std::runtime_error("n_stream mismatch");
+     }
+ 
+@@ -2162,7 +2167,8 @@ const slot_info_vec_t *   sinfos_in) {
+         clear(true);
+     }
+ 
+-    for (uint32_t s = 0; s < n_stream; ++s) {
++    const uint32_t n_stream_file = any_layout ? n_stream_cur : n_stream;
++    for (uint32_t s = 0; s < n_stream_file; ++s) {
+         uint32_t cell_count;
+         io.read(&cell_count, sizeof(cell_count));
+ 

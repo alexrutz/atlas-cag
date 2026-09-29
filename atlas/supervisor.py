@@ -54,6 +54,7 @@ class PresetConfig(BaseModel):
     kv_type: Literal["f16", "bf16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0"] = "q8_0"
     flash_attn: Literal["on", "auto", "off"] = "on"
     gpu_layers: str = "all"
+    cpu_moe: bool = False  # --cpu-moe: mixture-of-experts weights stay in system RAM, the rest on the GPU
     swa_full: bool = False
     extra_args: str = ""
     binary: str = ""  # llama-server command for this preset; empty = the standard build
@@ -189,6 +190,8 @@ def build_command(binary: list[str], preset: dict, port: int, kv_dir: Path, host
     ]
     if preset.get("swa_full"):
         args.append("--swa-full")
+    if preset.get("cpu_moe"):
+        args.append("--cpu-moe")
     if preset.get("mmproj"):
         args += ["--mmproj", preset["mmproj"]]
     if preset.get("draft_model"):  # on the same GPU layers, with a KV cache like the model's

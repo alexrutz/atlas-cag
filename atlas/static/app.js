@@ -815,6 +815,7 @@
           <div class="answer-sources" hidden></div>
           <div class="response-error" hidden></div>
           <div class="response-foot" hidden></div>
+          <details class="gen-details" hidden><summary>Generation details</summary><div class="gen-body"></div></details>
         </div>`;
       this.node = node;
       this.el = {
@@ -828,6 +829,7 @@
         sources: $(".answer-sources", node),
         error: $(".response-error", node),
         foot: $(".response-foot", node),
+        details: $(".gen-details", node),
         rewritten: $(".rewritten", node),
       };
       node.addEventListener("click", (e) => this.onClick(e));
@@ -1047,6 +1049,8 @@
       if (s.truncated) bits.push(`<span style="color:var(--warn)">${s.truncated} generation${s.truncated > 1 ? "s" : ""} hit the token limit</span>`);
       this.el.foot.innerHTML = bits.join("<span>·</span>");
       this.el.foot.hidden = false;
+      $(".gen-body", this.el.details).innerHTML = genDetails(this, s);
+      this.el.details.hidden = false;
       scrollDown();
     }
 
@@ -1329,6 +1333,66 @@
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape" && !srcPanel.hidden && !openMenuEl && !document.querySelector("dialog[open]")) closeSource();
   });
+
+  // ---------------------------------------------------------------- generation details
+
+  const STOP_LABELS = { eos: "end of answer", limit: "token limit", word: "stop word", none: "–" };
+  const dash = (v, f = (x) => x) => (v === undefined || v === null ? "–" : f(v));
+  const tps = (v) => dash(v, (x) => `${fmtInt(Math.round(x))} tok/s`);
+  const rate = (n, ms) => (ms ? n / (ms / 1000) : null);
+
+  function callRow(label, title, st) {
+    const used = (st.n_prompt || 0) + (st.n_gen || 0);
+    const ctx = st.n_ctx ? `${fmtTok(used)} / ${fmtTok(st.n_ctx)} (${Math.round((100 * used) / st.n_ctx)}%)` : fmtTok(used);
+    const think = st.n_reasoning ? ` <span class="muted">(${fmtInt(st.n_reasoning)} thinking)</span>` : "";
+    const draft = st.draft_n ? ` <span class="muted" title="speculative decoding: drafted tokens the model accepted">· ${Math.round((100 * st.draft_accepted) / st.draft_n)}% drafts</span>` : "";
+    return `<tr><td class="gd-label" title="${esc(title)}">${esc(label)}</td>
+      <td class="num">${dash(st.slot)}</td>
+      <td class="num">${dash(st.wait_ms, fmtMs)}</td>
+      <td class="num">${dash(st.restore_ms, fmtMs)}</td>
+      <td class="num">${dash(st.n_cached, fmtInt)}</td>
+      <td class="num">${dash(st.n_processed, fmtInt)}</td>
+      <td class="num">${tps(st.prompt_tps ?? rate(st.n_processed, st.prompt_ms))}</td>
+      <td class="num">${dash(st.n_gen, fmtInt)}${think}</td>
+      <td class="num">${tps(st.gen_tps)}${draft}</td>
+      <td class="num">${dash(st.ttft_ms, fmtMs)}</td>
+      <td class="num">${ctx}</td>
+      <td>${esc(st.truncated ? "context full" : STOP_LABELS[st.stop_type] || st.stop_type || "–")}${st.cache_miss ? ' <span class="warn-text">cache miss</span>' : ""}</td></tr>`;
+  }
+
+  function genDetails(turn, s) {
+    const calls = [...turn.targets.values()].filter((t) => t.stats);
+    const generated = s.tokens_generated || 0;
+    const thinking = s.tokens_reasoning || 0;
+    const promptTps = rate(s.tokens_processed || 0, s.prompt_ms);
+    const genTps = rate(generated, s.gen_ms);
+    const cfg = s.config;
+    const rows = [
+      ["Total time", `${fmtMs(s.total_ms)}${s.first_token_ms != null ? ` · first token after ${fmtMs(s.first_token_ms)}` : ""}${
+        s.first_answer_ms != null && s.first_answer_ms !== s.first_token_ms ? ` · first answer token after ${fmtMs(s.first_answer_ms)}` : ""}`],
+      ["From the KV cache", `${fmtInt(s.tokens_restored)} tokens restored from ${calls.length} slot file${calls.length === 1 ? "" : "s"}${
+        s.kv_bytes_read ? ` · ${fmtBytes(s.kv_bytes_read)} read` : ""} in ${fmtMs(s.restore_ms)}${s.cache_misses ? ` · <span class="warn-text">${s.cache_misses} cache miss${s.cache_misses > 1 ? "es" : ""}</span>` : ""}`],
+      ["Prompt evaluation", `${fmtInt(s.tokens_processed)} tokens${s.prompt_ms ? ` in ${fmtMs(s.prompt_ms)} · ${tps(promptTps)}` : ""}
+        <span class="muted">(conversation and question; the documents came from the cache)</span>`],
+      ["Generation", `${fmtInt(generated)} tokens${thinking ? ` (${fmtInt(thinking)} thinking, ${fmtInt(generated - thinking)} answer)` : ""}${
+        s.gen_ms ? ` in ${fmtMs(s.gen_ms)} · ${tps(genTps)}` : ""}${s.truncated ? ` · <span class="warn-text">${s.truncated} cut off</span>` : ""}`],
+      s.draft_n ? ["Speculative decoding", `${fmtInt(s.draft_accepted)} of ${fmtInt(s.draft_n)} drafted tokens accepted (${Math.round((100 * s.draft_accepted) / s.draft_n)}%)`] : null,
+      s.wait_ms >= 50 ? ["Waiting for slots", fmtMs(s.wait_ms)] : null,
+      ["Calls", `${s.llm_calls} to llama-server${s.n_targets > 1 ? ` · ${s.n_relevant ?? "–"} of ${s.n_targets} answers synthesized` : ""}${
+        s.synthesis_levels > 1 ? ` in ${s.synthesis_levels} rounds` : ""}${s.history_turns ? ` · ${s.history_turns} earlier turn${s.history_turns === 1 ? "" : "s"} sent` : ""}`],
+      s.sampling ? ["Sampling", Object.entries(s.sampling).map(([k, v]) => `${esc(k.replace(/_/g, " "))} ${esc(v)}`).join(" · ")] : null,
+      cfg ? ["Model", `${esc(cfg.model || "–")} · ${cfg.n_slots} × ${fmtInt(cfg.n_ctx_slot)} tokens${cfg.build ? ` · build ${esc(cfg.build)}` : ""}${
+        cfg.fingerprint ? ` · configuration <code>${esc(cfg.fingerprint)}</code>` : ""}`] : null,
+    ].filter(Boolean);
+    const table = calls.length || s.synthesis ? `<div class="table-wrap"><table class="gd-table">
+      <thead><tr><th>Call</th><th class="num">Slot</th><th class="num" title="waiting for a free slot">Wait</th><th class="num">Restore</th>
+        <th class="num" title="tokens reused from the restored KV cache">Cached</th><th class="num" title="prompt tokens evaluated">Evaluated</th>
+        <th class="num">Prompt speed</th><th class="num">Generated</th><th class="num">Speed</th><th class="num" title="request sent → first generated token">First token</th>
+        <th class="num" title="tokens in the slot after the answer / slot size">Context</th><th>Stop</th></tr></thead>
+      <tbody>${calls.map((t) => callRow(t.n_parts > 1 || calls.length > 1 ? `[${t.n}] ${t.label}` : t.label, t.label, t.stats)).join("")}
+        ${s.synthesis ? callRow("Synthesis", "the final answer from the per-document answers", s.synthesis) : ""}</tbody></table></div>` : "";
+    return `<dl class="kv gd-kv">${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl>${table}`;
+  }
 
   // ---------------------------------------------------------------- conversations
 

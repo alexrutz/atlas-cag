@@ -166,6 +166,15 @@ values; the card points out a missing one until you add it.
 Changing the model, the KV cache type, flash attention or `--swa-full` creates a new cache
 configuration; its caches are built in the background, and the old ones are kept for when you switch back.
 
+### Experts on the CPU
+
+For mixture-of-experts models larger than the GPU, the **-cmoe** switch next to *GPU layers* keeps
+the expert weights in system RAM (`--cpu-moe`) and everything else on the GPU; the field then
+shows `-cmoe`. The memory estimate moves the experts to the RAM row. Prefill copies the experts to
+the GPU once per micro-batch, so a larger `-ub` (e.g. `-ub 2048 -b 2048` in the extra arguments)
+makes prefill of long documents faster; the editor suggests it. `--n-cpu-moe N` (only the first N
+layers' experts) still goes into the extra arguments.
+
 ### Draft models (speculative decoding)
 
 A preset can name a **draft model** (optional, next to the optional vision projector): a small
@@ -239,6 +248,27 @@ A new build must not break a working setup:
   than one you went back from are not installed automatically.
 
 The two newest updates and any build a preset uses are kept; older ones are deleted.
+
+**Build from source with Atlas's fixes.** Standard llama.cpp releases re-prefill a restored
+document of a sliding-window model (Gemma, gpt-oss, Spark) unless `--swa-full` is set, and cannot
+load slot files saved with another number of slots. With **Build from: Source, with Atlas's fixes**
+(`ATLAS_BUILD_UPDATE_SOURCE=patched`) Atlas builds each release itself instead of downloading the
+package:
+
+1. `git clone --depth 1` of the release tag from `ATLAS_BUILD_SOURCE_REPO` (ggml-org/llama.cpp);
+2. the patches in `atlas/patches/llama.cpp/` (restored slots keep the sliding-window cache; slot
+   files load with any slot count); a patch the release already contains is skipped, and if one
+   no longer applies the build stops and the current build stays;
+3. CMake with CUDA for this machine's GPU (`ATLAS_BUILD_CUDA_ARCH`, default from `nvidia-smi`),
+   with the newest CUDA toolkit the driver supports, compiling only `llama-server` at low priority
+   (`nice`) on all cores (`ATLAS_BUILD_JOBS`); a few minutes;
+4. the binary and its libraries go into `data/builds/<tag>+atlas/`, the source and build tree are
+   deleted, and the build becomes the standard build like a downloaded one (pinning, rollback and
+   restart work the same). The build log stays in `data/builds/<tag>+atlas.build.log`.
+
+It needs git, cmake, a C++ compiler and the CUDA toolkit (`nvcc`); the settings page says what is
+missing. Switching the source builds (or fetches) the current release in the chosen form at once;
+**Build now** does it by hand.
 
 Caches are shared between builds when they are compatible. Every start restores a canary cache
 and checks that it still predicts the same next token as when it was built. A build that stores
@@ -470,6 +500,17 @@ the text around it, and a button that opens the full text scrolled to the passag
 opens the quote of that finding that best matches the sentence it stands in. Turns recorded
 before quotes were located get a **Find the quoted passages** link. Visual documents without a
 text layer have nothing to match quotes against.
+
+### Generation details
+
+Under every answer, **Generation details** opens the numbers behind it: total time and time to the
+first token and to the first answer token; tokens restored from slot files, bytes read and restore
+time; prompt tokens evaluated and prompt speed; tokens generated (thinking and answer) and speed;
+speculative decoding acceptance when a draft model runs; time spent waiting for a free slot;
+sampling; model, slot size, build and cache configuration. A table lists every llama-server call
+(each document part and the synthesis) with its slot, wait, restore, cached and evaluated tokens,
+speeds, first token, context used and why it stopped. The numbers are stored with the turn, so
+older conversations show them too (as far as they were recorded).
 
 ## Limits and thinking
 

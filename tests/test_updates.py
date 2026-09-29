@@ -289,3 +289,115 @@ def test_release_version_label(tmp_path):
     (tmp_path / "VERSION.txt").unlink()
     time.sleep(0.01)
     assert builds.inspect(str(exe)).version == "v0.5.0-dev", "shallow builds are named by their version"
+
+
+# --- building from source with Atlas's patches ----------------------------------------------
+
+def patch_images(patch: Path) -> dict[str, tuple[str, str]]:
+    """File -> (text before, text after) the patch, made of the lines its hunks show."""
+    images: dict[str, tuple[list[str], list[str]]] = {}
+    path = None
+    for line in patch.read_text().splitlines():
+        if line.startswith("+++ b/"):
+            path = line[6:]
+            images[path] = ([], [])
+        elif path and line.startswith("@@"):
+            images[path][0].append("// ...")
+            images[path][1].append("// ...")
+        elif path and line[:1] in (" ", "-", "+") and not line.startswith(("---", "+++")):
+            if line[0] in " -":
+                images[path][0].append(line[1:])
+            if line[0] in " +":
+                images[path][1].append(line[1:])
+    return {p: ("\n".join(a) + "\n", "\n".join(b) + "\n") for p, (a, b) in images.items()}
+
+
+def git(*args, cwd: Path) -> None:
+    import subprocess
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=cwd, check=True,
+                   capture_output=True)
+
+
+def llama_source(repo: Path, tag: str, state: str = "unpatched") -> None:
+    """Commit and tag a tree shaped like llama.cpp: the files Atlas patches (as the patches expect them,
+    already fixed, or rewritten) and a CMake project whose llama-server target runs the fake server.
+    The build fails unless the SWA fix is in the source."""
+    repo.mkdir(parents=True, exist_ok=True)
+    if not (repo / ".git").exists():
+        git("init", "-q", cwd=repo)
+    for patch in updater_module.patch_files():
+        for path, (before, after) in patch_images(patch).items():
+            text = {"unpatched": before, "fixed": after, "rewritten": "// this code was rewritten upstream\n"}[state]
+            (repo / path).parent.mkdir(parents=True, exist_ok=True)
+            (repo / path).write_text(text)
+    (repo / "llama-server.sh").write_text(f"#!/bin/sh\nexec {sys.executable} {CLI} --fake-version {tag.lstrip('v')} \"$@\"\n")
+    (repo / "CMakeLists.txt").write_text("""cmake_minimum_required(VERSION 3.16)
+project(fake_llama NONE)
+add_custom_target(llama-server ALL
+  COMMAND grep -q "Atlas patch" ${CMAKE_SOURCE_DIR}/tools/server/server-context.cpp
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/bin
+  COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/llama-server.sh ${CMAKE_BINARY_DIR}/bin/llama-server
+  COMMAND chmod +x ${CMAKE_BINARY_DIR}/bin/llama-server)
+""")
+    git("add", "-A", cwd=repo)
+    git("commit", "-q", "-m", tag, "--allow-empty", cwd=repo)
+    git("tag", tag, cwd=repo)
+
+
+@pytest.fixture
+async def patched_updates(tmp_path, github, monkeypatch):
+    monkeypatch.setattr(updater_module, "find_nvcc", lambda: "/usr/bin/true")  # the fake project needs no CUDA
+    repo = tmp_path / "llama.cpp"
+    settings = Settings(
+        _env_file=None, llama_server_bin=f"{sys.executable} {CLI}", llama_port=free_port(), kv_dir=tmp_path / "kv",
+        data_dir=tmp_path / "data", models_dirs=str(tmp_path / "models"), scan_model_caches=False,
+        llama_start_timeout_s=30, github_api=github.url, build_update_repo="ai-dock/llama.cpp-cuda",
+        build_updates="install", build_update_source="patched", build_source_repo=f"file://{repo}",
+        build_cuda_arch="89", build_jobs=2,
+    )
+    app = create_app(settings)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://atlas",
+                                     timeout=30) as client:
+            client.app, client.repo = app, repo
+            client.model = qwen35_like(tmp_path / "models" / "model-a.gguf", "Model A")
+            yield client
+
+
+async def test_releases_are_built_from_source_with_atlas_patches(patched_updates, github):
+    client = patched_updates
+    llama_source(client.repo, "v0.5.0")
+    github.publish("v0.5.0")
+    updates = await check(client)
+    assert updates["job"]["state"] == "done", updates
+    assert updates["standard_tag"] == "v0.5.0+atlas" and updates["source"] == "patched" and updates["toolchain"] == []
+    built = next(i for i in updates["installed"] if i["tag"] == "v0.5.0+atlas")
+    assert set(built["patched"].values()) == {"applied"} and len(built["patched"]) == 2
+    assert built["asset"] == "built from source (CUDA 89)"
+    data = client.app.state.supervisor.settings.data_dir
+    assert (data / "builds" / "v0.5.0+atlas.build.log").exists() and not (data / "builds" / "src" / "v0.5.0+atlas").exists()
+    p = (await client.post("/api/presets", json=preset("plain", client.model))).json()
+    assert (await activate(client, p["id"]))["ready"]
+    assert (await client.get("/api/server")).json()["supervisor"]["build"] == built["path"]
+
+    # a release that already contains the fixes builds without applying them
+    llama_source(client.repo, "v0.6.0", state="fixed")
+    github.publish("v0.6.0")
+    updates = await check(client)
+    assert updates["standard_tag"] == "v0.6.0+atlas", (updates["job"], updates["error"], updates["latest"])
+    assert set(next(i for i in updates["installed"] if i["tag"] == "v0.6.0+atlas")["patched"].values()) == {"already in this release"}
+
+    # a release where the patched code was rewritten: the build stops, the current build stays
+    llama_source(client.repo, "v0.7.0", state="rewritten")
+    github.publish("v0.7.0")
+    updates = await check(client)
+    assert updates["job"]["state"] == "failed" and "does not apply" in updates["job"]["error"]
+    assert updates["standard_tag"] == "v0.6.0+atlas"
+
+    # back to prebuilt releases: the newest package is installed (v0.7.0 has one)
+    r = await client.patch("/api/settings", json={"build_update_source": "release"})
+    assert r.status_code == 200
+    await asyncio.sleep(0.2)
+    updates = await wait_for(client, lambda u: u["job"]["state"] in ("done", "failed") and u["standard_tag"] == "v0.7.0",
+                             "/api/builds/updates", 30)
+    assert updates["source"] == "release"

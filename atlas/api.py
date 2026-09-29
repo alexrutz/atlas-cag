@@ -647,7 +647,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if info["kv_bytes_per_token"] is None and sup and sup.preset and Path(sup.preset["model_path"]).is_file():
             est = models.estimate(models.describe_file(Path(sup.preset["model_path"])), sup.preset["ctx_per_slot"],
                                   1, sup.preset["kv_type"], sup.preset.get("extra_args", ""),
-                                  swa_full=bool(sup.preset.get("swa_full")))
+                                  swa_full=bool(sup.preset.get("swa_full")), cpu_moe=bool(sup.preset.get("cpu_moe")))
             info["kv_bytes_per_token"] = est.get("kv_bytes_per_token")
         n_ctx = s.engine.info.n_ctx_slot
         info["part_tokens"] = n_ctx - s.engine.reserve_tokens() if n_ctx else None
@@ -881,8 +881,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except ValidationError as e:
             raise HTTPException(422, "; ".join(f"{'.'.join(map(str, x['loc']))}: {x['msg']}" for x in e.errors()))
         old_prompt = settings.system_prompt
+        old_source = settings.build_update_source
         for key in RUNTIME_FIELDS:
             setattr(settings, key, getattr(validated, key))
+        if settings.build_update_source != old_source and s.updater:
+            s.updater.check_in_background()  # build (or fetch) the current release in the chosen form
         s.store.set_state("settings", {k: getattr(validated, k) for k in overrides})
         s.ingestor.set_concurrency(s.engine.info.n_slots or 1)
         if settings.system_prompt != old_prompt and s.engine.info.connected and not s.engine.paused:
@@ -926,7 +929,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "warnings": warnings,
                 "estimate": models.estimate(info, p["ctx_per_slot"], p["slots"], p["kv_type"],
                                             p.get("extra_args", ""), p.get("gpu_layers", "all"), mmproj_bytes,
-                                            bool(p.get("swa_full")), draft)}
+                                            bool(p.get("swa_full")), draft, bool(p.get("cpu_moe")))}
 
     def describe_draft(path: str | None, index: dict[str, models.ModelInfo] | None = None) -> models.ModelInfo | None:
         if not path:
@@ -989,7 +992,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return {"sampling_model": info.sampling or {},
                     **models.estimate(info, int(body.get("ctx_per_slot") or 0), int(body.get("slots") or 1),
                                       str(body.get("kv_type") or "f16"), extra, str(body.get("gpu_layers") or "all"),
-                                      mmproj_bytes, bool(body.get("swa_full")), draft),
+                                      mmproj_bytes, bool(body.get("swa_full")), draft, bool(body.get("cpu_moe"))),
                     "warnings": builds.preset_warnings(build, info.arch, extra)
                     + draft_warnings(build, info, draft_path, draft),
                     "build": build.to_json()}

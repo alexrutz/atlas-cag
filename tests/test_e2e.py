@@ -35,6 +35,17 @@ async def test_single_document_restores_cache_and_appends_question(atlas, fake):
     assert last["cache_n"] == doc["n_tokens"]
     assert last["n_prompt"] - last["cache_n"] < 300
 
+    # generation details: per call and for the whole answer
+    stats = next(e for e in events if e["type"] == "target" and e["status"] == "done")["stats"]
+    for key in ("wait_ms", "restore_ms", "prompt_tps", "gen_tps", "ttft_ms", "first_answer_ms", "n_reasoning", "n_ctx",
+                "draft_n", "draft_accepted", "wall_ms"):
+        assert key in stats, key
+    assert stats["n_ctx"] == done["stats"]["config"]["n_ctx_slot"] == 4096 and stats["ttft_ms"] <= stats["wall_ms"] and stats["n_reasoning"] == 0
+    s = done["stats"]
+    assert s["first_token_ms"] <= s["first_answer_ms"] <= s["total_ms"] and s["kv_bytes_read"] > 0
+    assert s["config"]["n_slots"] == 2 and s["config"]["fingerprint"] == doc["fingerprint"]
+    assert s["tokens_reasoning"] == 0 and s["gen_ms"] >= 0 and s["draft_n"] == 0
+
 
 FILTER = pytest.mark.parametrize("atlas", [{"relevance_filter": True}], indirect=True)
 

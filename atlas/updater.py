@@ -5,6 +5,9 @@ llama.cpp-<tag>-cuda-<version>-<arch>.tar.gz. The packages leave out the CUDA ru
 cuBLAS, NCCL): Atlas links those from other llama.cpp builds or Python CUDA wheels already on this
 machine, and downloads the wheels from PyPI only if nothing local fits.
 
+With build_update_source = "patched", Atlas instead builds the same llama.cpp release from source
+with its own patches (atlas/patches/llama.cpp) and installs it as "<tag>+atlas".
+
 A new build becomes the standard build, i.e. the one used by every preset that does not name its
 own. Presets whose model or extra arguments only the previous build supports are pinned to it. If
 llama-server fails to start with a new build, Atlas goes back to the previous one and skips that
@@ -17,6 +20,8 @@ import logging
 import os
 import re
 import shutil
+import signal
+import subprocess
 import sys
 import tarfile
 import time
@@ -52,8 +57,88 @@ LIB_SEARCH = [
 ]
 
 
+PATCHES = Path(__file__).parent / "patches" / "llama.cpp"
+PATCHED_SUFFIX = "+atlas"
+BUILD_LOG_LINES = 12  # of a failed step, shown in the error
+
+
 class UpdateError(RuntimeError):
     pass
+
+
+def _cuda_version(text: str) -> tuple[int, int] | None:
+    m = re.search(r"(\d+)\.(\d+)", text)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def _driver_cuda() -> tuple[int, int] | None:
+    """The newest CUDA version the installed driver supports ("CUDA Version" in nvidia-smi)."""
+    try:
+        out = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=20).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"CUDA Version:\s*([\d.]+)", out)
+    return _cuda_version(m.group(1)) if m else None
+
+
+def _nvcc_version(nvcc: Path) -> tuple[int, int] | None:
+    if m := re.search(r"cuda-(\d+\.\d+)", str(nvcc.resolve())):
+        return _cuda_version(m.group(1))
+    try:
+        out = subprocess.run([str(nvcc), "--version"], capture_output=True, text=True, timeout=20).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"release\s+([\d.]+)", out)
+    return _cuda_version(m.group(1)) if m else None
+
+
+def find_nvcc() -> str | None:
+    """The newest CUDA compiler whose version the driver supports: binaries built with a newer
+    toolkit than the driver may not run."""
+    paths = [Path(p) for p in [shutil.which("nvcc")] if p] + sorted(Path("/usr/local").glob("cuda*/bin/nvcc"))
+    found: dict[Path, tuple[int, int]] = {}
+    for nvcc in paths:
+        if nvcc.resolve() not in found and (version := _nvcc_version(nvcc)):
+            found[nvcc.resolve()] = version
+    driver = _driver_cuda()
+    usable = {p: v for p, v in found.items() if driver is None or v <= driver}
+    if not usable:
+        return str(paths[0]) if paths else None
+    return str(max(usable, key=lambda p: usable[p]))
+
+
+_toolchain_cache: tuple[float, dict] | None = None
+
+
+def toolchain(max_age_s: float = 300.0) -> dict:
+    """What building llama.cpp from source needs, and what is missing (checked every few minutes)."""
+    global _toolchain_cache
+    if _toolchain_cache and time.time() - _toolchain_cache[0] < max_age_s:
+        return _toolchain_cache[1]
+    tools = {"git": shutil.which("git"), "cmake": shutil.which("cmake"),
+             "c++": shutil.which("c++") or shutil.which("g++") or shutil.which("clang++"), "nvcc": find_nvcc()}
+    result = {"tools": tools, "missing": [name for name, path in tools.items() if not path]}
+    _toolchain_cache = (time.time(), result)
+    return result
+
+
+def cuda_arch(configured: str) -> str:
+    """CMAKE_CUDA_ARCHITECTURES for this machine's GPU, e.g. "89" for compute capability 8.9."""
+    if configured:
+        return configured
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=20).stdout
+        caps = sorted({line.strip().replace(".", "") for line in out.splitlines() if line.strip()})
+        if caps:
+            return ";".join(caps)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return "native"
+
+
+def patch_files() -> list[Path]:
+    return sorted(PATCHES.glob("*.patch"))
 
 
 def _glob(pattern: str) -> list[Path]:
@@ -130,6 +215,10 @@ class BuildUpdater:
             "repo": self.settings.build_update_repo,
             "asset": self.settings.build_update_asset or f"cuda-*-{ARCH}.tar.gz",
             "interval_h": self.settings.build_update_interval_h,
+            "source": self.settings.build_update_source,
+            "source_repo": self.settings.build_source_repo,
+            "patches": [p.stem for p in patch_files()],
+            "toolchain": toolchain()["missing"],
             "last_check": state.get("last_check"),
             "latest": state.get("latest"),
             "error": state.get("error"),
@@ -177,6 +266,7 @@ class BuildUpdater:
 
     def check_in_background(self) -> None:
         if not self.busy:
+            self.job = {"state": "checking"}  # at once: the previous job's "done" must not linger
             self._task = asyncio.create_task(self.check_now(), name="build-update-check")
 
     async def check_now(self) -> None:
@@ -232,7 +322,7 @@ class BuildUpdater:
         skipped = set(self.state.get("skipped") or [])
         latest = None
         for rel in r.json():
-            if rel.get("draft") or rel.get("prerelease") or rel["tag_name"] in skipped:
+            if rel.get("draft") or rel.get("prerelease") or self.key(rel["tag_name"]) in skipped:
                 continue
             asset = next((a for a in rel.get("assets", []) if self._asset_matches(a["name"])), None)
             if asset:
@@ -246,10 +336,21 @@ class BuildUpdater:
         self._save(last_check=time.time(), latest=latest, error=None)
         return latest
 
+    def key(self, tag: str) -> str:
+        """How a release is installed: its tag, or "<tag>+atlas" when built from source with Atlas's patches."""
+        return tag + PATCHED_SUFFIX if self.settings.build_update_source == "patched" else tag
+
     def _is_new(self, release: dict) -> bool:
-        """Newer than the standard build and than any release the user rolled back from."""
-        floor = max(self._standard_published(), self.state.get("floor") or "")
-        return release["tag"] != self.state.get("standard") and release["published_at"] > floor
+        """Newer than the standard build and than any release the user rolled back from, or the
+        standard build's release in the other form (prebuilt / patched) after switching the source."""
+        key = self.key(release["tag"])
+        if key == self.state.get("standard"):
+            return False
+        floor = self.state.get("floor") or ""
+        published = release["published_at"]
+        if published == self._standard_published():
+            return published >= floor
+        return published > max(self._standard_published(), floor)
 
     def _standard_published(self) -> str:
         tag = self.state.get("standard")
@@ -259,9 +360,12 @@ class BuildUpdater:
 
     async def install(self, release: dict) -> None:
         tag = release["tag"]
-        installed = self._installed().get(tag)
+        installed = self._installed().get(self.key(tag))
         if installed and Path(installed["path"]).is_file():
-            await self.switch(tag)  # e.g. an earlier install that was rolled back and is wanted again
+            await self.switch(self.key(tag))  # e.g. an earlier install that was rolled back and is wanted again
+            return
+        if self.settings.build_update_source == "patched":
+            await self.build_patched(release)
             return
         self.dir.mkdir(parents=True, exist_ok=True)
         archive = self.dir / f".{tag}.tar.gz"
@@ -280,6 +384,113 @@ class BuildUpdater:
         self._save(installed=installed)
         log.info("installed llama-server %s (%s) in %s", tag, info.version, dest)
         await self.switch(tag)
+
+    # --- building from source with Atlas's patches ------------------------------------------
+
+    async def build_patched(self, release: dict) -> None:
+        """Build llama-server for a release from source with Atlas's patches and make it the standard."""
+        tag = release["tag"]
+        key = tag + PATCHED_SUFFIX
+        tools = toolchain(max_age_s=0)
+        if tools["missing"]:
+            raise UpdateError(f"building llama.cpp needs {', '.join(tools['missing'])}: install "
+                              f"{'the CUDA toolkit' if 'nvcc' in tools['missing'] else 'the missing tools'}, "
+                              "or use the prebuilt releases")
+        self.dir.mkdir(parents=True, exist_ok=True)
+        safe = re.sub(r"[^\w.+-]", "_", key)
+        src = self.dir / "src" / safe
+        dest = self.dir / safe
+        log_path = self.dir / f"{safe}.build.log"
+        shutil.rmtree(src, ignore_errors=True)
+        src.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(f"building {key} from {self.settings.build_source_repo}\n")
+        try:
+            self.job = {"state": "building", "tag": key, "step": "downloading the source"}
+            await self._step(["git", "clone", "--depth", "1", "--branch", tag, self.settings.build_source_repo, str(src)],
+                             log_path)
+            self.job["step"] = "applying Atlas's patches"
+            applied = await self._apply_patches(src, log_path)
+            self.job["step"] = "configuring"
+            arch = await asyncio.to_thread(cuda_arch, self.settings.build_cuda_arch)
+            await self._step(["cmake", "-S", str(src), "-B", str(src / "build"), "-DCMAKE_BUILD_TYPE=Release",
+                              "-DGGML_CUDA=ON", f"-DCMAKE_CUDA_ARCHITECTURES={arch}",
+                              f"-DCMAKE_CUDA_COMPILER={tools['tools']['nvcc']}", "-DGGML_NATIVE=ON",
+                              "-DBUILD_SHARED_LIBS=ON", "-DLLAMA_CURL=OFF", "-DLLAMA_BUILD_TESTS=OFF",
+                              "-DLLAMA_BUILD_EXAMPLES=OFF"], log_path)
+            self.job.update(step="compiling", percent=0)
+            jobs = self.settings.build_jobs or os.cpu_count() or 4
+            await self._step(["cmake", "--build", str(src / "build"), "--target", "llama-server", "-j", str(jobs)],
+                             log_path, progress=True)
+            self.job["step"] = "installing"
+            exe = await asyncio.to_thread(self._install_bin, src / "build" / "bin", dest)
+            info = await self.provide_runtime(exe)
+            if not info.runnable:
+                shutil.rmtree(dest, ignore_errors=True)
+                raise UpdateError(f"{key} was built but cannot run here: {info.problem}")
+        finally:
+            shutil.rmtree(src, ignore_errors=True)  # the source and build tree take gigabytes
+        installed = self._installed()
+        installed[key] = {"path": str(exe), "published_at": release["published_at"], "version": info.version,
+                          "asset": f"built from source (CUDA {arch})", "patched": applied, "installed_at": time.time()}
+        self._save(installed=installed)
+        log.info("built llama-server %s (%s) with %s", key, info.version, ", ".join(f"{n} ({s})" for n, s in applied.items()))
+        await self.switch(key)
+
+    async def _apply_patches(self, src: Path, log_path: Path) -> dict[str, str]:
+        """Apply every patch; one the release already contains is skipped, one that conflicts stops the build."""
+        applied = {}
+        for patch in patch_files():
+            if await self._step(["git", "-C", str(src), "apply", "--check", str(patch)], log_path, check=False) == 0:
+                await self._step(["git", "-C", str(src), "apply", str(patch)], log_path)
+                applied[patch.stem] = "applied"
+            elif await self._step(["git", "-C", str(src), "apply", "--reverse", "--check", str(patch)], log_path,
+                                  check=False) == 0:
+                applied[patch.stem] = "already in this release"
+            else:
+                raise UpdateError(f"Atlas's patch {patch.stem} does not apply to this llama.cpp release (the code it "
+                                  "changes was rewritten). Use the prebuilt release until Atlas's patches are updated.")
+        return applied
+
+    async def _step(self, cmd: list[str], log_path: Path, check: bool = True, progress: bool = False) -> int:
+        """Run one build step at low priority, appending its output to the build log."""
+        nice = ["nice", "-n", "10"] if shutil.which("nice") else []
+        tail: list[str] = []
+        with open(log_path, "a", encoding="utf-8") as logf:
+            logf.write(f"$ {' '.join(cmd)}\n")
+            proc = await asyncio.create_subprocess_exec(*nice, *cmd, stdout=asyncio.subprocess.PIPE,
+                                                        stderr=asyncio.subprocess.STDOUT, start_new_session=True)
+            try:
+                assert proc.stdout is not None
+                async for raw in proc.stdout:
+                    line = raw.decode(errors="replace").rstrip()
+                    logf.write(line + "\n")
+                    tail = (tail + [line])[-BUILD_LOG_LINES:]
+                    if progress and (m := re.match(r"\[\s*(\d+)%\]", line)):
+                        self.job["percent"] = int(m.group(1))
+                rc = await proc.wait()
+            except asyncio.CancelledError:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)  # the compiler and its children
+                except ProcessLookupError:
+                    pass
+                raise
+        if check and rc != 0:
+            detail = "\n".join(line for line in tail if line.strip())
+            raise UpdateError(f"{' '.join(cmd[:3])} failed (exit {rc}); build log {log_path}:\n{detail}")
+        return rc
+
+    def _install_bin(self, bin_dir: Path, dest: Path) -> Path:
+        if not (bin_dir / "llama-server").is_file():
+            raise UpdateError("the build produced no llama-server")
+        staging = dest.with_name(f".{dest.name}.staging")
+        shutil.rmtree(staging, ignore_errors=True)
+        staging.mkdir(parents=True)
+        for f in bin_dir.iterdir():  # llama-server and the shared libraries it was linked with
+            if f.name == "llama-server" or ".so" in f.name:
+                shutil.copy2(f, staging / f.name, follow_symlinks=False)
+        shutil.rmtree(dest, ignore_errors=True)
+        staging.rename(dest)
+        return dest / "llama-server"
 
     async def _download(self, release: dict, target: Path) -> None:
         part = target.with_name(target.name + ".part")

@@ -99,11 +99,23 @@ class Tally:
     cache_misses: int = 0
     truncated: int = 0  # generations cut off by the token limit
     llm_calls: int = 0
+    reasoning: int = 0  # generated tokens spent thinking (≈)
+    prompt_ms: float = 0.0
+    gen_ms: float = 0.0
+    wait_ms: float = 0.0  # waiting for a free slot
+    kv_bytes: int = 0  # read from slot files
+    draft_n: int = 0
+    draft_accepted: int = 0
     extra: dict = field(default_factory=dict)
 
     def add(self, res: GenResult) -> None:
         self.processed += res.n_processed
         self.generated += res.n_gen
+        self.reasoning += min(res.n_reasoning, res.n_gen)
+        self.prompt_ms += res.prompt_ms
+        self.gen_ms += res.gen_ms
+        self.draft_n += res.draft_n
+        self.draft_accepted += res.draft_accepted
         self.llm_calls += 1
         if res.stop_type == "limit":
             self.truncated += 1
@@ -217,6 +229,11 @@ class QueryService:
 
         async def emit(event: dict) -> None:
             record.observe(event)
+            if event.get("type") == "delta":  # the final answer's stream (single answer or synthesis)
+                ms = round((time.perf_counter() - started) * 1000, 1)
+                tally.extra.setdefault("first_token_ms", ms)
+                if event.get("channel") == "answer" and event.get("text", "").strip():
+                    tally.extra.setdefault("first_answer_ms", ms)
             await send(event)
 
         try:
@@ -278,6 +295,16 @@ class QueryService:
             "cache_misses": tally.cache_misses,
             "truncated": tally.truncated,
             "llm_calls": tally.llm_calls,
+            "tokens_reasoning": tally.reasoning,
+            "prompt_ms": round(tally.prompt_ms, 1),
+            "gen_ms": round(tally.gen_ms, 1),
+            "wait_ms": round(tally.wait_ms, 1),
+            "kv_bytes_read": tally.kv_bytes,
+            "draft_n": tally.draft_n,
+            "draft_accepted": tally.draft_accepted,
+            "config": {"model": self.engine.info.config_label or self.engine.info.model,
+                       "fingerprint": plan.fingerprint, "build": self.engine.info.build,
+                       "n_slots": self.engine.info.n_slots, "n_ctx_slot": self.engine.info.n_ctx_slot},
             "history_turns": len(plan.history) if plan.history_sent is None else plan.history_sent,
             "sampling": dict(self.engine.sampling),
             **tally.extra,
@@ -291,7 +318,9 @@ class QueryService:
         if t.part.visual:
             images = await asyncio.to_thread(self._page_bytes, t)
         await emit({"type": "target", "key": t.key, "status": "queued"})
+        queued = time.perf_counter()
         async with eng.pool.lease(PRIORITY_QUERY, f"query · {t.label}") as slot:
+            wait_ms = (time.perf_counter() - queued) * 1000
             if eng.info.fingerprint != plan.fingerprint:
                 raise QueryError("the model was switched while this query was running", 409)
             prefix = self.store.get_prefix_tokens(t.part.id)
@@ -327,14 +356,17 @@ class QueryService:
 
         tally.add(res)
         tally.restore_ms += restore_ms
+        tally.wait_ms += wait_ms
+        tally.kv_bytes += int(restored.get("n_read") or 0)
         tally.restored += min(res.n_cached, t.part.n_tokens)
         cache_miss = res.n_cached < t.part.n_tokens - 1
         if cache_miss:
             tally.cache_misses += 1
             log.warning("cache miss on %s: only %d/%d prefix tokens reused; check llama-server flags",
                         t.label, res.n_cached, t.part.n_tokens)
-        stats = {"slot": slot, "restore_ms": round(restore_ms, 1), "kv_bytes": restored.get("n_read"),
-                 "cache_miss": cache_miss, **res.stats()}
+        stats = {"slot": slot, "wait_ms": round(wait_ms, 1), "restore_ms": round(restore_ms, 1),
+                 "kv_bytes": restored.get("n_read"), "cache_miss": cache_miss, "n_ctx": eng.info.n_ctx_slot,
+                 **res.stats()}
         return res, stats
 
     async def _evidence(self, t: Target, answer: str, question: str) -> list[dict]:
@@ -467,10 +499,13 @@ class QueryService:
         async def on_piece(channel: str, text: str) -> None:
             await emit({"type": "delta", "channel": channel, "text": text})
 
+        queued = time.perf_counter()
         async with eng.pool.lease(PRIORITY_QUERY, "synthesis") as slot:
+            wait_ms = (time.perf_counter() - queued) * 1000
             res = await eng.generate(slot, prompt, layout, self.settings.max_final_tokens, on_piece)
         tally.add(res)
-        tally.extra["synthesis"] = res.stats()
+        tally.wait_ms += wait_ms
+        tally.extra["synthesis"] = {"slot": slot, "wait_ms": round(wait_ms, 1), "n_ctx": eng.info.n_ctx_slot, **res.stats()}
         return res.answer
 
     async def _partial(self, plan: Plan, group: list[tuple[str, str]], tally: Tally) -> tuple[str, str]:
