@@ -307,3 +307,48 @@ async def test_sliding_window_restore_reuse_is_checked(atlas, fake):
     await eng.probe_kv_dir()
     assert eng.info.swa_restore_ok is False
     assert not list(fake.kv_dir.glob("atlas-swa-probe*")), "the probe file is removed"
+
+
+
+def restart_with_slots(fake, n: int) -> None:
+    """llama-server comes back with another --parallel (a new process: new media marker)."""
+    fake.slots = {i: [] for i in range(n)}
+    fake.media_marker = f"<__media_{n}_{time.time()}__>"
+
+
+async def test_slot_count_change_keeps_caches_per_slot_count(atlas, fake):
+    """Standard llama.cpp only loads slot files saved with the same number of slots. Changing the
+    slot count must not throw the caches away: they stay valid for their slot count."""
+    doc = await add_text(atlas, "doc.txt", "The gearbox failed in April.")
+    s = atlas.app.state
+    fp_two = s.engine.info.fingerprint
+
+    restart_with_slots(fake, 3)
+    await monitor_step(s.engine, s.ingestor, None, s.store)
+    fp_three = s.engine.info.fingerprint
+    assert fp_three != fp_two and s.engine.stream_ident == 3
+    assert not (fake.kv_dir / "atlas-kv-epochs.json").exists(), "a slot-count change is not an incompatibility"
+    assert s.store.get_cache(doc["id"], fp_two).status == "ready", "the 2-slot caches are kept"
+    await wait_for(atlas, lambda ds: ds[0]["status"] == "ready" and ds[0]["fingerprint"] == fp_three)
+
+    # back to 2 slots: the original caches are used again, nothing is rebuilt
+    built = s.store.get_cache(doc["id"], fp_two).updated_at
+    restart_with_slots(fake, 2)
+    await monitor_step(s.engine, s.ingestor, None, s.store)
+    assert s.engine.info.fingerprint == fp_two and s.engine.stream_ident is None
+    docs = (await atlas.get("/api/documents")).json()
+    assert docs[0]["status"] == "ready" and s.store.get_cache(doc["id"], fp_two).updated_at == built
+    assert (await query(atlas, "What failed?", [doc["id"]]))[-1]["type"] == "done"
+
+
+async def test_slot_count_change_with_a_stream_agnostic_build(atlas, fake):
+    """With the patched loader slot files restore into any number of slots: nothing changes."""
+    fake.strict_streams = False
+    doc = await add_text(atlas, "doc.txt", "The gearbox failed in April.")
+    s = atlas.app.state
+    fp = s.engine.info.fingerprint
+    restart_with_slots(fake, 4)
+    await monitor_step(s.engine, s.ingestor, None, s.store)
+    assert s.engine.info.fingerprint == fp and s.engine.stream_ident is None
+    events = await query(atlas, "What failed?", [doc["id"]])
+    assert events[-1]["type"] == "done" and events[-1]["stats"]["cache_misses"] == 0

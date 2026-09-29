@@ -253,6 +253,21 @@ identical to a fresh run. Build it like any custom build and select it in the pr
 Atlas checks this whenever such a preset starts without `--swa-full`: it saves, restores and
 extends a window-sized prompt, and warns on the preset if the build prefills it again.
 
+### Changing the number of slots
+
+With `--no-kv-unified` llama.cpp keeps one KV stream per slot and writes the stream count into
+every slot file; standard builds refuse to load a file saved with a different number of slots
+("n_stream mismatch"), although a document's cache does not depend on it. The context per slot
+does not matter (as long as the parts still fit).
+
+Atlas notices this when a preset starts: if its canary was saved with another slot count and is
+rejected, the slot count becomes part of the cache configuration instead of the caches being
+declared incompatible. Each slot count then has its own caches, and switching back to a slot count
+used before is instant. A llama.cpp build with the stream fix (`state_read_sinfo` in
+`src/llama-kv-cache.cpp` loads a single sequence regardless of the stream count; included in
+`~/llama.cpp-v0.5.0-atlas/atlas-patches.patch` on the development machine) restores any slot file
+into any number of slots, so changing slots needs no prefill at all.
+
 Atlas must be the only client of its llama-server: in managed mode it listens on `127.0.0.1` only.
 
 ## Library and collections

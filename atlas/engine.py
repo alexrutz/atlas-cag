@@ -127,6 +127,10 @@ class Engine:
         self.restarted = False  # set by refresh() when llama-server was restarted since the last call
         # Set by the supervisor in managed mode: preset fields that define the KV-cache format.
         self.extra_ident: dict = {}
+        # Standard llama.cpp keeps one KV stream per slot (--no-kv-unified) and only loads slot files
+        # saved with the same number of streams. When a build turns out to be like that, the slot
+        # count becomes part of the configuration (set by probe_kv_dir, reset on every connect).
+        self.stream_ident: int | None = None
         # Set by the supervisor: the vision projector and image options (part of visual cache variants).
         self.vision_ident: str | None = None
         # Set by the supervisor from the active preset (llama-server request fields). Empty with an
@@ -154,6 +158,7 @@ class Engine:
             await self._connect()
 
     async def _connect(self) -> None:
+        self.stream_ident = None  # decided again by probe_kv_dir for this llama-server
         delay = 1.0
         while not await self.llama.health():
             self.info.connected = False
@@ -182,6 +187,8 @@ class Engine:
         self._instance = instance
 
         n_slots = int(props.get("total_slots") or 1)
+        if self.stream_ident and self.stream_ident != n_slots:
+            self.stream_ident = None  # restarted with another slot count: probe_kv_dir decides again
         n_ctx = int((props.get("default_generation_settings") or {}).get("n_ctx") or meta.get("n_ctx") or 0)
         model_path = props.get("model_path") or ""
         ident = {
@@ -194,6 +201,7 @@ class Engine:
             "prefix_version": prompts.PREFIX_VERSION,
             "system_prompt": hashlib.sha256(self.settings.system_prompt.encode()).hexdigest(),
             **self.extra_ident,
+            **({"streams": self.stream_ident} if self.stream_ident else {}),
         }
         self._ident = ident
         fingerprint = self._fingerprint()
@@ -320,7 +328,8 @@ class Engine:
         ref = await self._next_token(slot, tokens)
         refs = self._refs()
         if ref:
-            refs[self._base()] = {"token": ref[0], "logprob": ref[1], "build": self.info.build}
+            refs[self._base()] = {"token": ref[0], "logprob": ref[1], "build": self.info.build,
+                                  "streams": self.info.n_slots}
         else:
             refs.pop(self._base(), None)
         self._refs_file.write_text(json.dumps(refs))
@@ -350,9 +359,20 @@ class Engine:
                     try:
                         await self._restore_canary(slot)
                     except CacheRejected:
-                        self._bump_kv_epoch()
-                        rebuild = True
-                    else:
+                        if self._saved_with_other_slot_count():
+                            self._use_stream_config()  # the caches stay valid for their slot count
+                            canary = self.settings.kv_dir / self.canary_file
+                            rebuild = not canary.exists()
+                            if not rebuild:
+                                try:
+                                    await self._restore_canary(slot)
+                                except CacheRejected:
+                                    self._bump_kv_epoch()
+                                    rebuild = True
+                        else:
+                            self._bump_kv_epoch()
+                            rebuild = True
+                    if not rebuild:
                         ref = self._refs().get(self._base())
                         if ref is None:
                             rebuild = True  # canary from before references existed: re-create it
@@ -382,6 +402,24 @@ class Engine:
             self.info.error = f"slot persistence unavailable: {e}"
         if self.info.error:
             log.error(self.info.error)
+
+    def _saved_with_other_slot_count(self) -> bool:
+        """Whether a rejected canary may only have been saved with another number of slots."""
+        if self.stream_ident:
+            return False
+        saved = (self._refs().get(self._base()) or {}).get("streams")
+        return saved != self.info.n_slots  # also for canaries from before the count was recorded
+
+    def _use_stream_config(self) -> None:
+        old = self.info.fingerprint
+        saved = (self._refs().get(self._base()) or {}).get("streams")
+        self.stream_ident = self.info.n_slots
+        self._ident["streams"] = self.stream_ident
+        self.info.fingerprint = self._fingerprint()
+        log.warning("this llama-server cannot load slot files saved with %s slot(s) into %d slots (standard "
+                    "llama.cpp keeps one KV stream per slot): caches for %d slots are kept separately "
+                    "(fingerprint %s -> %s); the existing ones stay valid for their slot count",
+                    saved or "another number of", self.info.n_slots, self.info.n_slots, old, self.info.fingerprint)
 
     async def _probe_swa_restore(self, slot: int) -> None:
         """Check that llama-server reuses a restored cache of a sliding-window model.

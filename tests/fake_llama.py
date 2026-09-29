@@ -70,6 +70,9 @@ class FakeLlama:
         # like stock llama-server with a sliding-window model and no --swa-full: a restored slot
         # is never reused, everything is prefilled again
         self.swa_restore_bug = False
+        # like standard llama.cpp with --no-kv-unified: slot files only load into a server with the
+        # same number of slots (KV streams); False behaves like the patched build
+        self.strict_streams = True
         self.restored: set[int] = set()
         self.app = self._build()
 
@@ -154,7 +157,8 @@ class FakeLlama:
                 return error(400, "Invalid filename")
             path = fake.kv_dir / filename
             if action == "save":
-                path.write_text(json.dumps({"format": fake.kv_format, "tokens": fake.slots[slot]}))
+                path.write_text(json.dumps({"format": fake.kv_format, "tokens": fake.slots[slot],
+                                            "streams": len(fake.slots)}))
                 return {"id_slot": slot, "filename": filename, "n_saved": len(fake.slots[slot]),
                         "n_written": path.stat().st_size}
             if action == "restore":
@@ -164,6 +168,8 @@ class FakeLlama:
                 saved = json.loads(path.read_text()) if path.exists() else None
                 if not saved or saved["format"] != fake.kv_format:
                     return error(400, "Unable to restore slot: invalid slot save file")
+                if fake.strict_streams and saved.get("streams", len(fake.slots)) != len(fake.slots):
+                    return error(400, "Unable to restore slot: No available space in KV cache or invalid slot save file")
                 fake.slots[slot] = saved["tokens"]
                 fake.restored.add(slot)
                 return {"id_slot": slot, "filename": filename, "n_restored": len(fake.slots[slot]),
