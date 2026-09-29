@@ -17,10 +17,12 @@ model reads the complete document every time, at a fraction of the prefill cost.
 
 The UI has four modules, one tab each:
 
-- **Chat**: tick documents or whole collections and chat with them. Earlier questions and
-  answers go along with every question, as chat turns after each cached document.
-- **Library**: manage documents and collections: upload, move, switch between text and visual
-  prefill, rebuild caches, inspect parts and caches, bulk actions.
+- **Chat**: tick documents, whole collections or chapters and chat with them. Earlier questions
+  and answers go along with every question, as chat turns after each cached document. Click a
+  citation or a quote to see the passage in the document, highlighted on its page.
+- **Library**: manage documents and collections: chapters (nested collections) for documents
+  split into many parts, upload, move and reorder, switch between text and visual prefill,
+  rebuild caches, inspect parts and caches, bulk actions.
 - **PDF tools**: cut large PDFs into shards (by chapters, token budget, page count or ranges) and
   estimate tokens, cache size and prefill time of any text or file.
 - **Settings**: presets (how llama-server runs a model: GGUF file, slots, context, KV cache,
@@ -272,23 +274,35 @@ Atlas must be the only client of its llama-server: in managed mode it listens on
 
 ## Library and collections
 
-Every document lives in one collection or in *Unfiled*. The **Library** tab manages them:
+Every document lives in one collection or in *Unfiled*. Collections nest: a collection can hold
+chapters (collections inside it) next to its documents, so a long document split into many
+documents can be structured like the original, e.g. the first eight shards form chapter 1.
+Chapters and documents keep an order (by default the order they were added, which for shards is
+the page order). The **Library** tab manages them:
 
-- the collections panel lists each collection with its documents and tokens; click one to show
-  it, use its ⋯ menu to upload into it, rename it, ask all of it in chat or delete it (its
-  documents move to Unfiled unless you delete them as well);
-- the table lists documents with collection, prefill mode, pages, tokens, parts, KV cache size,
-  file size, state and age; sort by any column, filter by name, state and prefill mode;
-- tick documents for bulk actions: ask in chat, move, switch prefill, rebuild caches, delete;
-- drag rows onto a collection to move them; drop files anywhere on the page to upload (into the
-  collection and prefill mode chosen above the table);
+- the collections panel shows the tree with documents and tokens per collection (a collection
+  counts its chapters too); click one to show it with everything in it; its ⋯ menu uploads into
+  it, adds a chapter inside, renames, moves it up, down or into another collection, asks all of it
+  in chat or deletes it (its documents and chapters move up to its parent unless you delete them
+  as well);
+- the table lists documents in library order (the # column) with where they are, prefill mode,
+  pages, tokens, parts, KV cache size, file size, state and age; sort by any column, filter by
+  name, state and prefill mode;
+- tick documents for bulk actions (shift-click ticks a range): ask in chat, **Group as chapter**
+  (a new chapter made of them, placed where the first of them was, in the innermost collection
+  that holds all of them), move, switch prefill, rebuild caches, delete;
+- drag rows onto another row to put them before it (in library order), or onto a collection to
+  move them there; drop files anywhere on the page to upload (into the collection and prefill
+  mode chosen above the table);
 - click a document for its details: parts for the running model, its caches in every model
   configuration, text or page preview, download of the original file, and a shortcut to the PDF
   tools.
 
-In the **Chat** tab the left column only selects: a collection's checkbox selects all of its ready
-documents, a partially selected collection shows a dash. The query API takes `document_ids`,
-`collection_ids` or both.
+In the **Chat** tab the left column shows the same tree and only selects: a collection's or
+chapter's checkbox selects all ready documents in it, a partially selected one shows a dash, and
+a fully selected chapter becomes one chip above the question. Documents are always answered and
+cited in library order, so the citations of a chapter follow its pages. The query API takes
+`document_ids`, `collection_ids` (with their chapters) or both.
 
 ## PDF tools
 
@@ -316,8 +330,11 @@ a page to leave it out):
 
 The shard list shows pages and tokens per shard and flags shards that would still need several
 parts. Names default to the chapter title or page range and can be edited. **Add to the library**
-creates one document per shard (in a chosen collection, text or visual prefill); **Download
-(.zip)** saves the shard PDFs. Analyzed PDFs are kept for a day in `data/tools/`.
+creates one document per shard (in a chosen collection, text or visual prefill). With **Chapter
+folders** (for PDFs with nested bookmarks) each shard is filed into chapters named after the
+bookmarks it belongs to, e.g. `Manual › Part B › Chapter 3`, so a chapter can be asked as a whole;
+when cutting by chapters of level L, only the levels above L make folders. **Download (.zip)**
+saves the shard PDFs. Analyzed PDFs are kept for a day in `data/tools/`.
 
 **Token estimator**: paste text or drop a file to get its exact token count, words and characters,
 and for the running model the KV cache (= slot file) size, the prefill time at the speed measured
@@ -390,6 +407,29 @@ to a document part; the answer footer says how many earlier turns were sent. If 
 renders the first turn differently in a longer chat, the earlier turns go into the question as
 text instead. Switch the history off under **Settings → Generation → Chat**
 (`ATLAS_CHAT_HISTORY=false`).
+
+## Sources
+
+Answers quote the document: per-document answers are asked to quote the passages they answer
+from (the benchmarked map prompt), and single-document answers to support the answer with short
+verbatim quotes. When an answer is done, Atlas locates every quote in the document's text
+(`atlas/evidence.py`):
+
+- matching ignores what text extraction does to a PDF (line breaks, hyphenation, split words,
+  spacing) and finds quotes the model shortened with "…"; a quote with a few words changed is
+  found approximately and marked as such;
+- the passage is mapped to its page, and on PDFs to boxes on the rendered page (via pdfium's text
+  layer), preferring the document part the answer came from;
+- a quote that is not in the document is flagged ("not found in the document"): the model
+  paraphrased it, or the statement is not backed by the source.
+
+Quotes in an answer are underlined with their page next to them, and a **Sources** row under
+each answer lists them. Clicking a quote, a page chip or a citation `[n]` in a synthesized answer
+opens the source panel: the page with the passage highlighted (browse to the neighboring pages),
+the text around it, and a button that opens the full text scrolled to the passage. A citation
+opens the quote of that finding that best matches the sentence it stands in. Turns recorded
+before quotes were located get a **Find the quoted passages** link. Visual documents without a
+text layer have nothing to match quotes against.
 
 ## Limits and thinking
 
@@ -542,13 +582,15 @@ answer:
 | method and path | purpose |
 |---|---|
 | `GET /api/status` | engine, server, slots, leases, totals, limits |
-| `GET /api/collections` · `POST` · `PATCH /{id}` · `DELETE /{id}?delete_documents=` | collections |
+| `GET /api/collections` · `POST` · `PATCH /{id}` · `DELETE /{id}?delete_documents=` | collections; `POST {name, parent_id?, document_ids?}` creates a chapter made of documents, `PATCH {name?, parent_id?}` renames or moves |
+| `POST /api/library/order` | `{parent_id, items: [{kind: "collection"\|"document", id}]}` puts items into a collection in this order |
 | `GET /api/documents` | library with the cache status for the active configuration |
 | `POST /api/documents` | multipart upload (`files`, optional `collection_id` and `mode` = `text`/`visual`), deduplicated by SHA-256 |
 | `POST /api/documents/text` | `{name, text, collection_id?}` |
 | `GET` / `PATCH /api/documents/{id}` | details (parts) / rename, move or switch prefill (`{name?, collection_id?, mode?}`) |
 | `GET /api/documents/{id}/text` · `GET …/original` · `POST …/reingest` · `DELETE …` | |
 | `GET /api/documents/{id}/pages/{n}` | page image (PNG) of a PDF or image |
+| `POST /api/documents/{id}/evidence` · `GET …/passage?start=&end=` · `GET …/boxes/{page}?start=&end=` · `GET …/render/{page}?width=` | sources: locate an answer's quotes, a passage with its context, its boxes on a page, a rendered page |
 | `POST /api/query` | `{question, document_ids?, collection_ids?, thinking?, conversation_id?}` → Server-Sent Events |
 | `GET /api/conversations` · `POST` · `GET /{id}` (with turns) · `PATCH /{id}` · `DELETE /{id}` | conversations |
 | `GET /api/presets` · `POST` · `PUT /{id}` · `DELETE /{id}` · `POST /{id}/activate` | presets (managed mode) |
@@ -559,12 +601,14 @@ answer:
 | `GET` / `PATCH /api/settings` | runtime settings (`null` resets a value) |
 | `GET /api/caches` · `DELETE /api/caches/{fingerprint}` | caches per configuration |
 | `GET /api/queries` | query log with stats |
-| `POST /api/tools/pdf` (multipart `file` or form `doc_id`) · `GET …/{id}/thumb/{page}` · `POST …/{id}/shards` · `POST …/{id}/zip` · `DELETE …/{id}` | PDF analysis, thumbnails, shards into the library or as a ZIP |
+| `POST /api/tools/pdf` (multipart `file` or form `doc_id`) · `GET …/{id}/thumb/{page}` · `POST …/{id}/shards` · `POST …/{id}/zip` · `DELETE …/{id}` | PDF analysis, thumbnails, shards into the library (each optionally with `folder`: chapter names) or as a ZIP |
 | `POST /api/tools/estimate` (form `text` or multipart `file`) | token estimate with KV size, prefill time and parts |
 | `GET /healthz` | unauthenticated liveness |
 
-Query events: `plan` (includes the conversation and the number of earlier turns), `target` (status `queued`, `restoring`, `generating`, `done`, `irrelevant`
-or `error`, with per-call stats), `target_delta`, `synthesis`, `delta` (channel `answer` or
+Query events: `plan` (includes the conversation, the number of earlier turns and per target the
+collection path), `target` (status `queued`, `restoring`, `generating`, `done`, `irrelevant` or
+`error`, with per-call stats; `done` carries `evidence`: each quote with `found`, `start`/`end` in
+the document text, `page`, `score`), `target_delta`, `synthesis`, `delta` (channel `answer` or
 `reasoning`), `done` (answer and stats), `error`, and `ping` as a keep-alive.
 
 ## Development
@@ -590,12 +634,13 @@ atlas/
   prompts.py     chat-template layout via sentinels, prompt blocks, reasoning splitter
   sampling.py    preset sampling defaulting to the model file's general.sampling.* recommendations
   slots.py       prioritized exclusive slot leases (pausable, resizable)
-  store.py       SQLite: collections, documents, caches per configuration, parts, presets, settings,
-                 conversations and their turns
+  store.py       SQLite: collections (nested, ordered), documents, caches per configuration, parts,
+                 presets, settings, conversations and their turns
   chunking.py    token-budgeted splitting at natural boundaries
   extract.py     PDF / DOCX / HTML / text extraction
   pages.py       page images for visual prefill (PDF rendering, image normalization)
   pdftools.py    PDF analysis (pages, text, bookmarks), thumbnails, shards
+  evidence.py    locating an answer's quotes in the document: pages, boxes on the PDF page
   static/        single-page UI, no build step: app.js (core, router, chat), library.js,
                  tools.js (PDF tools, estimator), settings.js
 ```

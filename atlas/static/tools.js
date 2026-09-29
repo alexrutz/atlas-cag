@@ -20,6 +20,7 @@
     align: true,
     ranges: "",
     collection: store.get("atlas.uploadTarget", ""),
+    folders: store.get("atlas.tools.folders", 1),  // chapter folders from this many bookmark levels (0: none)
     mode: null,
     loading: false,
     built: false,
@@ -206,7 +207,8 @@
     const keptTokens = kept.reduce((s, p) => s + pageTokens(p), 0);
     $("#pdf-status").textContent = `${pdf.name} · ${pdf.n_pages} pages · ${fmtInt(pdf.total_tokens)} tokens${pdf.exact ? "" : " (estimated)"}`;
     const levels = [...new Set(pdf.outline.map((o) => o.level))].sort();
-    const colls = [["", "Unfiled"], ...A.state.collections.map((c) => [c.id, c.name])];
+    const colls = [["", "Unfiled"], ...A.groups().filter((g) => g.id).map((g) => [g.id, A.indent(g.depth) + g.name])];
+    const folderLevels = levels.slice(0, -1);  // the deepest level names the shards themselves
     const tooBig = list.filter((s) => !s.fits).length;
     $("#pdf-work").innerHTML = `
       <div class="pdf-summary">
@@ -252,6 +254,9 @@
       <div class="shard-out">
         <label>Collection <select id="out-coll">${colls.map(([v, n]) => `<option value="${esc(v)}" ${v === t.collection ? "selected" : ""}>${esc(n)}</option>`).join("")}</select></label>
         <button class="link-btn small" data-act="new-coll">new collection</button>
+        ${folderLevels.length ? `<label title="File each shard into chapter collections named after the bookmarks it belongs to, so a chapter can be asked as a whole">Chapter folders
+          <select id="out-folders"><option value="0" ${t.folders ? "" : "selected"}>none</option>${folderLevels.map((l, i) =>
+            `<option value="${i + 1}" ${t.folders === i + 1 ? "selected" : ""}>${i ? `levels ${levels[0]}–${l}` : `level ${l}`} bookmarks</option>`).join("")}</select></label>` : ""}
         <label>Prefill <select id="out-mode"><option value="text" ${t.mode === "text" ? "selected" : ""}>extracted text</option>
           <option value="visual" ${t.mode === "visual" ? "selected" : ""}>page images</option></select></label>
         <span class="spacer"></span>
@@ -304,10 +309,43 @@
 
   // ---------------------------------------------------------------- output
 
-  const shardPayload = () => shards().map((s) => ({ name: s.name, pages: s.pages }));
+  // the bookmarks a page belongs to, outermost first, down to `depth` levels: the chapter folders
+  // a shard starting on that page is filed in
+  function folderFor(page, depth) {
+    const outline = t.pdf.outline;
+    if (!outline.length || depth < 1) return [];
+    const top = Math.min(...outline.map((o) => o.level));
+    const path = [];
+    let from = 0;
+    for (let level = top; level < top + depth; level++) {
+      let pick = -1;
+      for (let i = from; i < outline.length; i++) {
+        const o = outline[i];
+        if (o.level < level) break;  // the enclosing chapter ended
+        if (o.page > page) break;
+        if (o.level === level) pick = i;
+      }
+      if (pick < 0) break;
+      path.push(outline[pick].title);
+      from = pick + 1;
+    }
+    return path;
+  }
+
+  function folderDepth() {
+    if (!t.pdf?.outline.length) return 0;
+    // cut by chapters of level L: each shard is one chapter, so only the levels above L make folders
+    const top = Math.min(...t.pdf.outline.map((o) => o.level));
+    return t.strategy === "chapters" ? Math.min(t.folders, t.level - top) : t.folders;
+  }
+
+  const shardPayload = (withFolders = false) => shards().map((s) => ({
+    name: s.name, pages: s.pages, ...(withFolders && folderDepth() > 0 ? { folder: folderFor(s.first, folderDepth()) } : {}),
+  }));
 
   async function addToLibrary() {
-    const body = { shards: shardPayload(), collection_id: t.collection || null, mode: t.mode };
+    const levels = new Set(t.pdf.outline.map((o) => o.level)).size;
+    const body = { shards: shardPayload(levels > 1), collection_id: t.collection || null, mode: t.mode };
     try {
       const { results } = await (await api(`/api/tools/pdf/${t.pdf.id}/shards`, { method: "POST", json: body })).json();
       const added = results.filter((r) => r.document && !r.duplicate).length;
@@ -422,6 +460,9 @@
         applyStrategy();
       } else if (e.target.id === "out-coll") {
         t.collection = e.target.value;
+      } else if (e.target.id === "out-folders") {
+        t.folders = +e.target.value;
+        store.set("atlas.tools.folders", t.folders);
       } else if (e.target.id === "out-mode") {
         t.mode = e.target.value;
       } else if (e.target.classList.contains("shard-name")) {

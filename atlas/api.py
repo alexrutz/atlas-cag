@@ -17,7 +17,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
-from . import __version__, builds, models, pdftools
+from . import __version__, builds, evidence, models, pdftools
 from . import pages as page_images
 from .config import RUNTIME_FIELDS, RuntimeSettings, Settings, get_settings
 from .downloads import Downloader, DownloadError
@@ -48,8 +48,31 @@ class DocumentUpdate(BaseModel):
     mode: Literal["text", "visual"] | None = None  # prefill from extracted text or from page images
 
 
-class CollectionBody(BaseModel):
+class CollectionCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
+    parent_id: str | None = None  # nested in this collection (a chapter of it)
+    document_ids: list[str] = Field(default_factory=list, max_length=10000)  # moved into it, keeping their order
+
+
+class CollectionUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    parent_id: str | None = None  # moves the collection when given (null: to the top level)
+
+
+class OrderItem(BaseModel):
+    kind: Literal["collection", "document"]
+    id: str
+
+
+class OrderRequest(BaseModel):
+    parent_id: str | None = None  # null: top level (collections) / unfiled (documents)
+    items: list[OrderItem] = Field(max_length=20000)
+
+
+class EvidenceRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=400_000)  # an answer: its quotes are located
+    question: str = Field(default="", max_length=400_000)
+    part: int | None = Field(default=None, ge=1)  # prefer the passage in this part (running model)
 
 
 class QueryRequest(BaseModel):
@@ -63,6 +86,8 @@ class QueryRequest(BaseModel):
 class ShardSpec(BaseModel):
     name: str = Field(min_length=1, max_length=5000)  # shortened to a file name when the shard is stored
     pages: list[int] = Field(min_length=1, max_length=10000)
+    # chapter collections to put the shard in, outermost first (nested in the target collection)
+    folder: list[str] = Field(default_factory=list, max_length=8)
 
 
 class ShardRequest(BaseModel):
@@ -212,8 +237,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return [{**c.to_json(), "n_docs": counts.get(c.id, 0)} for c in s.store.list_collections()]
 
     @api.post("/collections")
-    async def create_collection(request: Request, body: CollectionBody):
-        return st(request).store.create_collection(body.name.strip()).to_json()
+    async def create_collection(request: Request, body: CollectionCreate):
+        """Create a collection, optionally nested in another one and holding the given documents
+        (a chapter made of them, placed where the first of them was)."""
+        s = st(request)
+        parent = check_collection(s, body.parent_id)
+        docs = [get_doc_or_404(s, doc_id) for doc_id in dict.fromkeys(body.document_ids)]
+        position = min(d.order for d in docs) if docs else None
+        c = s.store.create_collection(body.name.strip(), parent, position)
+        for d in docs:
+            s.store.update_document(d.id, collection_id=c.id)  # positions kept: the order stays
+        return c.to_json()
 
     def get_collection_or_404(s, collection_id: str):
         c = s.store.get_collection(collection_id)
@@ -221,24 +255,59 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(404, "collection not found")
         return c
 
+    def check_parent(s, collection_id: str, parent_id: str | None) -> str | None:
+        """A collection can move anywhere except into itself or one of its own chapters."""
+        parent = check_collection(s, parent_id)
+        if parent and parent in s.store.subtree(collection_id):
+            raise HTTPException(400, "a collection cannot be moved into itself or into one of its chapters")
+        return parent
+
     @api.patch("/collections/{collection_id}")
-    async def rename_collection(request: Request, collection_id: str, body: CollectionBody):
+    async def update_collection(request: Request, collection_id: str, body: CollectionUpdate):
         s = st(request)
-        get_collection_or_404(s, collection_id)
-        s.store.rename_collection(collection_id, body.name.strip())
+        c = get_collection_or_404(s, collection_id)
+        fields = {}
+        if body.name:
+            fields["name"] = body.name.strip()
+        if "parent_id" in body.model_fields_set:
+            parent = check_parent(s, collection_id, body.parent_id)
+            if parent != c.parent_id:
+                fields.update(parent_id=parent, position=None)  # goes after what is already there
+        if fields:
+            s.store.update_collection(collection_id, **fields)
         return s.store.get_collection(collection_id).to_json()
 
     @api.delete("/collections/{collection_id}")
     async def delete_collection(request: Request, collection_id: str, delete_documents: bool = False):
+        """Without delete_documents, the collection's documents and chapters move up to its parent."""
         s = st(request)
         get_collection_or_404(s, collection_id)
         deleted = []
         if delete_documents:
-            for d in s.store.list_documents(collection_id):
+            subtree = s.store.subtree(collection_id)
+            for d in s.store.documents_under(collection_id):
                 remove_document(s, d.id)
                 deleted.append(d.id)
-        s.store.delete_collection(collection_id)  # remaining documents become unfiled
+            for cid in reversed(subtree[1:]):
+                s.store.delete_collection(cid)
+        s.store.delete_collection(collection_id)
         return {"deleted": collection_id, "deleted_documents": deleted}
+
+    @api.post("/library/order")
+    async def order_library(request: Request, body: OrderRequest):
+        """Put collections and documents into a collection (or the top level) in the given order."""
+        s = st(request)
+        parent = check_collection(s, body.parent_id)
+        items = []
+        for item in body.items:
+            if item.kind == "collection":
+                get_collection_or_404(s, item.id)
+                check_parent(s, item.id, parent)
+            else:
+                get_doc_or_404(s, item.id)
+            items.append((item.kind, item.id))
+        s.store.set_order(parent, items)
+        return {"ok": True}
 
     # --- documents ---------------------------------------------------------------------
 
@@ -385,9 +454,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         fields = {}
         if "name" in body.model_fields_set and body.name:
             fields["name"] = body.name.strip()
+        doc = s.store.get_document(doc_id)
         if "collection_id" in body.model_fields_set:
             fields["collection_id"] = check_collection(s, body.collection_id)
-        doc = s.store.get_document(doc_id)
+            if fields["collection_id"] != doc.collection_id:
+                fields["position"] = None  # goes after what is already there
         if body.mode and body.mode != doc.mode:
             if body.mode == "visual" and not page_images.supports_visual(doc.name):
                 raise HTTPException(400, "visual prefill works for PDFs and images")
@@ -424,6 +495,97 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def get_document_text(request: Request, doc_id: str):
         get_doc_or_404(st(request), doc_id)
         return (settings.docs_dir / doc_id / "text.txt").read_text(encoding="utf-8")
+
+    # --- sources: where an answer's quotes are in a document ----------------------------------
+
+    def doc_text(s, doc_id: str) -> evidence.DocText:
+        path = settings.docs_dir / doc_id / "text.txt"
+        if not path.exists():
+            raise HTTPException(404, "the document's text is missing")
+        return s.queries.texts.get(path)
+
+    @api.post("/documents/{doc_id}/evidence")
+    async def locate_evidence(request: Request, doc_id: str, body: EvidenceRequest):
+        """Locate the passages an answer quotes (for answers recorded before quotes were located)."""
+        s = st(request)
+        get_doc_or_404(s, doc_id)
+        text = await asyncio.to_thread(doc_text, s, doc_id)
+        prefer = None
+        if body.part and s.engine.info.fingerprint:
+            parts = s.store.get_parts(doc_id, s.engine.info.fingerprint, with_tokens=False)
+            if body.part <= len(parts):
+                p = parts[body.part - 1]
+                prefer = text.pages_span(p.char_start + 1, p.char_end) if p.visual else (p.char_start, p.char_end)
+        return {"evidence": await asyncio.to_thread(text.evidence, body.text, body.question, prefer)}
+
+    @api.get("/documents/{doc_id}/passage")
+    async def get_passage(request: Request, doc_id: str, start: int, end: int, context: int = 700):
+        """A located passage with the text around it, and the pages it is on."""
+        s = st(request)
+        doc = get_doc_or_404(s, doc_id)
+        text = await asyncio.to_thread(doc_text, s, doc_id)
+        n = len(text.text)
+        start, end = max(0, min(start, n)), max(0, min(end, n))
+        if end < start:
+            raise HTTPException(400, "end is before start")
+        context = max(0, min(context, 20000))
+        a = max(0, start - context)
+        b = min(n, end + context)
+        if a > 0:  # start and end the excerpt at a word break
+            cut = text.text.find(" ", a, start)
+            a = cut + 1 if cut >= 0 else a
+        if b < n:
+            cut = text.text.rfind(" ", end, b)
+            b = cut if cut > end else b
+        return {"doc_id": doc_id, "name": doc.name, "start": start, "end": end, "before": text.text[a:start],
+                "passage": text.text[start:end], "after": text.text[end:b], "truncated_before": a > 0,
+                "truncated_after": b < n, "page": text.page_at(start), "page_end": text.page_at(max(start, end - 1)),
+                "n_pages": doc.n_pages, "pdf": PurePath(doc.name).suffix.lower() == ".pdf"}
+
+    def original_pdf(doc_id: str) -> Path:
+        original = next((settings.docs_dir / doc_id).glob("original*"), None)
+        if original is None or original.suffix.lower() != ".pdf":
+            raise HTTPException(404, "this document is not a PDF")
+        return original
+
+    @api.get("/documents/{doc_id}/boxes/{page}")
+    async def get_passage_boxes(request: Request, doc_id: str, page: int, start: int, end: int):
+        """Where the part of a located passage that is on `page` appears on the rendered page."""
+        s = st(request)
+        get_doc_or_404(s, doc_id)
+        original = original_pdf(doc_id)
+        text = await asyncio.to_thread(doc_text, s, doc_id)
+        span = text.page_range(page)
+        if span is None:
+            return {"boxes": [], "score": 0.0}
+        a, b = max(start, span[0]), min(end, span[1])
+        if b - a < 4:
+            return {"boxes": [], "score": 0.0}
+        try:
+            return await asyncio.to_thread(evidence.page_boxes, original.read_bytes(), page, text.text[a:b])
+        except ValueError as e:
+            raise HTTPException(404, str(e)) from e
+
+    @api.get("/documents/{doc_id}/render/{n}")
+    async def render_document_page(request: Request, doc_id: str, n: int, width: int = 900):
+        """One page of a PDF (or an image document) as PNG, for viewing a source."""
+        doc = get_doc_or_404(st(request), doc_id)
+        folder = settings.docs_dir / doc_id
+        width = max(200, min(width, 2000)) // 100 * 100  # a few sizes, so the disk cache is reused
+        if page_images.is_image(doc.name):
+            pages = await asyncio.to_thread(page_images.ensure_pages, next(folder.glob("original*")), folder,
+                                            settings.visual_dpi)
+            return FileResponse(pages[0], media_type="image/png")
+        original = original_pdf(doc_id)
+        cached = folder / "view" / f"page-{n}-{width}.png"
+        if not cached.exists():
+            try:
+                png = await asyncio.to_thread(pdftools.thumbnail, original.read_bytes(), n, width)
+            except pdftools.PdfToolError as e:
+                raise HTTPException(404, str(e)) from e
+            cached.parent.mkdir(exist_ok=True)
+            cached.write_bytes(png)
+        return FileResponse(cached, media_type="image/png", headers={"Cache-Control": "private, max-age=86400"})
 
     @api.post("/documents/{doc_id}/reingest")
     async def reingest_document(request: Request, doc_id: str):
@@ -543,6 +705,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except pdftools.PdfToolError as e:
             raise HTTPException(400, str(e)) from e
         results, taken = [], set()
+        folders: dict[tuple[str, ...], str | None] = {(): collection_id}
+
+        def folder_for(path: list[str]) -> str | None:
+            """The chapter collection for a shard, created on first use (nested in the target)."""
+            path = [" ".join(p.split())[:120] for p in path if p.strip()]
+            for depth in range(1, len(path) + 1):
+                key = tuple(path[:depth])
+                if key not in folders:
+                    parent = folders[key[:-1]]
+                    existing = next((c for c in s.store.list_collections()
+                                     if c.parent_id == parent and c.name == key[-1]), None)
+                    folders[key] = existing.id if existing else s.store.create_collection(key[-1], parent).id
+            return folders[tuple(path)]
+
         for shard in body.shards:
             name = pdftools.shard_filename(shard.name, taken)
             try:
@@ -551,7 +727,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             except (pdftools.PdfToolError, ExtractionError, page_images.PageError) as e:
                 results.append({"name": name, "error": str(e)})
                 continue
-            result = register(s, name, "application/pdf", shard_data, prepared["text"], collection_id,
+            result = register(s, name, "application/pdf", shard_data, prepared["text"], folder_for(shard.folder),
                               prepared["mode"], prepared["n_pages"])
             if prepared["note"]:
                 result["note"] = prepared["note"]

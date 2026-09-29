@@ -100,15 +100,23 @@ class FakeLlama:
             return f"Synthesized from {text.count('Source:')} findings [1]."
         if "[image " in text:
             return f"Saw {text.count('[image ')} page image(s)."
+        question = text.rsplit("Question: ", 1)[1].split("\n\n", 1)[0].lower() if "Question: " in text else ""
+        source = text[text.find("<document"): text.find("</document>")]
+        doc = source.lower()
+        hits = [w for w in re.findall(r"[a-z0-9]{4,}", question) if w in doc]
+        quoted = ""
+        if "quote" in question and hits:  # quote the document's sentence with the first word asked about
+            body = source.split(">", 1)[1] if ">" in source else source
+            sentence = next(x for x in re.split(r"(?<=[.!?])\s+", body) if hits[0] in x.lower())
+            quoted = f' The document says: "{sentence.strip()}"'
+            if "invent" in question:
+                quoted += ' and "the turbine must be inspected every full moon by a wizard"'
         if "Quote the passages" in text:  # map phase
-            doc = text[text.find("<document"): text.find("</document>")].lower()
-            question = text.rsplit("Question: ", 1)[1].split("\n\n", 1)[0].lower()
-            hits = [w for w in re.findall(r"[a-z0-9]{4,}", question) if w in doc]
             rated = "COVERAGE: none" in text
             if hits:
-                return f"Found {hits[0]} in the document." + ("\nCOVERAGE: full" if rated else "")
+                return f"Found {hits[0]} in the document.{quoted}" + ("\nCOVERAGE: full" if rated else "")
             return "The document does not cover this." + ("\nCOVERAGE: none" if rated else "")
-        return "Single answer."
+        return f"Single answer.{quoted}"
 
     def _build(self) -> FastAPI:
         app = FastAPI()

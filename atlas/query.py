@@ -16,6 +16,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 
+from . import evidence
 from . import pages as page_images
 from . import prompts
 from .config import Settings
@@ -46,6 +47,7 @@ class Target:
     part: Part
     n_parts: int
     dpi: int | None = None  # visual parts: resolution of the page images that were prefilled
+    path: list[str] = field(default_factory=list)  # the collections (chapters) the document is in
 
     @property
     def key(self) -> str:
@@ -64,7 +66,7 @@ class Target:
         return {
             "key": self.key, "n": self.n, "doc_id": self.doc.id, "doc_name": self.doc.name,
             "part": self.part.idx + 1, "n_parts": self.n_parts, "n_tokens": self.part.n_tokens,
-            "label": self.label, "visual": self.part.visual,
+            "label": self.label, "visual": self.part.visual, "path": self.path,
         }
 
 
@@ -113,6 +115,7 @@ class QueryService:
         self.store = store
         self.ingestor = ingestor
         self.settings = settings
+        self.texts = evidence.TextCache()
         self._running: set[asyncio.Task] = set()
 
     # --- planning ----------------------------------------------------------------------
@@ -133,10 +136,13 @@ class QueryService:
             if self.store.get_collection(cid) is None:
                 raise QueryError(f"collection {cid} not found", 404)
             ready = self.store.caches_for(fp)
-            ids += [d.id for d in self.store.list_documents(cid) if (c := ready.get(d.id)) and c.status == "ready"]
+            ids += [d.id for d in self.store.documents_under(cid) if (c := ready.get(d.id)) and c.status == "ready"]
         doc_ids = list(dict.fromkeys(ids))
         if not doc_ids:
             raise QueryError("select at least one ready document")
+        # library order: the parts of a long document and its chapters are answered and cited in order
+        order = self.store.library_order()
+        doc_ids.sort(key=lambda d: order.get(d, len(order)))
 
         targets: list[Target] = []
         for doc_id in doc_ids:
@@ -153,10 +159,11 @@ class QueryService:
                     status = "built for a different prefill mode"
                 raise QueryError(f"'{doc.name}' has no ready KV cache for the current model ({status})", 409)
             dpi = int(wanted.rsplit(":", 1)[1]) if wanted.startswith("visual:") else None
+            path = [c.name for c in self.store.collection_path(doc.collection_id)]
             # prefix tokens are loaded per call while a slot is leased, bounding memory by slots
             parts = self.store.get_parts(doc_id, fp, with_tokens=False)
             for p in parts:
-                targets.append(Target(len(targets) + 1, doc, p, len(parts), dpi))
+                targets.append(Target(len(targets) + 1, doc, p, len(parts), dpi, path))
 
         if self.settings.max_question_tokens:
             n_q = await self.engine.count(question)
@@ -330,6 +337,27 @@ class QueryService:
                  "cache_miss": cache_miss, **res.stats()}
         return res, stats
 
+    async def _evidence(self, t: Target, answer: str, question: str) -> list[dict]:
+        """Where the answer's quotes are in the document (preferring the part it was given)."""
+        try:
+            return await asyncio.to_thread(self._locate, t, answer, question)
+        except Exception:
+            log.exception("locating the quotes of %s failed", t.label)
+            return []
+
+    def _locate(self, t: Target, answer: str, question: str) -> list[dict]:
+        path = self.settings.docs_dir / t.doc.id / "text.txt"
+        if not path.exists():
+            return []
+        doc = self.texts.get(path)
+        if not doc.text.strip():
+            return []  # visual document without a text layer: nothing to match quotes against
+        if t.part.visual:
+            prefer = doc.pages_span(t.part.char_start + 1, t.part.char_end)
+        else:
+            prefer = (t.part.char_start, t.part.char_end)
+        return doc.evidence(answer, question, prefer)
+
     def _page_bytes(self, t: Target) -> list[bytes]:
         folder = page_images.page_dir(self.settings.docs_dir / t.doc.id, t.dpi or self.settings.visual_dpi)
         pages = page_images.list_pages(folder)[t.part.char_start:t.part.char_end]
@@ -352,7 +380,8 @@ class QueryService:
 
         res, stats = await self._answer_target(plan, t, prompts.single_question_block(plan.question),
                                                emit, tally, on_piece)
-        await emit({"type": "target", "key": t.key, "status": "done", "stats": stats})
+        await emit({"type": "target", "key": t.key, "status": "done", "stats": stats,
+                    "evidence": await self._evidence(t, res.answer, plan.question)})
         if not res.answer:
             raise QueryError("the model produced no answer (token limit reached?)", 502)
         return res.answer
@@ -378,7 +407,8 @@ class QueryService:
             return "error", None, None
         dropped = self.settings.relevance_filter and (coverage == "none" or prompts.is_no_info(answer))
         await emit({"type": "target", "key": t.key, "status": "irrelevant" if dropped else "done",
-                    "answer": answer, "coverage": coverage, "stats": stats})
+                    "answer": answer, "coverage": coverage, "stats": stats,
+                    "evidence": [] if dropped else await self._evidence(t, answer, plan.question)})
         return ("irrelevant", None, coverage) if dropped else ("relevant", answer, coverage)
 
     async def _map_reduce(self, plan: Plan, emit: Emit, tally: Tally) -> str:
@@ -455,7 +485,7 @@ class QueryService:
 class TurnRecord:
     """Collects a turn's per-document answers and reasoning from its events, to show it again later."""
 
-    FIELDS = ("status", "answer", "coverage", "stats", "error")
+    FIELDS = ("status", "answer", "coverage", "stats", "error", "evidence")
 
     def __init__(self):
         self.targets: dict[str, dict] = {}

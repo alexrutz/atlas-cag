@@ -139,8 +139,10 @@ def visual_document_block(name: str, part_idx: int, n_parts: int, page_numbers: 
 
 
 def single_question_block(question: str) -> str:
+    # The quotes are located in the document afterwards, so the answer can be checked at its source.
     return (
         "Answer the question using only the document above, in the language of the question. "
+        "Support the answer with short verbatim quotes from the document in quotation marks. "
         "If the document does not contain the answer, say so clearly.\n\n"
         f"Question: {question}"
     )

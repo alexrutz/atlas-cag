@@ -12,8 +12,10 @@
     filter: "",
     status: "all",
     mode: "all",
-    sort: store.get("atlas.lib.sort", { key: "created_at", dir: -1 }),
+    sort: store.get("atlas.lib.sort2", { key: "order", dir: 1 }),  // "order": library order
     checked: new Set(),
+    lastChecked: null,  // for selecting a range with shift
+    collapsed: new Set(store.get("atlas.lib.collapsed", [])),
     detail: null,  // document id shown in the details panel
     target: store.get("atlas.uploadTarget", ""),
     uploadMode: store.get("atlas.uploadMode", null),  // null: the server's default prefill mode
@@ -67,6 +69,7 @@
           <div class="bulkbar" id="lib-bulk" hidden>
             <strong id="lib-bulk-n"></strong>
             <button class="btn small" data-act="bulk-chat">Ask in chat</button>
+            <button class="btn small" data-act="bulk-group" title="Put the selected documents into a new chapter, where the first of them is">Group as chapter…</button>
             <button class="btn small" data-act="bulk-move">Move to…</button>
             <button class="btn small" data-act="bulk-mode">Prefill…</button>
             <button class="btn small" data-act="bulk-rebuild">Rebuild caches</button>
@@ -77,6 +80,7 @@
             <table class="table lib-table">
               <thead><tr>
                 <th class="chk"><input type="checkbox" id="lib-all" aria-label="Select all shown documents"></th>
+                <th data-sort="order" class="num" title="Library order: collections, chapters and documents as arranged (drag rows to reorder)">#</th>
                 <th data-sort="name">Name</th><th data-sort="collection">Collection</th><th data-sort="mode">Prefill</th>
                 <th data-sort="n_tokens" class="num">Tokens</th><th data-sort="n_parts" class="num">Parts</th>
                 <th data-sort="kv_bytes" class="num">KV cache</th><th data-sort="size_bytes" class="num">File</th>
@@ -97,15 +101,27 @@
 
   const collName = (id) => A.collectionName(id || null);
 
+  // where a document is, seen from the collection being viewed ("Chapter 1 › 1.2"; "" if directly in it)
+  function place(d) {
+    const path = A.collectionPath(d.collection_id);
+    if (lib.coll === "all" || lib.coll === "") return path.map((c) => c.name).join(" › ") || "Unfiled";
+    const i = path.findIndex((c) => c.id === lib.coll);
+    return path.slice(i + 1).map((c) => c.name).join(" › ");
+  }
+
+  function scopeDocs() {  // the viewed collection with its chapters
+    return lib.coll === "all" ? S().docs : lib.coll === "" ? A.docsIn(null) : A.docsUnder(lib.coll);
+  }
+
   function shownDocs() {
     const q = lib.filter.trim().toLowerCase();
-    const docs = S().docs.filter((d) =>
-      (lib.coll === "all" || (d.collection_id || "") === lib.coll)
-      && (!q || d.name.toLowerCase().includes(q))
+    const docs = scopeDocs().filter((d) =>
+      (!q || d.name.toLowerCase().includes(q))
       && (lib.status === "all" || STATUS_GROUPS[lib.status](d))
       && (lib.mode === "all" || d.mode === lib.mode));
     const { key, dir } = lib.sort;
-    const val = (d) => key === "collection" ? collName(d.collection_id).toLowerCase()
+    const order = A.libraryOrder();
+    const val = (d) => key === "order" ? order.get(d.id) ?? 1e9 : key === "collection" ? A.pathLabel(d.collection_id).toLowerCase()
       : key === "name" ? d.name.toLowerCase() : key === "status" ? (STATUS_LABELS[d.status] || d.status) : d[key] ?? 0;
     return docs.sort((a, b) => (val(a) > val(b) ? 1 : val(a) < val(b) ? -1 : 0) * dir);
   }
@@ -119,27 +135,35 @@
     const docs = S().docs;
     const items = [{ key: "all", html: `<li class="coll${lib.coll === "all" ? " current" : ""}" data-coll="all">
         <span class="coll-name">${ICONS.inbox}<span>All documents</span></span><span class="coll-meta">${collectionStats(docs)}</span></li>` }];
-    for (const c of S().collections) {
-      const inside = docs.filter((d) => d.collection_id === c.id);
-      items.push({ key: c.id, html: `<li class="coll${lib.coll === c.id ? " current" : ""}" data-coll="${esc(c.id)}">
-        <span class="coll-name">${ICONS.folder}<span title="${esc(c.name)}">${esc(c.name)}</span></span>
-        <span class="coll-meta">${collectionStats(inside)}</span>
-        <button class="icon-btn" data-act="coll-menu" title="Collection actions" aria-haspopup="menu">${ICONS.more}</button></li>` });
-    }
+    const walk = (pid, depth) => {
+      for (const c of A.childCollections(pid)) {
+        const nested = A.childCollections(c.id).length > 0;
+        const collapsed = lib.collapsed.has(c.id);
+        items.push({ key: c.id, html: `<li class="coll${lib.coll === c.id ? " current" : ""}${depth ? " chapter" : ""}" data-coll="${esc(c.id)}" style="--depth:${depth}">
+          ${nested ? `<button class="caret${collapsed ? " collapsed" : ""}" data-act="coll-toggle" aria-label="${collapsed ? "Expand" : "Collapse"} ${esc(c.name)}">${ICONS.caret}</button>` : '<span class="caret-space"></span>'}
+          <span class="coll-name">${depth ? ICONS.chapter : ICONS.folder}<span title="${esc(A.pathLabel(c.id))}">${esc(c.name)}</span></span>
+          <span class="coll-meta">${collectionStats(A.docsUnder(c.id))}</span>
+          <button class="icon-btn" data-act="coll-menu" title="Collection actions" aria-haspopup="menu">${ICONS.more}</button></li>` });
+        if (!collapsed && depth < 64) walk(c.id, depth + 1);
+      }
+    };
+    walk(null, 0);
     const unfiled = docs.filter((d) => !d.collection_id);
     items.push({ key: "_unfiled", html: `<li class="coll${lib.coll === "" ? " current" : ""}" data-coll="">
       <span class="coll-name">${ICONS.inbox}<span>Unfiled</span></span><span class="coll-meta">${collectionStats(unfiled)}</span></li>` });
     A.patchList($("#coll-list"), items);
   }
 
-  function row(d) {
+  function row(d, index) {
     const checked = lib.checked.has(d.id);
     const pages = d.mode === "visual" || d.n_pages ? ` <span class="muted">${d.n_pages} p.</span>` : "";
+    const where = place(d);
     return `<tr class="${checked ? "checked" : ""}${lib.detail === d.id ? " open" : ""}" data-id="${esc(d.id)}" draggable="true">
       <td class="chk"><input type="checkbox" ${checked ? "checked" : ""} aria-label="Select ${esc(d.name)}"></td>
+      <td class="num muted">${index}</td>
       <td class="name-cell"><span class="lib-name" title="${esc(d.name)}">${esc(d.name)}</span>
         ${d.error && !["ready", "queued"].includes(d.status) ? `<span class="doc-error">${esc(d.error)}</span>` : ""}</td>
-      <td class="muted">${esc(collName(d.collection_id))}</td>
+      <td class="muted place-cell" title="${esc(A.pathLabel(d.collection_id))}">${where ? esc(where) : "–"}</td>
       <td>${d.mode === "visual" ? '<span class="pill visual">visual</span>' : '<span class="pill text">text</span>'}${pages}</td>
       <td class="num">${d.n_tokens ? fmtInt(d.n_tokens) : "–"}</td>
       <td class="num">${d.n_parts || "–"}</td>
@@ -154,7 +178,10 @@
 
   function renderTable() {
     const docs = shownDocs();
-    A.patchList($("#lib-rows"), docs.map((d) => ({ key: d.id, html: row(d) })));
+    const order = A.libraryOrder();
+    const scope = scopeDocs().map((d) => order.get(d.id) ?? 1e9).sort((a, b) => a - b);
+    const index = new Map(scope.map((o, i) => [o, i + 1]));  // numbered within the viewed collection
+    A.patchList($("#lib-rows"), docs.map((d) => ({ key: d.id, html: row(d, index.get(order.get(d.id) ?? 1e9) ?? "") })));
     const empty = $("#lib-empty");
     empty.hidden = docs.length > 0;
     if (!docs.length) {
@@ -174,13 +201,16 @@
     });
     const title = lib.coll === "all" ? "All documents" : lib.coll === "" ? "Unfiled" : collName(lib.coll);
     $("#lib-title").textContent = title;
+    $("#lib-title").title = lib.coll && lib.coll !== "all" ? A.pathLabel(lib.coll) : "";
     const ready = docs.filter((d) => d.status === "ready");
     $("#lib-sub").textContent = `${docs.length} shown · ${ready.length} ready · ${fmtTok(ready.reduce((s, d) => s + d.n_tokens, 0))} tokens · `
       + `${fmtBytes(ready.reduce((s, d) => s + d.kv_bytes, 0))} KV for the running model`;
   }
 
+  const collectionOptions = () => [["", "Unfiled"], ...A.groups().filter((g) => g.id).map((g) => [g.id, A.indent(g.depth) + g.name])];
+
   function renderUploadControls() {
-    const opts = [["", "Unfiled"], ...S().collections.map((c) => [c.id, c.name])];
+    const opts = collectionOptions();
     if (lib.target && !S().collections.some((c) => c.id === lib.target)) lib.target = "";
     const html = opts.map(([v, n]) => `<option value="${esc(v)}"${v === lib.target ? " selected" : ""}>${esc(n)}</option>`).join("");
     for (const sel of [$("#lib-target"), $("#paste-collection")]) {
@@ -210,7 +240,7 @@
     let detail = null;
     try { detail = await getJSON(`/api/documents/${d.id}`); } catch { return; }
     if (seq !== detailSeq || lib.detail !== d.id) return;
-    const collOpts = [["", "Unfiled"], ...S().collections.map((c) => [c.id, c.name])]
+    const collOpts = collectionOptions()
       .map(([v, n]) => `<option value="${esc(v)}"${(detail.collection_id || "") === v ? " selected" : ""}>${esc(n)}</option>`).join("");
     const parts = (detail.parts || []).map((p) => {
       const what = p.visual ? (p.char_end - p.char_start > 1 ? `pages ${p.char_start + 1}–${p.char_end}` : `page ${p.char_start + 1}`) : `part ${p.idx + 1}`;
@@ -323,7 +353,65 @@
   }
 
   function moveMenu(anchor, docs) {
-    A.openMenu(anchor, [{ heading: "Move to" }, ...A.groups().map((g) => ({ label: g.name, action: () => move(docs, g.id) }))]);
+    A.openMenu(anchor, [{ heading: "Move to" }, ...A.groups().map((g) => ({ label: A.indent(g.depth) + g.name, action: () => move(docs, g.id) }))]);
+  }
+
+  const byOrder = (docs) => { const o = A.libraryOrder(); return [...docs].sort((a, b) => (o.get(a.id) ?? 1e9) - (o.get(b.id) ?? 1e9)); };
+
+  // A chapter made of documents goes into the innermost collection that holds all of them, where
+  // the first of them was, and keeps their order.
+  async function groupAsChapter(docs) {
+    docs = byOrder(docs);
+    if (!docs.length) return;
+    let common = null;
+    for (const d of docs) {
+      const path = A.collectionPath(d.collection_id).map((c) => c.id);
+      if (common === null) { common = path; continue; }
+      let i = 0;
+      while (i < common.length && common[i] === path[i]) i++;
+      common = common.slice(0, i);
+    }
+    const parent = common[common.length - 1] || null;
+    const where = parent ? A.pathLabel(parent) : "the top level";
+    const name = await A.promptText(`Group ${docs.length} document${docs.length === 1 ? "" : "s"} as a chapter`,
+      `Chapter name (created in ${where})`, `Chapter ${A.childCollections(parent).length + 1}`, "Create chapter");
+    if (!name?.trim()) return;
+    const c = await A.run(async () => (await api("/api/collections", {
+      method: "POST", json: { name: name.trim(), parent_id: parent, document_ids: docs.map((d) => d.id) },
+    })).json(), `Grouped ${docs.length} document${docs.length === 1 ? "" : "s"} as “${name.trim()}”`);
+    if (c) { lib.checked.clear(); lib.lastChecked = null; }
+  }
+
+  // the items of a collection (or of the top level / Unfiled) in their current order
+  const siblingsOf = (parent, kind) => parent ? A.childItems(parent).map((it) => ({ kind: it.kind, id: it.id }))
+    : kind === "collection" ? A.childCollections(null).map((c) => ({ kind: "collection", id: c.id }))
+      : A.docsIn(null).map((d) => ({ kind: "document", id: d.id }));
+
+  const saveOrder = (parent, items) => A.run(() => api("/api/library/order", { method: "POST", json: { parent_id: parent, items } }));
+
+  // dropped rows go before the row they were dropped on, into that row's collection
+  function dropBefore(target, ids) {
+    const moving = byOrder(ids.map(A.docById).filter((d) => d && d.id !== target.id));
+    if (!moving.length) return;
+    const parent = target.collection_id || null;
+    const movingIds = new Set(moving.map((d) => d.id));
+    const items = [];
+    for (const it of siblingsOf(parent, "document")) {
+      if (movingIds.has(it.id)) continue;
+      if (it.id === target.id) items.push(...moving.map((d) => ({ kind: "document", id: d.id })));
+      items.push(it);
+    }
+    saveOrder(parent, items);
+  }
+
+  function shiftCollection(c, step) {
+    const parent = c.parent_id || null;
+    const items = siblingsOf(parent, "collection");
+    const i = items.findIndex((it) => it.kind === "collection" && it.id === c.id);
+    const j = i + step;
+    if (i < 0 || j < 0 || j >= items.length) return;
+    [items[i], items[j]] = [items[j], items[i]];
+    saveOrder(parent, items);
   }
 
   function docMenu(anchor, d) {
@@ -351,22 +439,42 @@
   function collectionMenu(anchor, cid) {
     const c = A.collectionById(cid);
     if (!c) return;
-    const n = A.docsIn(cid).length;
+    const n = A.docsUnder(cid).length;
+    const chapters = A.subtreeIds(cid).length - 1;
+    const parent = c.parent_id || null;
+    const siblings = siblingsOf(parent, "collection");
+    const at = siblings.findIndex((it) => it.kind === "collection" && it.id === cid);
+    const subtree = new Set(A.subtreeIds(cid));
     A.openMenu(anchor, [
       { label: "Upload files here…", action: () => pickFiles(cid) },
       { label: "Paste text here…", action: () => openPaste(cid) },
-      { label: "Ask all in chat", disabled: !A.docsIn(cid).some((d) => d.queryable), action: () => askInChat(A.docsIn(cid)) },
+      { label: "Ask all in chat", disabled: !A.docsUnder(cid).some((d) => d.queryable), action: () => askInChat(A.docsUnder(cid)) },
+      "-",
+      { label: "New chapter inside…", action: async () => {
+        const name = await A.promptText(`New chapter in ${c.name}`, "Name", `Chapter ${A.childCollections(cid).length + 1}`, "Create");
+        if (name?.trim()) A.run(() => api("/api/collections", { method: "POST", json: { name: name.trim(), parent_id: cid } }), `Created ${name.trim()}`);
+      } },
       { label: "Rename…", action: async () => {
         const name = await A.promptText("Rename collection", "Name", c.name);
         if (name && name !== c.name) A.run(() => api(`/api/collections/${cid}`, { method: "PATCH", json: { name } }));
       } },
+      { label: "Move up", disabled: at <= 0, action: () => shiftCollection(c, -1) },
+      { label: "Move down", disabled: at < 0 || at >= siblings.length - 1, action: () => shiftCollection(c, 1) },
+      { label: "Move into…", action: () => A.openMenu(anchor, [{ heading: `Move “${c.name}” into` },
+        { label: "Top level", disabled: !parent, action: () => A.run(() => api(`/api/collections/${cid}`, { method: "PATCH", json: { parent_id: null } })) },
+        ...A.groups().filter((g) => g.id && !subtree.has(g.id)).map((g) => ({
+          label: A.indent(g.depth) + g.name, disabled: g.id === parent,
+          action: () => A.run(() => api(`/api/collections/${cid}`, { method: "PATCH", json: { parent_id: g.id } })),
+        }))]) },
       "-",
-      { label: "Delete collection…", danger: true, action: async () => {
-        const r = await A.confirmAction("Delete collection",
-          `Delete the collection “${c.name}”? Its ${n} document${n === 1 ? "" : "s"} will move to Unfiled.`, "Delete",
-          n ? { checkbox: `Delete the ${n} document${n === 1 ? "" : "s"} as well` } : {});
+      { label: parent ? "Delete chapter…" : "Delete collection…", danger: true, action: async () => {
+        const up = parent ? `“${collName(parent)}”` : "Unfiled";
+        const what = [n ? `${n} document${n === 1 ? "" : "s"}` : "", chapters ? `${chapters} chapter${chapters === 1 ? "" : "s"}` : ""].filter(Boolean).join(" and ");
+        const r = await A.confirmAction(parent ? "Delete chapter" : "Delete collection",
+          `Delete “${c.name}”?${what ? ` Its ${what} will move to ${parent ? up : chapters ? "the top level and Unfiled" : "Unfiled"}.` : ""}`, "Delete",
+          n ? { checkbox: `Delete the ${n} document${n === 1 ? "" : "s"}${chapters ? " and chapters" : ""} as well` } : {});
         if (!r) return;
-        if (lib.coll === cid) setColl("all");
+        if (subtree.has(lib.coll)) setColl(parent || "all");
         A.run(() => api(`/api/collections/${cid}?delete_documents=${r.checked}`, { method: "DELETE" }), `Deleted ${c.name}`);
       } },
     ]);
@@ -456,9 +564,16 @@
         return;
       }
       if (act === "coll-menu") return collectionMenu(e.target.closest("button"), coll.dataset.coll);
+      if (act === "coll-toggle") {
+        const id = coll.dataset.coll;
+        if (lib.collapsed.has(id)) lib.collapsed.delete(id); else lib.collapsed.add(id);
+        store.set("atlas.lib.collapsed", [...lib.collapsed]);
+        return renderCollections();
+      }
       if (coll) return setColl(coll.dataset.coll);
       if (act === "bulk-clear") { lib.checked.clear(); return renderTable(); }
       if (act === "bulk-chat") return askInChat(checkedDocs());
+      if (act === "bulk-group") return groupAsChapter(checkedDocs());
       if (act === "bulk-move") return moveMenu(e.target.closest("button"), checkedDocs());
       if (act === "bulk-mode") {
         return A.openMenu(e.target.closest("button"), [
@@ -471,8 +586,8 @@
       const th = e.target.closest("th[data-sort]");
       if (th) {
         const key = th.dataset.sort;
-        lib.sort = { key, dir: lib.sort.key === key ? -lib.sort.dir : (["name", "collection", "mode", "status"].includes(key) ? 1 : -1) };
-        store.set("atlas.lib.sort", lib.sort);
+        lib.sort = { key, dir: lib.sort.key === key ? -lib.sort.dir : (["order", "name", "collection", "mode", "status"].includes(key) ? 1 : -1) };
+        store.set("atlas.lib.sort2", lib.sort);
         return renderTable();
       }
       const detail = e.target.closest("#lib-detail");
@@ -494,8 +609,15 @@
         const d = A.docById(tr.dataset.id);
         if (!d) return;
         if (act === "doc-menu") return docMenu(e.target.closest("button"), d);
-        if (e.target.matches("input[type=checkbox]")) {
-          if (e.target.checked) lib.checked.add(d.id); else lib.checked.delete(d.id);
+        const box = e.target.matches("input[type=checkbox]");
+        if (box || e.shiftKey || e.ctrlKey || e.metaKey) {
+          const on = box ? e.target.checked : !lib.checked.has(d.id);
+          const shown = shownDocs().map((x) => x.id);
+          const a = shown.indexOf(lib.lastChecked), b = shown.indexOf(d.id);
+          const ids = e.shiftKey && a >= 0 && b >= 0 ? shown.slice(Math.min(a, b), Math.max(a, b) + 1) : [d.id];
+          for (const id of ids) { if (on) lib.checked.add(id); else lib.checked.delete(id); }
+          lib.lastChecked = d.id;
+          if (e.shiftKey) window.getSelection()?.removeAllRanges();
           return renderTable();
         }
         return lib.detail === d.id ? closeDetail() : openDetail(d.id);
@@ -533,25 +655,35 @@
     });
     const isFiles = (e) => [...(e.dataTransfer?.types || [])].includes("Files");
     const isDocs = (e) => [...(e.dataTransfer?.types || [])].includes("application/x-atlas-docs");
+    const clearDrop = () => document.querySelectorAll(".coll.drop-target, #lib-rows tr.drop-before").forEach((c) => c.classList.remove("drop-target", "drop-before"));
     root.addEventListener("dragover", (e) => {
       if (!isFiles(e) && !isDocs(e)) return;
       e.preventDefault();
-      document.querySelectorAll(".coll.drop-target").forEach((c) => c.classList.remove("drop-target"));
+      clearDrop();
       const coll = e.target.closest(".coll");
       if (coll && coll.dataset.coll !== "all") coll.classList.add("drop-target");
+      const tr = e.target.closest("#lib-rows tr");
+      if (tr && isDocs(e) && lib.sort.key === "order" && lib.sort.dir > 0) tr.classList.add("drop-before");
       root.classList.toggle("dragging", isFiles(e));
     });
     root.addEventListener("dragleave", (e) => {
       if (!root.contains(e.relatedTarget)) {
         root.classList.remove("dragging");
-        document.querySelectorAll(".coll.drop-target").forEach((c) => c.classList.remove("drop-target"));
+        clearDrop();
       }
     });
     root.addEventListener("drop", (e) => {
       root.classList.remove("dragging");
-      document.querySelectorAll(".coll.drop-target").forEach((c) => c.classList.remove("drop-target"));
+      clearDrop();
       const coll = e.target.closest(".coll");
       const target = coll && coll.dataset.coll !== "all" ? coll.dataset.coll : null;
+      const tr = e.target.closest("#lib-rows tr");
+      if (isDocs(e) && tr && lib.sort.key === "order" && lib.sort.dir > 0) {
+        e.preventDefault();
+        const d = A.docById(tr.dataset.id);
+        if (d) dropBefore(d, JSON.parse(e.dataTransfer.getData("application/x-atlas-docs")));
+        return;
+      }
       if (isDocs(e)) {
         e.preventDefault();
         if (target === null) return;

@@ -15,13 +15,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA = """
+-- collections nest: a long document split into many documents can be grouped into chapters
 CREATE TABLE IF NOT EXISTS collections (
     id          TEXT PRIMARY KEY,
     name        TEXT NOT NULL,
-    created_at  REAL NOT NULL
+    created_at  REAL NOT NULL,
+    parent_id   TEXT REFERENCES collections(id) ON DELETE SET NULL,
+    position    REAL  -- order among the parent's collections and documents; NULL: created_at
 );
 
 CREATE TABLE IF NOT EXISTS documents (
@@ -35,7 +38,8 @@ CREATE TABLE IF NOT EXISTS documents (
     created_at    REAL NOT NULL,
     updated_at    REAL NOT NULL,
     mode          TEXT NOT NULL DEFAULT 'text',  -- prefill: 'text' (extracted text) or 'visual' (page images)
-    n_pages       INTEGER NOT NULL DEFAULT 0
+    n_pages       INTEGER NOT NULL DEFAULT 0,
+    position      REAL  -- order within the collection; NULL: created_at (the order documents were added)
 );
 CREATE INDEX IF NOT EXISTS documents_sha ON documents(sha256);
 
@@ -119,7 +123,9 @@ CREATE INDEX IF NOT EXISTS queries_conversation ON queries(conversation_id, crea
 EARLIER_QUESTIONS = "Earlier questions"
 QUERY_COLUMNS = "id, created_at, question, doc_ids, mode, answer, stats, error, conversation_id, standalone, detail"
 
-DOC_COLUMNS = "id, name, collection_id, mime, sha256, size_bytes, n_chars, created_at, updated_at, mode, n_pages"
+DOC_COLUMNS = ("id, name, collection_id, mime, sha256, size_bytes, n_chars, created_at, updated_at, mode, n_pages, "
+               "position")
+COLL_COLUMNS = "id, name, created_at, parent_id, position"
 CACHE_COLUMNS = ("doc_id, fingerprint, status, error, n_tokens, n_parts, kv_bytes, ingest_ms, created_at, updated_at, "
                  "variant")
 PART_COLUMNS = ("id, doc_id, fingerprint, idx, n_tokens, kv_file, kv_bytes, char_start, char_end, prefill_ms, "
@@ -150,9 +156,15 @@ class Collection:
     id: str
     name: str
     created_at: float
+    parent_id: str | None = None
+    position: float | None = None
+
+    @property
+    def order(self) -> float:
+        return self.created_at if self.position is None else self.position
 
     def to_json(self) -> dict:
-        return dict(self.__dict__)
+        return {**self.__dict__, "position": self.order}
 
 
 @dataclass
@@ -168,9 +180,14 @@ class Document:
     updated_at: float
     mode: str = "text"
     n_pages: int = 0
+    position: float | None = None
+
+    @property
+    def order(self) -> float:
+        return self.created_at if self.position is None else self.position
 
     def to_json(self) -> dict:
-        return dict(self.__dict__)
+        return {**self.__dict__, "position": self.order}
 
 
 @dataclass
@@ -250,6 +267,16 @@ class Store:
         self._migrate_v2()
         self._migrate_v3()
         self._migrate_v4()
+        self._migrate_v5()
+
+    def _migrate_v5(self) -> None:
+        """v5 nests collections (chapters) and orders collections and documents explicitly."""
+        added = [("collections", "parent_id", "TEXT REFERENCES collections(id) ON DELETE SET NULL"),
+                 ("collections", "position", "REAL"), ("documents", "position", "REAL")]
+        for table, column, decl in added:
+            columns = self._columns(table)
+            if columns and column not in columns:
+                self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     def _migrate_v4(self) -> None:
         """v4 adds visual prefill: document mode, cache variant, multimodal part prefixes."""
@@ -335,24 +362,114 @@ class Store:
 
     # --- collections -------------------------------------------------------------------
 
-    def create_collection(self, name: str) -> Collection:
-        c = Collection(new_id(), name, time.time())
-        self._exec("INSERT INTO collections (id, name, created_at) VALUES (?, ?, ?)", (c.id, c.name, c.created_at))
+    def create_collection(self, name: str, parent_id: str | None = None, position: float | None = None) -> Collection:
+        c = Collection(new_id(), name, time.time(), parent_id, position)
+        self._exec("INSERT INTO collections (id, name, created_at, parent_id, position) VALUES (?, ?, ?, ?, ?)",
+                   (c.id, c.name, c.created_at, c.parent_id, c.position))
         return c
 
     def get_collection(self, collection_id: str) -> Collection | None:
-        row = self._exec("SELECT id, name, created_at FROM collections WHERE id = ?", (collection_id,)).fetchone()
+        row = self._exec(f"SELECT {COLL_COLUMNS} FROM collections WHERE id = ?", (collection_id,)).fetchone()
         return Collection(**row) if row else None
 
     def list_collections(self) -> list[Collection]:
-        rows = self._exec("SELECT id, name, created_at FROM collections ORDER BY name COLLATE NOCASE").fetchall()
+        rows = self._exec(f"SELECT {COLL_COLUMNS} FROM collections ORDER BY COALESCE(position, created_at)").fetchall()
         return [Collection(**r) for r in rows]
 
+    def update_collection(self, collection_id: str, **fields) -> None:
+        cols = ", ".join(f"{k} = ?" for k in fields)
+        self._exec(f"UPDATE collections SET {cols} WHERE id = ?", (*fields.values(), collection_id))
+
     def rename_collection(self, collection_id: str, name: str) -> None:
-        self._exec("UPDATE collections SET name = ? WHERE id = ?", (name, collection_id))
+        self.update_collection(collection_id, name=name)
+
+    def subtree(self, collection_id: str) -> list[str]:
+        """The collection and every collection nested in it, parents before children."""
+        children: dict[str | None, list[str]] = {}
+        for c in self.list_collections():
+            children.setdefault(c.parent_id, []).append(c.id)
+        out, todo = [], [collection_id]
+        while todo:
+            cid = todo.pop(0)
+            out.append(cid)
+            todo += children.get(cid, [])
+        return out
+
+    def collection_path(self, collection_id: str | None) -> list[Collection]:
+        """The collection and its parents, outermost first."""
+        by_id = {c.id: c for c in self.list_collections()}
+        path: list[Collection] = []
+        while collection_id and collection_id in by_id and len(path) < 64:
+            path.insert(0, by_id[collection_id])
+            collection_id = by_id[collection_id].parent_id
+        return path
 
     def delete_collection(self, collection_id: str) -> None:
-        self._exec("DELETE FROM collections WHERE id = ?", (collection_id,))
+        """Delete one collection; its documents and nested collections move up to its parent."""
+        with self._lock:
+            row = self._db.execute("SELECT parent_id FROM collections WHERE id = ?", (collection_id,)).fetchone()
+            if row is None:
+                return
+            self._db.execute("BEGIN")
+            try:
+                self._db.execute("UPDATE documents SET collection_id = ? WHERE collection_id = ?",
+                                 (row["parent_id"], collection_id))
+                self._db.execute("UPDATE collections SET parent_id = ? WHERE parent_id = ?",
+                                 (row["parent_id"], collection_id))
+                self._db.execute("DELETE FROM collections WHERE id = ?", (collection_id,))
+                self._db.execute("COMMIT")
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
+
+    def set_order(self, parent_id: str | None, items: list[tuple[str, str]]) -> None:
+        """Put ("collection" | "document", id) items into `parent_id` (None: top level / unfiled),
+        in this order."""
+        with self._lock:
+            self._db.execute("BEGIN")
+            try:
+                for i, (kind, item_id) in enumerate(items, 1):
+                    if kind == "collection":
+                        self._db.execute("UPDATE collections SET parent_id = ?, position = ? WHERE id = ?",
+                                         (parent_id, float(i), item_id))
+                    else:
+                        self._db.execute("UPDATE documents SET collection_id = ?, position = ? WHERE id = ?",
+                                         (parent_id, float(i), item_id))
+                self._db.execute("COMMIT")
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
+
+    def library_order(self) -> dict[str, int]:
+        """Document id -> index in library order: depth first through the collections, collections
+        and documents interleaved by position, unfiled documents last."""
+        colls = self.list_collections()
+        docs = self.list_documents()
+        items: dict[str | None, list[tuple[float, int, str, str]]] = {}
+        for c in colls:
+            items.setdefault(c.parent_id, []).append((c.order, 0, "c", c.id))
+        for d in docs:
+            items.setdefault(d.collection_id, []).append((d.order, 1, "d", d.id))
+        order: dict[str, int] = {}
+        seen: set[str] = set()
+
+        def walk(parent: str | None) -> None:
+            for _, _, kind, item_id in sorted(items.get(parent, [])):
+                if kind == "d":
+                    order[item_id] = len(order)
+                elif item_id not in seen:  # guards against a cycle in a damaged database
+                    seen.add(item_id)
+                    walk(item_id)
+
+        top = sorted((c.order, c.id) for c in colls if c.parent_id is None or c.parent_id not in {x.id for x in colls})
+        for _, cid in top:
+            seen.add(cid)
+            walk(cid)
+        for d in sorted((d for d in docs if d.collection_id is None), key=lambda d: d.order):
+            order[d.id] = len(order)
+        for d in docs:  # documents in collections unreachable from the top level
+            order.setdefault(d.id, len(order))
+        return order
 
     # --- documents ---------------------------------------------------------------------
 
@@ -380,8 +497,12 @@ class Store:
             rows = self._exec(f"SELECT {DOC_COLUMNS} FROM documents ORDER BY created_at DESC").fetchall()
         else:
             rows = self._exec(f"SELECT {DOC_COLUMNS} FROM documents WHERE collection_id = ? "
-                              "ORDER BY created_at DESC", (collection_id,)).fetchall()
+                              "ORDER BY COALESCE(position, created_at)", (collection_id,)).fetchall()
         return [Document(**r) for r in rows]
+
+    def documents_under(self, collection_id: str) -> list[Document]:
+        """Documents in the collection and in every collection nested in it."""
+        return [d for cid in self.subtree(collection_id) for d in self.list_documents(cid)]
 
     def update_document(self, doc_id: str, **fields) -> None:
         fields["updated_at"] = time.time()
