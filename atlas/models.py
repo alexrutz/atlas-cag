@@ -28,6 +28,25 @@ KV_TYPE_BYTES = {"f16": 2.0, "bf16": 2.0, "q8_0": 34 / 32, "q5_1": 24 / 32, "q5_
 _SHARD = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
 _SKIP = re.compile(r"(^|[-_.])(mmproj|imatrix)", re.I)
 _PROJECTOR = re.compile(r"(^|[-_.])mmproj", re.I)
+# What converters store as general.name when the model's config has none: the name of the folder
+# they converted from ("hf_format", "merged", "output", …) or a snapshot hash. The file says more.
+_PLACEHOLDER_NAMES = {
+    "hf", "hf format", "hf model", "hf format model", "model", "models", "base model", "local model", "new model",
+    "merged", "merged model", "output", "outputs", "out", "final", "final model", "checkpoint", "checkpoints",
+    "snapshot", "snapshots", "main", "tmp", "temp", "converted", "export", "exported", "pytorch model",
+    "safetensors", "transformers", "unknown", "untitled", "gguf",
+}
+_QUANT_SUFFIX = re.compile(r"[-_.](?:UD[-_])?(?:I?Q\d\w*|[BM]?F\d+\w*|MXFP4\w*)$", re.I)
+
+
+def display_name(meta_name: str | None, file: str) -> str:
+    """general.name, unless it is a placeholder: then the file name without shard and quant suffix."""
+    name = (meta_name or "").strip()
+    key = re.sub(r"[\W_]+", " ", name).strip().lower()
+    if name and key not in _PLACEHOLDER_NAMES and not re.fullmatch(r"[0-9a-f]{32,}", name):
+        return name
+    stem = _SHARD.sub("", file).removesuffix(".gguf")
+    return _QUANT_SUFFIX.sub("", stem) or stem
 
 
 @dataclass
@@ -82,9 +101,7 @@ def _describe(info: ModelInfo) -> None:
         return
     arch = meta.get("general.architecture")
     info.arch = arch
-    name = meta.get("general.name") or meta.get("general.basename")
-    # converters sometimes store a snapshot hash as the name: fall back to the file name
-    info.name = name if name and not re.fullmatch(r"[0-9a-f]{32,}", name) else _SHARD.sub("", Path(info.file).stem)
+    info.name = display_name(meta.get("general.name") or meta.get("general.basename"), info.file)
     info.size_label = meta.get("general.size_label")
     info.quant = FILE_TYPES.get(meta.get("general.file_type"), None)
     info.sampling = sampling.from_model(meta)
@@ -230,8 +247,7 @@ def describe_projector(path: Path, source: str = "custom path", repo: str | None
     except (OSError, GGUFError) as e:
         info["error"] = str(e)
         return info
-    name = meta.get("general.name")
-    info["name"] = name if name and not re.fullmatch(r"[0-9a-f]{32,}", name) else path.stem
+    info["name"] = display_name(meta.get("general.name"), path.name)
     info["projector_type"] = meta.get("clip.projector_type") or meta.get("clip.vision.projector_type")
     info["vision"] = bool(meta.get("clip.has_vision_encoder"))
     info["audio"] = bool(meta.get("clip.has_audio_encoder"))

@@ -132,6 +132,18 @@ def test_discovery_and_estimates(tmp_path, monkeypatch):
     assert "added.gguf" in {m.file for m in models.discover([tmp_path / "models"])}
 
 
+def test_placeholder_model_names_fall_back_to_the_file_name(tmp_path):
+    """llama.cpp's converter names a model after the folder it came from, e.g. "Hf_Format"."""
+    qwen35_like(tmp_path / "Spark-X2.5-4B-Q4_K_M.gguf", "Hf_Format")
+    qwen35_like(tmp_path / "Ling-3.0-tiny-Q6_K.gguf", "Ling 3.0 Tiny")
+    names = {m.file: m.name for m in models.discover([tmp_path], scan_caches=False)}
+    assert names == {"Spark-X2.5-4B-Q4_K_M.gguf": "Spark-X2.5-4B", "Ling-3.0-tiny-Q6_K.gguf": "Ling 3.0 Tiny"}
+    assert models.display_name("merged", "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf") == "Qwen3.8-Flash-Next-GSQ-RCO"
+    assert models.display_name("a" * 40, "gemma-3-12b-it-UD-Q4_K_XL.gguf") == "gemma-3-12b-it"
+    assert models.display_name(None, "mmproj-model-BF16.gguf") == "mmproj-model"
+    assert models.display_name("Llama 3.1 8B Instruct", "model.gguf") == "Llama 3.1 8B Instruct"
+
+
 def test_tensor_classes_and_offload_flags(tmp_path):
     """qwen4exp-like: routed experts, n-gram embeddings (lazy), indexer keys, conv state."""
     layers = 4
