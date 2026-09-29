@@ -747,7 +747,7 @@
       cmoeButton.title = moe ? "Keep the mixture-of-experts weights in system RAM (--cpu-moe); attention and shared weights stay on the GPU"
         : "Only for mixture-of-experts models";
       $(".gpu-layers-help", presetForm).textContent = cmoeOn()
-        ? "Experts stay in system RAM (--cpu-moe), everything else on the GPU: for MoE models larger than the GPU."
+        ? "Sent as -cmoe instead of --n-gpu-layers: experts stay in system RAM, llama.cpp puts as many other layers on the GPU as fit. For MoE models larger than the GPU."
         : "“all”, “auto” or a number; fewer layers spill weights to system RAM (slower).";
     };
     const ownSampling = () => Object.fromEntries(SAMPLING.map((x) => {

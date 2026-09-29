@@ -169,8 +169,9 @@ configuration; its caches are built in the background, and the old ones are kept
 ### Experts on the CPU
 
 For mixture-of-experts models larger than the GPU, the **-cmoe** switch next to *GPU layers* keeps
-the expert weights in system RAM (`--cpu-moe`) and everything else on the GPU; the field then
-shows `-cmoe`. The memory estimate moves the experts to the RAM row. Prefill copies the experts to
+the expert weights in system RAM; the field then shows `-cmoe`. The command line gets `-cmoe` in
+place of `--n-gpu-layers`, so llama.cpp places the other layers itself (its default, `auto`: as
+many as fit on the GPU). The memory estimate moves the experts to the RAM row. Prefill copies the experts to
 the GPU once per micro-batch, so a larger `-ub` (e.g. `-ub 2048 -b 2048` in the extra arguments)
 makes prefill of long documents faster; the editor suggests it. `--n-cpu-moe N` (only the first N
 layers' experts) still goes into the extra arguments.
