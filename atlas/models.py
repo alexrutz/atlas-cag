@@ -1,6 +1,7 @@
 """Discover local GGUF models, describe them, and estimate the memory a preset needs."""
 
 import asyncio
+import dataclasses
 import os
 import re
 import shlex
@@ -143,7 +144,7 @@ def _info(path: Path, source: str, repo: str | None) -> ModelInfo:
     if shards > 1:
         size = sum((p.resolve().stat().st_size for p in path.parent.glob(_SHARD.sub("-*-of-" + m.group(2) + ".gguf",
                                                                                     path.name))), 0)
-    key = (str(path), st.st_mtime, size)
+    key = (str(path), st.st_mtime, size)  # the description only; where it was found comes from the caller
     if key not in _cache:
         info = ModelInfo(path=str(path), file=path.name, source=source, repo=repo, size_bytes=size, shards=shards)
         _describe(info)
@@ -151,7 +152,7 @@ def _info(path: Path, source: str, repo: str | None) -> ModelInfo:
             shard_files = sorted(path.parent.glob(_SHARD.sub("-*-of-" + m.group(2) + ".gguf", path.name))) if m else [path]
             _classify(info, shard_files)
         _cache[key] = info
-    return _cache[key]
+    return dataclasses.replace(_cache[key], source=source, repo=repo)
 
 
 _EXPERTS = re.compile(r"^blk\.(\d+)\.ffn_\w*_exps\b")
@@ -272,11 +273,8 @@ def _flags(extra_args: str) -> dict:
 
 
 # llama.cpp sizes a sliding-window cache as window + micro-batch per sequence, padded to 256
-SWA_UBATCH = 512
-
-
-def _swa_cells(window: int, ctx: int) -> int:
-    return min(ctx, -(-(window + SWA_UBATCH) // 256) * 256)
+def _swa_cells(window: int, ctx: int, ubatch: int = 512) -> int:
+    return min(ctx, -(-(window + ubatch) // 256) * 256)
 
 
 def estimate(model: ModelInfo | None, ctx_per_slot: int, slots: int, kv_type: str,
@@ -298,7 +296,7 @@ def estimate(model: ModelInfo | None, ctx_per_slot: int, slots: int, kv_type: st
     scale = KV_TYPE_BYTES.get(kv_type, 2.0) / 2
     swa_part = model.kv_swa_bytes_per_token_f16 * scale
     per_token = model.kv_bytes_per_token_f16 * scale - (0 if swa_full else swa_part)  # grows with the context
-    swa_fixed = 0 if swa_full else swa_part * _swa_cells(model.sliding_window or 0, ctx_per_slot)
+    swa_fixed = 0 if swa_full else swa_part * _swa_cells(model.sliding_window or 0, ctx_per_slot, flags["ubatch"])
     kv = (per_token * ctx_per_slot + swa_fixed) * slots
     # llama.cpp reserves the compute buffer for a full slot: the attention mask (context x
     # micro-batch, f16) and, for a quantized cache, one layer's K and V converted to f16 for the
@@ -320,6 +318,9 @@ def estimate(model: ModelInfo | None, ctx_per_slot: int, slots: int, kv_type: st
         "ram": int(ram),
         "ssd": int(lazy_ssd),
         "kv_bytes_per_token": int(per_token),
+        "ubatch": flags["ubatch"],
+        # experts kept in RAM are copied to the GPU once per micro-batch during prefill
+        "streamed_experts": int(experts_ram),
         "slot_file_per_100k_tokens": int(per_token * 100_000 + model.recurrent_bytes_per_slot
                                          + (swa_part * (model.sliding_window or 0) if not swa_full else 0)),
     }

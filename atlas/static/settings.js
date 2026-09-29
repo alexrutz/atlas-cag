@@ -130,6 +130,7 @@
       ${est.ram ? `<div class="est-row"><span class="est-label">RAM</span>
         <div class="bar"><span class="seg ram" style="width:${pct(est.ram, Math.max(ram, est.ram))}" title="Offloaded weights ${fmtGB(est.ram)}"></span></div>
         <strong>≈ ${fmtGB(est.ram)}${ram ? ` of ${fmtGB(ram)}` : ""}</strong></div>` : ""}
+      ${est.streamed_experts && est.ubatch < 2048 ? `<div class="muted small">Prefill copies the ${fmtGB(est.streamed_experts)} of experts kept in RAM to the GPU once per micro-batch (now ${est.ubatch} tokens), so it is limited by PCIe. A larger micro-batch, e.g. <code>-ub 2048 -b 2048</code> or 4096, makes prefill of long documents several times faster; it costs compute buffer memory, shown above.</div>` : ""}
       ${est.ssd ? `<div class="muted small">${fmtGB(est.ssd)} of embeddings stay on disk and are read on demand (--lazy-mode).</div>` : ""}
       ${gpuOver ? `<div class="warn-text">Does not fit: about ${fmtGB(est.total)} needed plus 1 GB kept free for the desktop, ${fmtGB(gpu)} free. Windows would move the rest into shared system memory: slow, and the desktop can stutter or freeze. Reduce context per slot or slots, use a smaller KV type, or offload experts (-cmoe / --n-cpu-moe N).</div>` : ""}
       ${ramOver ? '<div class="warn-text">The weights kept in system RAM exceed most of the memory available to this system.</div>' : ""}
@@ -159,11 +160,7 @@
         <dt>Binary</dt><dd><code>${esc(tildify(sup.build || server.llama_server_bin))}</code> → <code>${esc(server.llama_url)}</code></dd>
       </dl>
       ${sup.error ? `<div class="response-error">${esc(sup.error)}</div>` : ""}
-      ${sup.fit_warning && sup.state === "running" ? `<div class="response-error">${esc(sup.fit_warning)}</div>` : ""}
-      <details class="log" ${sup.state === "failed" || sup.state === "starting" ? "open" : ""}>
-        <summary>Server log</summary><pre id="server-log"></pre>
-      </details>
-      ${sup.command ? `<details><summary>Command line</summary><pre class="cmd">${esc(sup.command)}</pre></details>` : ""}`;
+      ${sup.fit_warning && sup.state === "running" ? `<div class="response-error">${esc(sup.fit_warning)}</div>` : ""}`;
   }
 
   function presetCard(p, running) {
@@ -222,7 +219,11 @@
     const running = server.supervisor.state === "running";
     if (first || !$("#server-card")) {
       body.innerHTML = `
-        <section class="card" id="server-card"></section>
+        <section class="card">
+          <div id="server-card"></div>
+          <details class="log" id="server-log-box"><summary>Server log</summary><pre id="server-log"></pre></details>
+          <details id="server-cmd-box" hidden><summary>Command line</summary><pre class="cmd" id="server-cmd"></pre></details>
+        </section>
         <section class="card">
           <div class="card-head"><h2>Presets</h2><button class="btn primary" data-act="new-preset">New preset</button></div>
           <p class="muted">A preset is one way of running a model: the GGUF file, how many requests run in parallel (slots),
@@ -257,6 +258,12 @@
     const updating = ["checking", "downloading", "installing"].includes(updates?.job?.state);
     if (view.wasUpdating && !updating) loadBuilds();  // a new build was installed
     view.wasUpdating = updating;
+    // the log keeps its open state and scroll position; it opens by itself when a start begins or fails
+    const state = server.supervisor.state;
+    if (["starting", "failed"].includes(state) && view.serverState !== state) $("#server-log-box").open = true;
+    view.serverState = state;
+    $("#server-cmd-box").hidden = !server.supervisor.command;
+    if ($("#server-cmd").textContent !== (server.supervisor.command || "")) $("#server-cmd").textContent = server.supervisor.command || "";
     const log = $("#server-log");
     if (log) {
       const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 20;
@@ -492,7 +499,7 @@
   }
 
   async function editPreset(preset, fromModel) {
-    if (!view.models.length) await loadModels();
+    await loadModels();  // files added since the page loaded show up in the list
     if (!view.builds) await loadBuilds();
     const base = preset || {};
     const model = fromModel || view.models.find((m) => m.path === base.model_path) || view.models[0];

@@ -124,6 +124,13 @@ def test_discovery_and_estimates(tmp_path, monkeypatch):
     assert est["total"] == m.size_bytes + est["kv_cache"] + est["recurrent"] + est["compute"]
     assert est["compute"] == 262144 * 512 * 2 + 64 * 2**20 + 4 * 512 * 2 * 262144  # mask + one layer as f16
 
+    # a file described first as a preset's custom path is labelled by where discovery finds it
+    models.describe_file(tmp_path / "models" / "sub" / "own.gguf")
+    assert {m.file: m.source for m in models.discover([tmp_path / "models"])}["own.gguf"] == "models dir"
+    # a file added later is found by the next discovery
+    qwen35_like(tmp_path / "models" / "added.gguf", "Added")
+    assert "added.gguf" in {m.file for m in models.discover([tmp_path / "models"])}
+
 
 def test_tensor_classes_and_offload_flags(tmp_path):
     """qwen4exp-like: routed experts, n-gram embeddings (lazy), indexer keys, conv state."""
@@ -152,6 +159,11 @@ def test_tensor_classes_and_offload_flags(tmp_path):
     partial = models.estimate(m, 1000, 1, "f16", "--n-cpu-moe=2 -lzm off")
     assert partial["ram"] == 2 * 3072 + 320 + 5120 and partial["ssd"] == 0
     assert models.estimate(m, 1000, 1, "f16")["ram"] == 320 + 5120  # defaults: embeddings in RAM
+    # experts in RAM are streamed per micro-batch: reported with the micro-batch, which sizes the mask
+    assert all_cpu["streamed_experts"] == 4 * 3072 and all_cpu["ubatch"] == 512
+    big = models.estimate(m, 1000, 1, "f16", "-cmoe -ub 4096 -b 4096")
+    assert big["ubatch"] == 4096 and big["compute"] - all_cpu["compute"] == 1000 * (4096 - 512) * 2
+    assert models.estimate(m, 1000, 1, "f16")["streamed_experts"] == 0
 
 
 # --- downloads --------------------------------------------------------------------------
