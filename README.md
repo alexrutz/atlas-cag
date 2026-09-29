@@ -224,6 +224,22 @@ newer release) reuses them.
 Atlas keeps logs in `data/logs/`: `atlas.log` for Atlas itself and `llama-server.log` for every
 llama-server start with its full command line. Both rotate.
 
+### Address and API key
+
+**Settings → Model → llama-server → Address** sets where the managed llama-server listens: this
+computer only (127.0.0.1, default), all network interfaces (0.0.0.0) or a specific address, the
+port, and optionally an API key. Saving restarts llama-server there; document caches stay valid.
+Other programs can then use it as an OpenAI-compatible API (`http://host:port/v1`, with
+`Authorization: Bearer <key>` if a key is set). Atlas checks that the port is free, sends the key
+itself, and passes it to llama-server in a file (`data/llama-server.key`, readable only by you),
+so it never appears in a command line or log.
+
+Outside programs share the slots with Atlas: a request that lands in a slot Atlas is using (a
+restored document, or one being prefilled) makes Atlas prefill that document again. Keep outside
+use light, or run a second llama-server for other tools. Without an API key anyone who reaches the
+port can use the model and its slot endpoints. Under WSL in NAT mode, Windows programs reach it at
+`localhost`; other computers need a Windows port forward or WSL's mirrored networking.
+
 ## llama-server requirements
 
 Presets (and `scripts/run-llama-server.sh`) always set:
@@ -527,7 +543,8 @@ override the environment.
 | variable | default | notes |
 |---|---|---|
 | `ATLAS_LLAMA_SERVER_BIN` | *(empty)* | enables managed mode (presets); path or command of llama-server |
-| `ATLAS_LLAMA_PORT` | 8081 | managed llama-server port (bound to 127.0.0.1) |
+| `ATLAS_LLAMA_HOST` / `ATLAS_LLAMA_PORT` | 127.0.0.1 / 8081 | where the managed llama-server listens; `0.0.0.0` lets other programs use it. Also in the UI (Settings → Model → llama-server → Address), which overrides these |
+| `ATLAS_LLAMA_API_KEY` | *(empty)* | key llama-server requires (managed: passed via `--api-key-file`; external: the server's key). Also in the UI |
 | `ATLAS_LLAMA_URL` | `http://127.0.0.1:8080` | external mode only |
 | `ATLAS_KV_DIR` | `data/kv` | slot files; external mode: must equal `--slot-save-path` |
 | `ATLAS_DATA_DIR` | `data` | SQLite index and extracted texts |

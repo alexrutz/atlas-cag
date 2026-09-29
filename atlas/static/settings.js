@@ -157,10 +157,83 @@
         ${p ? `<dt>Model</dt><dd>${esc(p.model_path.split("/").pop())}</dd>
         <dt>Slots</dt><dd>${p.slots} × ${fmtInt(p.ctx_per_slot)} tokens · ${esc(p.kv_type)} KV cache${status?.fingerprint ? ` · configuration <code>${esc(status.fingerprint)}</code>` : ""}</dd>` : ""}
         <dt>GPU</dt><dd>${gpu}</dd>
-        <dt>Binary</dt><dd><code>${esc(tildify(sup.build || server.llama_server_bin))}</code> → <code>${esc(server.llama_url)}</code></dd>
+        <dt>Binary</dt><dd><code>${esc(tildify(sup.build || server.llama_server_bin))}</code></dd>
+        <dt>Address</dt><dd>${addressLine(sup, server)}</dd>
       </dl>
       ${sup.error ? `<div class="response-error">${esc(sup.error)}</div>` : ""}
       ${sup.fit_warning && sup.state === "running" ? `<div class="response-error">${esc(sup.fit_warning)}</div>` : ""}`;
+  }
+
+  const LOOPBACK = new Set(["127.0.0.1", "localhost", "::1"]);
+  const hostPort = (host, port) => `${host.includes(":") ? `[${host}]` : host}:${port}`;
+
+  function addressLine(sup, server) {
+    const exposed = !LOOPBACK.has(sup.host);
+    const pending = sup.listening && (sup.listening.host !== sup.host || sup.listening.port !== sup.port);
+    return `<code>${esc(hostPort(sup.host, sup.port))}</code>
+      ${exposed ? '<span class="badge warn" title="Other programs and computers that can reach this port can use llama-server">network</span>' : '<span class="muted">this computer only</span>'}
+      ${sup.api_key_set ? '<span class="badge ok" title="Clients must send Authorization: Bearer &lt;key&gt;">API key</span>' : exposed ? '<span class="warn-text">no API key</span>' : ""}
+      ${pending ? `<span class="muted">(running on ${esc(hostPort(sup.listening.host, sup.listening.port))} until the next start)</span>` : ""}
+      <button class="link-btn small" data-act="server-address">Change…</button>
+      ${exposed ? `<span class="muted small">OpenAI-compatible API for other programs: <code>http://${esc(hostPort(sup.host === "0.0.0.0" || sup.host === "::" ? (server.wsl ? "localhost" : "&lt;this computer&gt;") : sup.host, sup.port))}/v1</code></span>` : ""}`;
+  }
+
+  function randomKey() {
+    const bytes = crypto.getRandomValues(new Uint8Array(24));
+    return "sk-" + [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  async function editAddress(server) {
+    const sup = server.supervisor;
+    const mode = sup.host === "127.0.0.1" ? "local" : sup.host === "0.0.0.0" ? "all" : "custom";
+    const running = sup.preset && !["stopped", "stopping"].includes(sup.state);
+    const form = await A.openModal({
+      title: "llama-server address",
+      confirm: running ? "Save and restart llama-server" : "Save",
+      body: `
+        <label class="field">Listen on
+          <select name="mode">
+            <option value="local" ${mode === "local" ? "selected" : ""}>This computer only (127.0.0.1)</option>
+            <option value="all" ${mode === "all" ? "selected" : ""}>All network interfaces (0.0.0.0)</option>
+            <option value="custom" ${mode === "custom" ? "selected" : ""}>A specific address…</option>
+          </select></label>
+        <label class="field" data-custom ${mode === "custom" ? "" : "hidden"}>Host name or IP address of this computer
+          <input name="host" value="${esc(mode === "custom" ? sup.host : "")}" placeholder="192.168.1.20" autocomplete="off"></label>
+        <label class="field">Port<input name="port" type="number" min="1" max="65535" value="${sup.port}" required></label>
+        <label class="field">API key <span class="muted small">Clients must send it as <code>Authorization: Bearer &lt;key&gt;</code>; Atlas does so itself.
+          ${sup.api_key_set ? "A key is set: leave the field empty to keep it." : "Empty: no key."}</span>
+          <span class="input-row"><input name="api_key" autocomplete="off" spellcheck="false" placeholder="${sup.api_key_set ? "unchanged" : "no key"}">
+          <button type="button" class="btn small" data-generate>Generate</button></span></label>
+        ${sup.api_key_set ? '<label class="toggle"><input type="checkbox" name="remove_key"> Remove the key</label>' : ""}
+        <div class="address-note" data-exposed>
+          Other programs, and other computers that can reach this port, can then use llama-server, for example as an
+          OpenAI-compatible API at <code>/v1</code>. They share its slots with Atlas: a request that lands in a slot
+          Atlas is using makes Atlas prefill that document again, so keep outside use light. Set an API key: without
+          one, anyone who reaches the port can use the model and its slot files. Copy a new key before saving; it is
+          not shown again.
+          ${server.wsl ? "<br><br>Under WSL, programs on Windows reach it at <code>localhost</code>; other computers need a port forward on Windows (<code>netsh interface portproxy</code>) or WSL's mirrored networking." : ""}
+        </div>
+        ${running ? '<p class="muted small">Saving restarts llama-server on the new address; running questions are finished first. The document caches stay valid.</p>' : ""}`,
+      onOpen: (f) => {
+        const sync = () => {
+          f.querySelector("[data-custom]").hidden = f.mode.value !== "custom";
+          f.querySelector("[data-exposed]").hidden = f.mode.value === "local" ||
+            (f.mode.value === "custom" && LOOPBACK.has(f.host.value.trim()));
+        };
+        f.mode.addEventListener("change", sync);
+        f.host.addEventListener("input", sync);
+        f.querySelector("[data-generate]").addEventListener("click", () => { f.api_key.value = randomKey(); f.api_key.select(); });
+        sync();
+      },
+    });
+    if (!form) return;
+    const host = { local: "127.0.0.1", all: "0.0.0.0" }[form.mode.value] || form.host.value.trim();
+    const key = form.remove_key?.checked ? "" : form.api_key.value.trim() || null;
+    try {
+      const r = await (await api("/api/server/address", { method: "PUT", json: { host, port: Number(form.port.value), api_key: key } })).json();
+      toast(r.restarting ? `Restarting llama-server on ${hostPort(r.host, r.port)}…` : `llama-server will listen on ${hostPort(r.host, r.port)} from its next start`);
+      render();
+    } catch (err) { toast(err.message, "error"); }
   }
 
   function presetCard(p, running) {
@@ -379,6 +452,8 @@
           } },
         ]);
         return;
+      } else if (act === "server-address") {
+        await editAddress(await getJSON("/api/server"));
       } else if (act === "restart") {
         await api("/api/server/restart", { method: "POST" });
         toast("Restarting llama-server…");

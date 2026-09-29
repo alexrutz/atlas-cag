@@ -58,6 +58,7 @@ def main() -> None:
     ap.add_argument("--ctx-size", type=int, default=4096)
     ap.add_argument("--slot-save-path", required=True)
     ap.add_argument("--cache-type-k", default="f16")
+    ap.add_argument("--api-key-file")
     args, _unknown = ap.parse_known_args()
 
     print(f"load_model: loading model '{args.model}'", flush=True)
@@ -78,6 +79,16 @@ def main() -> None:
     fake.kv_format = args.cache_type_k
     fake.semantics = args.fake_semantics
     fake.vision = bool(args.mmproj)
+    if args.api_key_file:  # like llama-server: every endpoint but /health needs the key
+        from fastapi.responses import JSONResponse
+        key = Path(args.api_key_file).read_text().strip()
+
+        @fake.app.middleware("http")
+        async def require_key(request, call_next):
+            if request.url.path != "/health" and request.headers.get("authorization") != f"Bearer {key}":
+                return JSONResponse({"error": {"code": 401, "message": "Invalid API Key",
+                                               "type": "authentication_error"}}, status_code=401)
+            return await call_next(request)
     print(f"init: n_slots = {args.parallel}, n_ctx_slot = {args.ctx_size // args.parallel}", flush=True)
     uvicorn.run(fake.app, host=args.host, port=args.port, log_level="warning")
 

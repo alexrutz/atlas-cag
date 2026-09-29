@@ -157,11 +157,24 @@ def vision_ident(preset: dict) -> str | None:
     return ":".join([path.name, str(size), *sorted(image)])
 
 
-def build_command(binary: list[str], preset: dict, port: int, kv_dir: Path) -> list[str]:
+LOOPBACK = {"127.0.0.1", "localhost", "::1"}
+
+
+def connect_url(host: str, port: int) -> str:
+    """The URL Atlas reaches llama-server at when it listens on host:port."""
+    if host in ("", "0.0.0.0", "localhost"):
+        host = "127.0.0.1"  # listening everywhere includes this computer
+    elif host == "::":
+        host = "::1"
+    return f"http://[{host}]:{port}" if ":" in host else f"http://{host}:{port}"
+
+
+def build_command(binary: list[str], preset: dict, port: int, kv_dir: Path, host: str = "127.0.0.1",
+                  api_key_file: Path | None = None) -> list[str]:
     args = [
         *binary,
         "--model", preset["model_path"],
-        "--host", "127.0.0.1", "--port", str(port),
+        "--host", host, "--port", str(port),
         "--parallel", str(preset["slots"]),
         "--ctx-size", str(preset["slots"] * preset["ctx_per_slot"]),
         "--no-kv-unified", "--cache-ram", "0",
@@ -174,6 +187,8 @@ def build_command(binary: list[str], preset: dict, port: int, kv_dir: Path) -> l
         args.append("--swa-full")
     if preset.get("mmproj"):
         args += ["--mmproj", preset["mmproj"]]
+    if api_key_file:
+        args += ["--api-key-file", str(api_key_file)]  # the key itself never appears in a command line or log
     return args + shlex.split(preset.get("extra_args") or "")
 
 
@@ -197,6 +212,7 @@ class Supervisor:
         self.preset: dict | None = None
         self.started_at: float | None = None
         self.log: deque[str] = deque(maxlen=400)
+        self.listening: tuple[str, int] | None = None  # the address the running llama-server listens on
         self.proc: asyncio.subprocess.Process | None = None
         self._lock = asyncio.Lock()
         self._crashes: deque[float] = deque()
@@ -250,8 +266,12 @@ class Supervisor:
             "gpu_baseline": self.gpu_baseline,
             "build": self.running_command,
             "fit_warning": self.fit_warning,
-            "command": shlex.join(build_command(self.binary_for(self.preset), self.preset, self.port,
-                                                self.settings.kv_dir)) if self.preset else None,
+            "command": shlex.join(self._command(self.binary_for(self.preset))) if self.preset else None,
+            "host": self.settings.llama_host,
+            "port": self.settings.llama_port,
+            "url": connect_url(self.settings.llama_host, self.settings.llama_port),
+            "api_key_set": bool(self.settings.llama_api_key),
+            "listening": {"host": self.listening[0], "port": self.listening[1]} if self.listening else None,
             "log": list(self.log)[-200:],
         }
 
@@ -361,7 +381,14 @@ class Supervisor:
         if not binary:
             raise SupervisorError("no llama-server build: set ATLAS_LLAMA_SERVER_BIN or choose a build in the preset")
         self.running_command = command
-        cmd = build_command(binary, self.preset, self.port, self.settings.kv_dir)
+        # the address and key in effect now (Settings → Model can change them for the next start)
+        self.port = self.settings.llama_port
+        url = connect_url(self.settings.llama_host, self.port)
+        settings_key = self.settings.llama_api_key or None
+        self._write_key_file(settings_key)
+        self.engine.llama.retarget(url, settings_key)
+        self.settings.llama_url = url
+        cmd = self._command(binary)
         exe = shutil.which(cmd[0]) or cmd[0]
         env = os.environ.copy()
         # source builds keep their shared libraries next to the binary
@@ -397,7 +424,25 @@ class Supervisor:
             await asyncio.sleep(0.5)
         self.state = "running"
         self.started_at = time.time()
+        self.listening = (self.settings.llama_host, self.port)
         self._spawn(self._watch(proc))
+
+    @property
+    def key_file(self) -> Path:
+        return self.settings.data_dir / "llama-server.key"
+
+    def _write_key_file(self, key: str | None) -> None:
+        if not key:
+            self.key_file.unlink(missing_ok=True)
+            return
+        fd = os.open(self.key_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(key + "\n")
+        os.chmod(self.key_file, 0o600)
+
+    def _command(self, binary: list[str]) -> list[str]:
+        return build_command(binary, self.preset, self.settings.llama_port, self.settings.kv_dir,
+                             self.settings.llama_host, self.key_file if self.settings.llama_api_key else None)
 
     async def _pump(self, proc: asyncio.subprocess.Process) -> None:
         assert proc.stdout is not None
@@ -454,6 +499,7 @@ class Supervisor:
         self._pid_file.unlink(missing_ok=True)
         self.state = state
         self.started_at = None
+        self.listening = None
 
     def _kill_leftover(self) -> None:
         """Stop a llama-server left running by a previous Atlas process that died hard."""
@@ -463,7 +509,8 @@ class Supervisor:
         except (OSError, ValueError):
             self._pid_file.unlink(missing_ok=True)
             return
-        if "--slot-save-path" in cmdline and str(self.port) in cmdline:
+        # ours if it saves slots into our KV directory (its port may have been changed since)
+        if f"--slot-save-path {self.settings.kv_dir.resolve()}" in cmdline:
             log.warning("stopping leftover llama-server (pid %d)", pid)
             try:
                 os.kill(pid, signal.SIGTERM)

@@ -68,6 +68,56 @@ async def activate(client, preset_id: str, timeout: float = 30) -> dict:
                           "/api/status", timeout)
 
 
+async def test_server_address_and_key_can_be_changed(managed, tmp_path):
+    model_a, _ = managed.models
+    a = (await managed.post("/api/presets", json=preset("A", model_a))).json()
+    assert (await activate(managed, a["id"]))["ready"]
+    doc = await add_text(managed, "doc.txt", "The gearbox failed in April.")
+    first_port = (await managed.get("/api/server")).json()["supervisor"]["port"]
+
+    port = free_port()
+    r = await managed.put("/api/server/address", json={"host": "0.0.0.0", "port": port, "api_key": "s3cret-key"})
+    assert r.status_code == 202, r.text
+    assert r.json() == {"host": "0.0.0.0", "port": port, "url": f"http://127.0.0.1:{port}", "api_key_set": True,
+                        "exposed": True, "restarting": True}
+    await asyncio.sleep(0.3)
+    status = await wait_for(managed, lambda s: s["ready"], "/api/status", 30)
+    server = (await managed.get("/api/server")).json()
+    sup = server["supervisor"]
+    assert sup["listening"] == {"host": "0.0.0.0", "port": port} and server["llama_url"] == f"http://127.0.0.1:{port}"
+    assert "--host 0.0.0.0" in sup["command"] and f"--port {port}" in sup["command"] and "--api-key-file" in sup["command"]
+    assert "s3cret-key" not in sup["command"] and not any("s3cret-key" in line for line in sup["log"])
+    key_file = tmp_path / "data" / "llama-server.key"
+    assert key_file.read_text().strip() == "s3cret-key" and key_file.stat().st_mode & 0o777 == 0o600
+
+    # other programs need the key; Atlas sends it, and the document cache is still used
+    async with httpx.AsyncClient() as other:
+        assert (await other.get(f"http://127.0.0.1:{port}/props")).status_code == 401
+        assert (await other.get(f"http://127.0.0.1:{port}/props",
+                                headers={"Authorization": "Bearer s3cret-key"})).status_code == 200
+    done = (await query(managed, "What failed?", [doc["id"]]))[-1]
+    assert done["type"] == "done" and done["stats"]["cache_misses"] == 0 and status["engine"]["fingerprint"] == doc["fingerprint"]
+
+    # a port that is taken, Atlas's own port, a bad host
+    with socket.socket() as taken:
+        taken.bind(("127.0.0.1", 0))
+        taken.listen()
+        r = await managed.put("/api/server/address", json={"host": "127.0.0.1", "port": taken.getsockname()[1]})
+        assert r.status_code == 409 and "in use" in r.json()["detail"]
+    assert (await managed.put("/api/server/address", json={"host": "127.0.0.1", "port": 8000})).status_code == 422
+    assert (await managed.put("/api/server/address", json={"host": "my host", "port": port})).status_code == 422
+
+    # back to this computer only, without a key (null would keep it), on the port it had before,
+    # which was just released and still has connections in TIME_WAIT
+    r = await managed.put("/api/server/address", json={"host": "127.0.0.1", "port": first_port, "api_key": ""})
+    assert r.status_code == 202 and r.json()["api_key_set"] is False
+    await asyncio.sleep(0.3)
+    await wait_for(managed, lambda s: s["ready"], "/api/status", 30)
+    assert not key_file.exists()
+    assert managed.app.state.store.get_state("llama_address") == {"host": "127.0.0.1", "port": first_port, "api_key": None}
+    assert (await managed.get("/api/server")).json()["supervisor"]["listening"] == {"host": "127.0.0.1", "port": first_port}
+
+
 async def test_no_preset_means_no_server(managed):
     status = (await managed.get("/api/status")).json()
     assert status["mode"] == "managed" and not status["ready"]

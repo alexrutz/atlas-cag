@@ -16,9 +16,15 @@ class Settings(BaseSettings):
     # Managed mode: path (or command) of llama-server. Atlas then starts it itself from the
     # active preset. Leave empty to connect to an external llama-server at ATLAS_LLAMA_URL.
     llama_server_bin: str | None = None
-    llama_port: int = 8081  # managed mode; llama-server listens on 127.0.0.1 only
+    # Managed mode: where llama-server listens. 127.0.0.1 = this computer only; 0.0.0.0 = every
+    # network interface, so other programs (OpenAI-compatible clients) can use it too. Also
+    # editable in Settings → Model; the values saved there override these.
+    llama_host: str = "127.0.0.1"
+    llama_port: int = 8081
     llama_start_timeout_s: float = 900.0
-    llama_url: str = "http://127.0.0.1:8080"
+    llama_url: str = "http://127.0.0.1:8080"  # external mode: the llama-server to connect to
+    # Bearer token llama-server requires (managed: Atlas starts it with this key; external: the
+    # key of the server at llama_url). Empty = no key.
     llama_api_key: str | None = None
     # Must be the SAME directory that llama-server was started with via --slot-save-path.
     # Atlas verifies this at startup with a probe file.

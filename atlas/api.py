@@ -5,7 +5,10 @@ import hashlib
 import hmac
 import json
 import logging
+import platform
+import re
 import shutil
+import socket
 from contextlib import asynccontextmanager
 from pathlib import Path, PurePath
 
@@ -28,7 +31,7 @@ from .ingest import Ingestor
 from .query import QueryError, QueryService
 from .store import Store
 from . import sampling
-from .supervisor import PresetConfig, Supervisor, preset_sampling, standard_build
+from .supervisor import LOOPBACK, PresetConfig, Supervisor, connect_url, preset_sampling, standard_build
 from .updater import BuildUpdater, UpdateError
 
 log = logging.getLogger("atlas.api")
@@ -100,6 +103,12 @@ class ConversationBody(BaseModel):
     title: str = Field(min_length=1, max_length=200)
 
 
+class ServerAddress(BaseModel):
+    host: str = Field(min_length=1, max_length=253)  # 127.0.0.1: this computer only; 0.0.0.0: all interfaces
+    port: int = Field(ge=1, le=65535)
+    api_key: str | None = Field(default=None, max_length=512)  # null: keep the current key; "": no key
+
+
 class DownloadRequest(BaseModel):
     repo: str
     file: str
@@ -112,7 +121,7 @@ class BuildRequest(BaseModel):
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     if settings.managed:
-        settings.llama_url = f"http://127.0.0.1:{settings.llama_port}"
+        settings.llama_url = connect_url(settings.llama_host, settings.llama_port)
     defaults = {f: getattr(settings, f) for f in RUNTIME_FIELDS}
 
     @asynccontextmanager
@@ -125,6 +134,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         for key, value in (store.get_state("settings") or {}).items():
             if key in RUNTIME_FIELDS:
                 setattr(settings, key, value)
+        if settings.managed:  # the llama-server address chosen in Settings → Model
+            for key, value in (store.get_state("llama_address") or {}).items():
+                setattr(settings, f"llama_{key}", value)
+            settings.llama_url = connect_url(settings.llama_host, settings.llama_port)
         engine = Engine(settings)
         ingestor = Ingestor(engine, store, settings)
         downloader = Downloader(settings.hf_endpoint, settings.model_dirs[0])
@@ -1074,11 +1087,59 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {
             "mode": "managed" if s.supervisor else "external",
             "llama_url": settings.llama_url,
+            "wsl": "microsoft" in platform.release().lower(),
             "llama_server_bin": standard_build(settings, s.store) if s.supervisor else None,
             "supervisor": s.supervisor.to_json() if s.supervisor else None,
             "gpus": await models.gpu_info(),
             "ram_total": models.system_memory(),
         }
+
+    def check_host(host: str) -> str:
+        host = host.strip().strip("[]")
+        if host != "localhost" and not re.fullmatch(r"[0-9A-Za-z.:%_-]+", host):
+            raise HTTPException(422, f"host: '{host}' is not an IP address or host name")
+        return host
+
+    def can_listen(host: str, port: int) -> str | None:
+        """Why llama-server could not listen on host:port, or None."""
+        try:
+            infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except OSError as e:
+            return f"unknown host '{host}': {e.strerror or e}"
+        family, _, _, _, addr = infos[0]
+        with socket.socket(family, socket.SOCK_STREAM) as sock:
+            # like llama-server: a port it just left may still have connections in TIME_WAIT
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind(addr)
+                sock.listen()
+            except OSError as e:
+                if e.errno == 98:  # EADDRINUSE
+                    return f"port {port} is already in use by another program"
+                return f"cannot listen on {host}:{port}: {e.strerror or e}"
+        return None
+
+    @api.put("/server/address", status_code=202)
+    async def set_server_address(request: Request, body: ServerAddress):
+        """Where llama-server listens (and the key it requires); restarts it if it is running."""
+        s = st(request)
+        sup = managed(s)
+        host = check_host(body.host)
+        if body.port == settings.port:
+            raise HTTPException(422, f"port: {body.port} is Atlas's own port")
+        in_use_by_us = sup.listening is not None and sup.listening[1] == body.port
+        if not in_use_by_us and (problem := await asyncio.to_thread(can_listen, host, body.port)):
+            raise HTTPException(409, problem)
+        key = settings.llama_api_key if body.api_key is None else (body.api_key.strip() or None)
+        if key and not re.fullmatch(r"[\x21-\x7e]+", key):
+            raise HTTPException(422, "api_key: use printable characters without spaces")
+        settings.llama_host, settings.llama_port, settings.llama_api_key = host, body.port, key
+        s.store.set_state("llama_address", {"host": host, "port": body.port, "api_key": key})
+        restart = sup.preset is not None and sup.state not in ("stopped", "stopping")
+        if restart:
+            sup._spawn(sup.activate(sup.preset))
+        return {"host": host, "port": body.port, "url": connect_url(host, body.port), "api_key_set": bool(key),
+                "exposed": host not in LOOPBACK, "restarting": restart}
 
     @api.post("/server/restart", status_code=202)
     async def restart_server(request: Request):

@@ -46,6 +46,14 @@ class LlamaClient:
             limits=httpx.Limits(max_connections=256, max_keepalive_connections=64),
         )
 
+    def retarget(self, base_url: str, api_key: str | None) -> None:
+        """Talk to llama-server at another address (it was restarted there)."""
+        self._http.base_url = base_url.rstrip("/")
+        if api_key:
+            self._http.headers["Authorization"] = f"Bearer {api_key}"
+        else:
+            self._http.headers.pop("Authorization", None)
+
     async def aclose(self) -> None:
         await self._http.aclose()
 
