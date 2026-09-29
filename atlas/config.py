@@ -73,6 +73,10 @@ class Settings(BaseSettings):
     # Build KV caches automatically: for new documents, for every document when a new model
     # configuration becomes active, and to repair missing or broken caches.
     auto_build_caches: bool = True
+    # When another model configuration becomes active (other preset, model, KV type, build that
+    # computes differently), build the caches it lacks for the whole library. Off: documents show
+    # "not built" for it until built from the Library (Build all, or per document).
+    build_on_model_change: bool = False
     # How new PDFs and images are prefilled: "text" (extracted text) or "visual" (page images,
     # needs a preset with a vision projector). Each document can be switched later.
     default_prefill: Literal["text", "visual"] = "text"
@@ -177,6 +181,7 @@ class RuntimeSettings(BaseModel):
     ingest_concurrency: int = Field(ge=1, le=32)
     part_overlap_tokens: int = Field(ge=0, le=16384)
     auto_build_caches: bool
+    build_on_model_change: bool
     default_prefill: Literal["text", "visual"]
     visual_dpi: int = Field(ge=36, le=400)
     build_updates: Literal["off", "install", "apply"]

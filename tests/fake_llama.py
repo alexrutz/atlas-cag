@@ -211,9 +211,11 @@ class FakeLlama:
                              "sampling": {k: body[k] for k in SAMPLING_FIELDS if k in body}})
             if not body.get("stream"):
                 # non-streaming requests are only used for the canary's next-token check
-                token = 11 if fake.semantics == "default" else 12
+                token = 12 if fake.semantics == "custom" else 11
+                # "noisy": the same token with another probability, as another evaluation path gives
+                logprob = -1.2 if fake.semantics == "noisy" else -0.05
                 return {"content": "x", "stop": True, "tokens_cached": n,
-                        "completion_probabilities": [{"id": token, "token": "x", "logprob": -0.05}],
+                        "completion_probabilities": [{"id": token, "token": "x", "logprob": logprob}],
                         "timings": {"cache_n": n, "prompt_n": len(prompt) - n}}
             text = text if text is not None else detokenize(prompt)
             fake.log[-1]["prompt_text"] = text

@@ -701,7 +701,8 @@ dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; ma
 .seg.compute, .legend i.compute { background: #94a3b8; }
 .seg.draft, .legend i.draft { background: #e879a6; }
 .optional-box { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 12px 0; margin: 0 0 12px;
-  display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; }
+  display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; align-items: start; }
+.optional-box > .field { align-content: start; }
 .optional-box legend { font-size: 13px; font-weight: 650; padding: 0 4px; }
 .projector-hint:empty { display: none; }
 @media (max-width: 900px) { .optional-box { grid-template-columns: 1fr; } }
@@ -948,3 +949,4 @@ body.source-open .chat-module { grid-template-columns: 340px minmax(0, 1fr) minm
 .gd-table .num { text-align: right; }
 .gd-table .gd-label { max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
 .gen-body .table-wrap { overflow-x: auto; }
+.lib-missing { margin: 0 0 10px; justify-content: space-between; }

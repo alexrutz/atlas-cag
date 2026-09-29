@@ -25,6 +25,13 @@ NO_INFO = "NO_RELEVANT_INFORMATION"
 # Bump whenever the structure of the persisted prefix changes, so stored KV caches get rebuilt.
 PREFIX_VERSION = "1"
 
+# Reasoning blocks of the model families Atlas knows, as (opening, closing) text. Qwen, DeepSeek and
+# most others: <think> … </think>. Gemma 4 opens a channel named "thought": <|channel>thought … <channel|>.
+THINK_TAGS = (("<think>", "</think>"), ("<|channel>thought", "<channel|>"))
+# Control tokens llama-server leaves out of generated text unless a request lists them (strings
+# that are not a single token of the model are ignored by llama-server)
+THINK_TOKENS = ["<think>", "</think>", "<|channel>", "<channel|>"]
+
 
 class TemplateError(RuntimeError):
     pass
@@ -38,8 +45,13 @@ class Layout:
 
     @property
     def thinking_open(self) -> bool:
-        """True if the generation prompt already opened a reasoning block (model starts inside <think>)."""
-        return self.tail.rfind("<think>") > self.tail.rfind("</think>")
+        """True if the generation prompt already opened a reasoning block (the model starts inside it)."""
+        return any(self.tail.rfind(o) > self.tail.rfind(c) for o, c in THINK_TAGS)
+
+    @property
+    def think_tags(self) -> tuple[str, str]:
+        """The reasoning tags of this chat template: the pair its generation prompt uses, else <think>."""
+        return next(((o, c) for o, c in THINK_TAGS if o in self.tail or c in self.tail), THINK_TAGS[0])
 
 
 def split_rendered(rendered: str) -> Layout:
@@ -200,7 +212,7 @@ def history_block(history: list[tuple[str, str]]) -> str:
     return "Conversation so far:\n\n" + "\n\n".join(lines) + "\n\nNew message:\n"
 
 
-_THINK_RE = re.compile(r"<think>.*?(</think>|$)", re.S)
+_THINK_RE = re.compile("|".join(f"{re.escape(o)}.*?(?:{re.escape(c)}|$)" for o, c in THINK_TAGS), re.S)
 
 
 def strip_reasoning(text: str) -> str:
@@ -213,32 +225,40 @@ def is_no_info(answer: str) -> bool:
 
 
 class ThinkSplitter:
-    """Incrementally routes streamed text into ('reasoning', s) or ('answer', s) pieces."""
+    """Incrementally routes streamed text into ('reasoning', s) or ('answer', s) pieces, for any of
+    THINK_TAGS (a block opened with one pair is closed by the same pair)."""
 
-    OPEN, CLOSE = "<think>", "</think>"
+    OPEN, CLOSE = THINK_TAGS[0]
 
     def __init__(self, start_in_reasoning: bool = False):
         self.in_reasoning = start_in_reasoning
+        self._closing = [c for _, c in THINK_TAGS]  # started inside a block: any closing tag ends it
+        self._lead = False
         self._buf = ""
 
     def feed(self, text: str) -> list[tuple[str, str]]:
         self._buf += text
         out: list[tuple[str, str]] = []
         while self._buf:
-            tag = self.CLOSE if self.in_reasoning else self.OPEN
-            idx = self._buf.find(tag)
-            if idx >= 0:
+            tags = self._closing if self.in_reasoning else [o for o, _ in THINK_TAGS]
+            hits = [(i, t) for t in tags if (i := self._buf.find(t)) >= 0]
+            if hits:
+                idx, tag = min(hits)
                 if idx:
                     out.append(self._piece(self._buf[:idx]))
                 self._buf = self._buf[idx + len(tag):]
+                if not self.in_reasoning:
+                    self._closing = [c for o, c in THINK_TAGS if o == tag]
+                    self._lead = True  # Gemma's "<|channel>thought" is followed by a line break
                 self.in_reasoning = not self.in_reasoning
                 continue
             # keep a possible partial tag at the end of the buffer
             keep = 0
-            for k in range(min(len(tag) - 1, len(self._buf)), 0, -1):
-                if tag.startswith(self._buf[-k:]):
-                    keep = k
-                    break
+            for tag in tags:
+                for k in range(min(len(tag) - 1, len(self._buf)), keep, -1):
+                    if tag.startswith(self._buf[-k:]):
+                        keep = k
+                        break
             emit = self._buf[: len(self._buf) - keep]
             if emit:
                 out.append(self._piece(emit))
@@ -252,4 +272,7 @@ class ThinkSplitter:
         return out
 
     def _piece(self, s: str) -> tuple[str, str]:
+        if self.in_reasoning and self._lead:
+            self._lead = False
+            s = s.removeprefix("\n")
         return ("reasoning" if self.in_reasoning else "answer", s)

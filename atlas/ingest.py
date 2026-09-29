@@ -79,6 +79,23 @@ class Ingestor:
             self._pending.add(doc_id)
             self.queue.put_nowait(doc_id)
 
+    def build_missing(self) -> list[str]:
+        """Queue every document without a usable cache for the active configuration."""
+        fp = self.engine.info.fingerprint
+        if not fp:
+            return []
+        caches = self.store.caches_for(fp)
+        queued = []
+        for doc in self.store.list_documents():
+            cache = caches.get(doc.id)
+            wanted = self.variant_for(doc)
+            if wanted is None or self.is_busy(doc.id):
+                continue
+            if cache is None or cache.status in ("stale", "failed") or cache.built_as != wanted:
+                self.enqueue(doc.id)
+                queued.append(doc.id)
+        return queued
+
     def cancel(self, doc_id: str) -> None:
         self._cancelled.add(doc_id)
 
@@ -139,14 +156,15 @@ class Ingestor:
             if c.doc_id not in self._active:
                 self.remove_parts(c.doc_id, c.fingerprint)
                 self.store.delete_cache(c.doc_id, c.fingerprint)
-        auto = self.settings.auto_build_caches
+        auto = self.settings.auto_build_caches  # repairs of this configuration's caches
+        on_change = self.settings.build_on_model_change  # caches this configuration never had
         caches = self.store.caches_for(fp)
         n_ctx = self.engine.info.n_ctx_slot
         for doc in self.store.list_documents():
             cache = caches.get(doc.id)
             wanted = self.variant_for(doc)
             if cache is None:
-                if auto and wanted:
+                if on_change and wanted:
                     self.enqueue(doc.id)
                 continue
             if cache.status in ("queued", "ingesting"):
@@ -154,8 +172,9 @@ class Ingestor:
                     self.enqueue(doc.id)
                 continue
             if wanted and cache.built_as != wanted:
-                # switched between text and visual, or the projector / page resolution changed
-                if auto and not self.is_busy(doc.id):
+                # the preset's projector or the page resolution changed (a document switched between
+                # text and visual is queued when it is switched)
+                if on_change and not self.is_busy(doc.id):
                     self.enqueue(doc.id)
                 continue
             if cache.status == "failed" or wanted is None:
@@ -172,7 +191,8 @@ class Ingestor:
             elif status == "stale" and valid:
                 self.store.set_cache(doc.id, fp, status="ready", error=None)
                 status = "ready"
-            if status == "stale" and auto and not self.is_busy(doc.id):
+            # a missing file is repaired; parts larger than the slot come from a smaller slot size
+            if status == "stale" and not self.is_busy(doc.id) and (on_change if too_big else auto):
                 self.enqueue(doc.id)
 
     # --- worker ------------------------------------------------------------------------
@@ -433,7 +453,7 @@ class Ingestor:
         )
         self._retries.pop(doc_id, None)
         log.info("ingested %s: %d tokens in %d part(s)", doc.name, sum(p.n_tokens for p in created), len(created))
-        if fingerprint != eng.info.fingerprint and self.settings.auto_build_caches:
+        if fingerprint != eng.info.fingerprint and self.settings.build_on_model_change:
             # finished for the previous configuration (still valid there); build for the new one
             self._active.pop(doc_id, None)
             self.enqueue(doc_id)

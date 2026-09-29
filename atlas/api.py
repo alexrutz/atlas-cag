@@ -600,6 +600,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             cached.write_bytes(png)
         return FileResponse(cached, media_type="image/png", headers={"Cache-Control": "private, max-age=86400"})
 
+    @api.post("/documents/build-missing")
+    async def build_missing_caches(request: Request):
+        """Build the caches the running model configuration lacks (after switching presets)."""
+        s = st(request)
+        if not s.engine.info.fingerprint:
+            raise HTTPException(409, "no model is running")
+        return {"queued": s.ingestor.build_missing()}
+
     @api.post("/documents/{doc_id}/reingest")
     async def reingest_document(request: Request, doc_id: str):
         s = st(request)

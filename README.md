@@ -272,9 +272,19 @@ missing. Switching the source builds (or fetches) the current release in the cho
 **Build now** does it by hand.
 
 Caches are shared between builds when they are compatible. Every start restores a canary cache
-and checks that it still predicts the same next token as when it was built. A build that stores
-the cache differently or computes differently gets its own caches; an equivalent build (e.g. a
-newer release) reuses them.
+and checks that it still predicts the same next token as when it was built (the reference is taken
+from the restored file too). Only the token is compared: its probability moves with how
+llama-server evaluates the prompt (reusing the restored cache, re-evaluating from a checkpoint, or
+evaluating everything again, as standard builds do for sliding-window models), e.g. 0.31 vs 0.70
+for Gemma 4 with the same build and settings. A build that stores the cache differently or
+computes differently gets its own caches; an equivalent build (e.g. a newer release) reuses them.
+
+After another model configuration becomes active, Atlas does not prefill the library by itself:
+documents without a cache for it show *not built*, and the Library offers **Build all** (or build
+single documents). Settings → Generation → *Build the whole library when another model
+configuration starts* (`ATLAS_BUILD_ON_MODEL_CHANGE`) restores the automatic rebuild. New documents
+and repairs (a cache file that disappeared) are still built automatically
+(`ATLAS_AUTO_BUILD_CACHES`).
 
 Atlas keeps logs in `data/logs/`: `atlas.log` for Atlas itself and `llama-server.log` for every
 llama-server start with its full command line. Both rotate.
@@ -512,6 +522,14 @@ sampling; model, slot size, build and cache configuration. A table lists every l
 (each document part and the synthesis) with its slot, wait, restore, cached and evaluated tokens,
 speeds, first token, context used and why it stopped. The numbers are stored with the turn, so
 older conversations show them too (as far as they were recorded).
+
+### Thinking formats
+
+Atlas separates the model's reasoning from the answer for `<think> … </think>` (Qwen, DeepSeek and
+most others) and for Gemma 4's thought channel (`<|channel>thought … <channel|>`). Gemma's markers
+are control tokens that llama-server leaves out of generated text unless asked, so every request
+lists them as `preserved_tokens`. The reasoning shows under *Reasoning* and never goes into the
+conversation history.
 
 ## Limits and thinking
 

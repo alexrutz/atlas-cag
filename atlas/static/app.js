@@ -444,8 +444,10 @@
     }
     patchList($("#doc-list"), items);
     const s = state.status;
-    $("#library-foot").textContent = s
-      ? `${s.documents.count} documents · ${s.documents.ready} ready · ${fmtTok(s.documents.tokens)} tokens · ${fmtBytes(s.documents.kv_bytes)} KV for this model`
+    const notBuilt = state.docs.filter((d) => d.status === "not_built").length;
+    $("#library-foot").innerHTML = s
+      ? `${s.documents.count} documents · ${s.documents.ready} ready · ${fmtTok(s.documents.tokens)} tokens · ${fmtBytes(s.documents.kv_bytes)} KV for this model${
+        notBuilt && s.ready ? ` · <a href="#library">${notBuilt} not built for this model</a>` : ""}`
       : "";
   }
 

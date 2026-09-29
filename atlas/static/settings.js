@@ -682,17 +682,15 @@
             <select name="mmproj_select">${projectorOptions(p.mmproj)}</select>
             <input name="mmproj" placeholder="/path/to/mmproj.gguf" value="${esc(p.mmproj)}" ${customProjector ? "" : "hidden"}>
             <span class="projector-hint"></span>
-            <span class="muted small">For visual prefill: the model reads PDF pages and images as pictures (tables, charts, scans). Must belong to
-              the model, e.g. the <code>mmproj-*.gguf</code> from the same Hugging Face repository. Text caches are kept when you add or change it.</span>
+            <span class="muted small">For visual prefill: the model reads PDF pages and images as pictures (tables, charts, scans).
+              Use the <code>mmproj-*.gguf</code> from the model's repository. Text caches are kept.</span>
           </label>
           <label class="field">Draft model (speculative decoding)
             <select name="draft_select">${draftOptions(p.draft_model, p.model_path)}</select>
             <input name="draft_model" placeholder="/path/to/draft.gguf" value="${esc(p.draft_model)}" ${customDraft ? "" : "hidden"}>
-            <span class="muted small">A small model of the same family, or a DFlash / Eagle3 / MTP head made for this model, guesses the next
-              tokens and the model checks several at once: the same answers, generated faster when the guesses are good. It needs
-              its weights and a KV cache of its own (included in the estimate below). Restoring a document fills only the model's
-              cache, not the draft's, so guesses about the document's wording are weaker than on a freshly read prompt. Caches are kept
-              when you add or change it.</span>
+            <span class="muted small">Faster answers: a small model of the same family (or a DFlash / Eagle3 / MTP head for this model)
+              guesses ahead and the model checks several tokens at once. Needs extra memory (in the estimate). Guesses are weaker on
+              restored documents, because llama-server restores only the model's cache. Document caches are kept.</span>
           </label>
         </fieldset>
         <label class="field span2">llama-server build
@@ -1050,7 +1048,8 @@
     { key: "visual_dpi", label: "Page resolution (dpi)", type: "number", step: 10, min: 36, max: 400,
       help: "Higher reads small print better but costs more tokens per page. Changing it rebuilds visual caches." },
     { section: "Ingestion" },
-    { key: "auto_build_caches", label: "Build KV caches automatically (new documents, model switches, repairs)", type: "checkbox" },
+    { key: "auto_build_caches", label: "Build KV caches automatically for new documents and to repair missing ones", type: "checkbox" },
+    { key: "build_on_model_change", label: "Build the whole library when another model configuration starts (off: documents show “not built” until you build them in the Library)", type: "checkbox" },
     { key: "ingest_concurrency", label: "Slots used for ingestion at most", type: "number", step: 1, min: 1, help: "Always leaves at least one slot free for questions." },
     { key: "part_overlap_tokens", label: "Overlap between parts of large documents (tokens)", type: "number", step: 64, min: 0 },
     { section: "Prompts" },

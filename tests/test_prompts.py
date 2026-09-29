@@ -87,3 +87,23 @@ def test_split_coverage(text, answer, rating):
 def test_document_block_escapes_name():
     block = prompts.document_block('a "quoted"\nname', 1, 3, "body")
     assert block.startswith('<document name="a \'quoted\' name" part="2 of 3">\nbody\n')
+
+
+def test_gemma_thinking_channel_is_split_from_the_answer():
+    """Gemma 4 thinks in a channel: <|channel>thought\\n … <channel|> answer."""
+    text = "<|channel>thought\nThe user asks for 2+2.<channel|>The answer is 4."
+    for size in range(1, len(text) + 1):
+        chunks = [text[i:i + size] for i in range(0, len(text), size)]
+        answer, reasoning = feed_all(ThinkSplitter(), chunks)
+        assert (answer, reasoning) == ("The answer is 4.", "The user asks for 2+2."), size
+    # a <think> block is not closed by Gemma's tag and vice versa
+    answer, reasoning = feed_all(ThinkSplitter(), ["<think>a <channel|> b</think>c"])
+    assert (answer, reasoning) == ("c", "a <channel|> b")
+    assert prompts.strip_reasoning("<|channel>thought\nhidden<channel|>Visible") == "Visible"
+
+
+def test_gemma_generation_prompt():
+    off = prompts.Layout("", "", "<|turn>model\n<|channel>thought\n<channel|>")  # thinking off: an empty thought
+    assert not off.thinking_open and off.think_tags == ("<|channel>thought", "<channel|>")
+    assert not prompts.Layout("", "", "<|turn>model\n").thinking_open  # thinking on: the model opens the channel
+    assert prompts.Layout("", "", "<|im_start|>assistant\n<think>\n").think_tags == ("<think>", "</think>")

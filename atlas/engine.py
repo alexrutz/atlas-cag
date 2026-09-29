@@ -120,10 +120,12 @@ def cache_rejected(e: LlamaError) -> bool:
     return e.status == 400
 
 
-def canary_matches(ref: dict, got: tuple[int, float], tolerance: float = 0.25) -> bool:
-    """Same most-likely token with a similar probability: small numeric differences between builds
-    (kernels, flash attention) pass, a build that computes something else does not."""
-    return got[0] == ref["token"] and abs(math.exp(got[1]) - math.exp(ref["logprob"])) <= tolerance
+def canary_matches(ref: dict, got: tuple[int, float]) -> bool:
+    """The same most likely token. Its probability is not compared: it moves with how llama-server
+    evaluates the prompt (restored cache reused, a checkpoint re-evaluated, or everything evaluated
+    again, as standard builds do for sliding-window models), by 0.31 vs 0.70 for Gemma 4 with the
+    same build and settings. A build that computes something else predicts another token."""
+    return got[0] == ref["token"]
 
 
 class Engine:
@@ -339,6 +341,9 @@ class Engine:
         tokens = await self._canary_tokens()
         await self.prefill(slot, tokens)
         await self.llama.slot_save(slot, self.canary_file)
+        # the reference is taken the way the check later takes it: from the restored file
+        await self.llama.slot_erase(slot)
+        await self._restore_canary(slot)
         ref = await self._next_token(slot, tokens)
         refs = self._refs()
         if ref:
@@ -392,6 +397,10 @@ class Engine:
                             rebuild = True  # canary from before references existed: re-create it
                         else:
                             got = await self._next_token(slot, await self._canary_tokens())
+                            if got is not None and got[0] == ref["token"] and abs(got[1] - ref["logprob"]) > 0.1:
+                                log.info("the canary predicts the same token with p=%.2f instead of %.2f (a different "
+                                         "evaluation path, not a different build)", math.exp(got[1]),
+                                         math.exp(ref["logprob"]))
                             if got is not None and not canary_matches(ref, got):
                                 log.warning("the canary predicts token %s (p=%.2f) instead of %s (p=%.2f): this "
                                             "llama-server build computes differently from the one that built the "
@@ -688,6 +697,7 @@ class Engine:
             "n_predict": max(1, min(answer_cap + (budget or 0), free) if capped else free),
             "id_slot": slot,
             "cache_prompt": True,
+            "preserved_tokens": prompts.THINK_TOKENS,  # or Gemma's thinking markers are left out of the text
             **self.sampling,
         }
         if temperature is not None:
@@ -695,10 +705,11 @@ class Engine:
         if thinking_open and budget:
             # llama-server forces the end tag once the budget is spent, so an answer always follows.
             # The message key must be present: only its handler sets the tokens that get forced.
+            start_tag, end_tag = layout.think_tags
             payload.update({
                 "reasoning_budget_tokens": self.settings.max_thinking_tokens,
-                "reasoning_budget_start_tag": prompts.ThinkSplitter.OPEN,
-                "reasoning_budget_end_tags": [prompts.ThinkSplitter.CLOSE],
+                "reasoning_budget_start_tag": start_tag,
+                "reasoning_budget_end_tags": [end_tag],
                 "reasoning_budget_message": "\n\nThinking budget reached, answering now.\n",
                 "generation_prompt": layout.tail,
             })

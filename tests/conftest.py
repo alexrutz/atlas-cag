@@ -21,7 +21,8 @@ def fake(tmp_path):
 
 
 def atlas_settings(fake, tmp_path, **overrides) -> Settings:
-    values = dict(max_question_tokens=256, max_answer_tokens=256, max_final_tokens=256, part_overlap_tokens=32)
+    values = dict(max_question_tokens=256, max_answer_tokens=256, max_final_tokens=256, part_overlap_tokens=32,
+                  build_on_model_change=True)
     return Settings(
         _env_file=None,
         llama_url=fake.url,

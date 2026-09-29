@@ -180,7 +180,7 @@ async def test_preset_projector_starts_vision_and_keys_the_cache(tmp_path):
     settings = Settings(_env_file=None, llama_server_bin=f"{sys.executable} {CLI}", llama_port=free_port(),
                         kv_dir=tmp_path / "kv", data_dir=tmp_path / "data", models_dirs=str(models_dir),
                         scan_model_caches=False, llama_start_timeout_s=30, build_updates="off",
-                        max_question_tokens=256, max_answer_tokens=256, max_final_tokens=256)
+                        build_on_model_change=True, max_question_tokens=256, max_answer_tokens=256, max_final_tokens=256)
     app = create_app(settings)
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://atlas",

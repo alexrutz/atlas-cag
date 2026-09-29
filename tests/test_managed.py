@@ -43,6 +43,7 @@ async def managed(tmp_path, monkeypatch):
         scan_model_caches=False,
         llama_start_timeout_s=30,
         build_updates="off",
+        build_on_model_change=True,
         max_question_tokens=256,
         max_answer_tokens=256,
         max_final_tokens=256,
@@ -241,6 +242,8 @@ async def test_per_preset_builds_and_canary_check(managed):
     """Same model and cache format with three builds: a compatible build reuses the caches, one
     that computes differently fails the canary's next-token check and gets its own caches."""
     model = managed.models[0]
+    r = await managed.patch("/api/settings", json={"build_on_model_change": False})  # the default
+    assert r.status_code == 200
     default = (await managed.post("/api/presets", json=preset("Default build", model))).json()
     same = (await managed.post("/api/presets", json=preset(
         "Other compatible build", model, binary=f"{sys.executable} {CLI} --fake-semantics default"))).json()
@@ -259,8 +262,21 @@ async def test_per_preset_builds_and_canary_check(managed):
     server = (await managed.get("/api/server")).json()["supervisor"]
     assert "--fake-semantics default" in server["command"]
 
+    # the same token with another probability (another evaluation path): still compatible
+    noisy = (await managed.post("/api/presets", json=preset(
+        "Same build, other evaluation path", model, binary=f"{sys.executable} {CLI} --fake-semantics noisy"))).json()
+    status = await activate(managed, noisy["id"])
+    assert status["ready"] and status["engine"]["fingerprint"] == fp, "a probability change must not rebuild caches"
+    assert store.get_cache(doc["id"], fp).updated_at == built_at
+
     status = await activate(managed, odd["id"])
     assert status["ready"] and status["engine"]["fingerprint"] != fp, "canary mismatch must change the configuration"
+    # nothing is rebuilt by itself after the switch: the document waits until it is built
+    await asyncio.sleep(0.5)
+    docs = (await managed.get("/api/documents")).json()
+    assert docs[0]["status"] == "not_built"
+    r = await managed.post("/api/documents/build-missing")
+    assert r.json()["queued"] == [doc["id"]]
     docs = await wait_for(managed, lambda ds: ds[0]["status"] == "ready")
     assert docs[0]["fingerprint"] == status["engine"]["fingerprint"]
     assert (await query(managed, "What failed?", [doc["id"]]))[-1]["type"] == "done"

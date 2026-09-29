@@ -66,6 +66,7 @@
               <option value="all">Text and visual</option><option value="text">Text prefill</option><option value="visual">Visual prefill</option>
             </select>
           </div>
+          <div class="notice lib-missing" id="lib-missing" hidden></div>
           <div class="bulkbar" id="lib-bulk" hidden>
             <strong id="lib-bulk-n"></strong>
             <button class="btn small" data-act="bulk-chat">Ask in chat</button>
@@ -220,8 +221,22 @@
     if (document.activeElement !== mode) mode.value = uploadMode();
   }
 
+  // documents without a cache for the running model (after switching presets nothing is rebuilt by itself)
+  function renderMissing() {
+    const box = $("#lib-missing");
+    const running = S().status?.engine?.fingerprint && S().status?.ready;
+    const missing = S().docs.filter((d) => d.status === "not_built" || (d.status === "stale" && !d.progress));
+    const html = running && missing.length ? `<span><strong>${missing.length} document${missing.length === 1 ? " has" : "s have"} no KV cache</strong>
+      for the running model (${esc(S().status.engine.config_label || S().status.engine.model || "")}) and cannot be asked yet.
+      ${fmtTok(missing.reduce((s, d) => s + (d.n_chars || 0) / 4, 0))} tokens (estimated) to prefill.</span>
+      <button class="btn small primary" data-act="build-missing">Build all</button>` : "";
+    if (box.dataset.html !== html) { box.innerHTML = html; box.dataset.html = html; }
+    box.hidden = !html;
+  }
+
   function render() {
     if (!lib.built) build();
+    renderMissing();
     renderCollections();
     renderUploadControls();
     renderTable();
@@ -571,6 +586,12 @@
         return renderCollections();
       }
       if (coll) return setColl(coll.dataset.coll);
+      if (act === "build-missing") {
+        return A.run(async () => {
+          const { queued } = await (await api("/api/documents/build-missing", { method: "POST" })).json();
+          return queued;
+        }, "Building the missing caches");
+      }
       if (act === "bulk-clear") { lib.checked.clear(); return renderTable(); }
       if (act === "bulk-chat") return askInChat(checkedDocs());
       if (act === "bulk-group") return groupAsChapter(checkedDocs());
