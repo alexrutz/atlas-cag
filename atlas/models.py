@@ -77,6 +77,8 @@ class ModelInfo:
     input_bytes: int = 0  # token embeddings: always kept in system RAM by llama.cpp
     tied_embeddings: bool = False  # no output.weight: the embeddings double as output layer, copied to the GPU
     sampling: dict | None = None  # recommended sampling from general.sampling.* (see sampling.py)
+    tokenizer: str | None = None  # tokenizer.ggml.model ("gpt2", "llama", …): a draft model must match
+    vocab_size: int | None = None
     error: str | None = None
 
     def to_json(self) -> dict:
@@ -102,6 +104,10 @@ def _describe(info: ModelInfo) -> None:
     arch = meta.get("general.architecture")
     info.arch = arch
     info.name = display_name(meta.get("general.name") or meta.get("general.basename"), info.file)
+    info.tokenizer = meta.get("tokenizer.ggml.model")
+    tokens = meta.get("tokenizer.ggml.tokens")  # large arrays are skipped by the reader, only counted
+    info.vocab_size = (len(tokens) if isinstance(tokens, list) else tokens.get("skipped_array") if isinstance(tokens, dict)
+                       else meta.get(f"{meta.get('general.architecture')}.vocab_size"))
     info.size_label = meta.get("general.size_label")
     info.quant = FILE_TYPES.get(meta.get("general.file_type"), None)
     info.sampling = sampling.from_model(meta)
@@ -293,8 +299,29 @@ def _swa_cells(window: int, ctx: int, ubatch: int = 512) -> int:
     return min(ctx, -(-(window + ubatch) // 256) * 256)
 
 
+# llama.cpp refuses speculative decoding when the vocabularies differ by more than this
+DRAFT_VOCAB_TOLERANCE = 128
+
+
+def draft_problem(model: ModelInfo | None, draft: ModelInfo | None) -> str | None:
+    """Why a draft model cannot speed up `model`, or None if it looks compatible."""
+    if model is None or draft is None:
+        return None
+    if draft.error:
+        return f"the draft model cannot be read: {draft.error}"
+    if draft.path == model.path:
+        return "the draft model is the model itself"
+    if model.tokenizer and draft.tokenizer and model.tokenizer != draft.tokenizer:
+        return f"its tokenizer ({draft.tokenizer}) differs from the model's ({model.tokenizer})"
+    if model.vocab_size and draft.vocab_size and abs(model.vocab_size - draft.vocab_size) > DRAFT_VOCAB_TOLERANCE:
+        return (f"its vocabulary ({draft.vocab_size:,} tokens) differs from the model's ({model.vocab_size:,}): "
+                "use a smaller model of the same family")
+    return None
+
+
 def estimate(model: ModelInfo | None, ctx_per_slot: int, slots: int, kv_type: str,
-             extra_args: str = "", gpu_layers: str = "all", mmproj_bytes: int = 0, swa_full: bool = False) -> dict:
+             extra_args: str = "", gpu_layers: str = "all", mmproj_bytes: int = 0, swa_full: bool = False,
+             draft: ModelInfo | None = None) -> dict:
     """Rough memory estimate for a preset, in bytes: GPU (weights + KV + recurrent state + vision
     projector), system RAM (CPU-offloaded experts, input embeddings) and SSD (lazily read embeddings)."""
     if model is None or not model.kv_bytes_per_token_f16:
@@ -324,13 +351,20 @@ def estimate(model: ModelInfo | None, ctx_per_slot: int, slots: int, kv_type: st
     if mmproj_bytes and "--no-mmproj-offload" in shlex.split(extra_args or ""):
         ram += mmproj_bytes
         mmproj_bytes = 0
+    # a draft model gets its own context of the same size (llama.cpp has no smaller draft context)
+    # and a KV cache of the preset's type (Atlas passes -ctkd / -ctvd)
+    d = estimate(draft, ctx_per_slot, slots, kv_type, "", gpu_layers, 0, swa_full) if draft else {}
+    draft_bytes = sum(d.get(k, 0) for k in ("weights", "kv_cache", "recurrent", "compute"))
+    ram += d.get("ram", 0)
     return {
         "weights": int(gpu_weights),
         "kv_cache": int(kv),
         "recurrent": int(recurrent),
         "projector": int(mmproj_bytes),
         "compute": int(compute),
-        "total": int(gpu_weights + kv + recurrent + mmproj_bytes + compute),  # GPU
+        "draft": int(draft_bytes),
+        "draft_kv": int(d.get("kv_cache", 0)),
+        "total": int(gpu_weights + kv + recurrent + mmproj_bytes + compute + draft_bytes),  # GPU
         "ram": int(ram),
         "ssd": int(lazy_ssd),
         "kv_bytes_per_token": int(per_token),

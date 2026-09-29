@@ -15,7 +15,7 @@ from atlas import supervisor as supervisor_module
 from atlas.api import create_app
 from atlas.config import Settings
 
-from .gguf_writer import qwen35_like
+from .gguf_writer import qwen35_like, write_gguf
 from .helpers import add_text, query, wait_for
 
 CLI = Path(__file__).parent / "fake_llama_cli.py"
@@ -190,12 +190,43 @@ async def test_preset_validation(managed):
         ({"extra_args": "--port 9999 --threads 8"}, "--port"),
         ({"kv_type": "q4_0", "flash_attn": "off"}, "flash attention"),
         ({"gpu_layers": "lots"}, "gpu_layers"),
+        ({"draft_model": "/nope/draft.gguf"}, "draft model not found"),
+        ({"extra_args": "-md /tmp/x.gguf"}, "-md"),
     ]
     for override, message in cases:
         r = await managed.post("/api/presets", json={**preset("X", Path(model)), **override})
         assert r.status_code == 422 and message in r.json()["detail"], (override, r.text)
     ok = await managed.post("/api/presets", json=preset("X", Path(model), extra_args="--threads 8"))
     assert ok.status_code == 200
+
+
+async def test_draft_model_is_optional_and_keeps_the_caches(managed, tmp_path):
+    model_a, model_b = managed.models
+    draft = qwen35_like(tmp_path / "models" / "tiny-draft.gguf", "Tiny Draft")
+    plain = (await managed.post("/api/presets", json=preset("Plain", model_a))).json()
+    fast = (await managed.post("/api/presets", json=preset("With draft", model_a, draft_model=str(draft)))).json()
+    assert plain["draft_model"] == "" and fast["draft_model"] == str(draft)
+
+    await activate(managed, plain["id"])
+    doc = await add_text(managed, "doc.txt", "The gearbox failed in April.")
+    status = await activate(managed, fast["id"])
+    assert status["ready"] and status["engine"]["fingerprint"] == doc["fingerprint"], "a draft model must not rebuild caches"
+    command = (await managed.get("/api/server")).json()["supervisor"]["command"]
+    assert f"--model-draft {draft}" in command and "--gpu-layers-draft all" in command
+    assert "--cache-type-k-draft q8_0 --cache-type-v-draft q8_0" in command
+    assert (await query(managed, "What failed?", [doc["id"]]))[-1]["stats"]["cache_misses"] == 0
+
+    listed = {p["name"]: p for p in (await managed.get("/api/presets")).json()["presets"]}
+    est, base = listed["With draft"]["estimate"], listed["Plain"]["estimate"]
+    assert est["draft"] > est["draft_kv"] > 0 and est["total"] == base["total"] + est["draft"]
+    assert listed["With draft"]["draft"]["name"] == "Tiny Draft" and not listed["With draft"]["warnings"]
+
+    # a draft with another vocabulary is flagged before llama-server refuses it
+    other = write_gguf(tmp_path / "models" / "other-vocab.gguf", {
+        "general.architecture": "llama", "general.name": "Other", "tokenizer.ggml.model": "llama",
+        "tokenizer.ggml.tokens": ["b"] * 1500})
+    r = await managed.post("/api/presets/estimate", json={**preset("X", model_a), "draft_model": str(other)})
+    assert any("draft model will not work" in w for w in r.json()["warnings"]), r.json()["warnings"]
 
 
 async def test_per_preset_builds_and_canary_check(managed):

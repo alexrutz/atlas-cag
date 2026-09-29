@@ -34,6 +34,7 @@ RESERVED_FLAGS = {
     "-ctk", "--cache-type-k", "-ctv", "--cache-type-v", "-fa", "--flash-attn", "-ngl", "--gpu-layers",
     "--n-gpu-layers", "--swa-full", "--api-key", "--api-key-file", "--no-slots",
     "-mm", "--mmproj", "-mmu", "--mmproj-url", "--no-mmproj", "--mmproj-auto", "--no-mmproj-auto",
+    "-md", "--model-draft", "--spec-draft-model",
 }
 # llama-server options that change how images become tokens (part of visual cache variants)
 IMAGE_FLAGS = {"--image-min-tokens", "--image-max-tokens"}
@@ -57,16 +58,19 @@ class PresetConfig(BaseModel):
     extra_args: str = ""
     binary: str = ""  # llama-server command for this preset; empty = the standard build
     mmproj: str = ""  # vision projector (.gguf) for visual prefill; empty = text only
+    # draft model (or MTP / Eagle3 / DFlash head) for speculative decoding; empty = none
+    draft_model: str = ""
     sampling: SamplingConfig = Field(default_factory=SamplingConfig)  # unset values: from the model file
 
-    @field_validator("mmproj")
+    @field_validator("mmproj", "draft_model")
     @classmethod
-    def _mmproj(cls, v: str) -> str:
+    def _gguf_file(cls, v: str, info) -> str:
+        what = "vision projector" if info.field_name == "mmproj" else "draft model"
         v = (v or "").strip()
         if v and not v.endswith(".gguf"):
-            raise ValueError("vision projector must be a .gguf file")
+            raise ValueError(f"{what} must be a .gguf file")
         if v and not Path(v).is_file():
-            raise ValueError(f"vision projector not found: {v}")
+            raise ValueError(f"{what} not found: {v}")
         return v
 
     @field_validator("binary")
@@ -187,6 +191,9 @@ def build_command(binary: list[str], preset: dict, port: int, kv_dir: Path, host
         args.append("--swa-full")
     if preset.get("mmproj"):
         args += ["--mmproj", preset["mmproj"]]
+    if preset.get("draft_model"):  # on the same GPU layers, with a KV cache like the model's
+        args += ["--model-draft", preset["draft_model"], "--gpu-layers-draft", str(preset["gpu_layers"]),
+                 "--cache-type-k-draft", preset["kv_type"], "--cache-type-v-draft", preset["kv_type"]]
     if api_key_file:
         args += ["--api-key-file", str(api_key_file)]  # the key itself never appears in a command line or log
     return args + shlex.split(preset.get("extra_args") or "")

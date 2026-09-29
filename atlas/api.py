@@ -906,8 +906,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         build = builds.inspect(p.get("binary") or standard_build(settings, s.store) or "")
         mmproj = Path(p.get("mmproj") or "")
         mmproj_bytes = mmproj.stat().st_size if p.get("mmproj") and mmproj.is_file() else 0
+        draft = describe_draft(p.get("draft_model"), index)
         effective, source, missing = sampling.resolve(p.get("sampling"), (info.sampling or {}) if info else {})
         warnings = builds.preset_warnings(build, info.arch if info else None, p.get("extra_args", ""))
+        warnings += draft_warnings(build, info, p.get("draft_model"), draft)
         if missing:
             warnings.append(sampling.describe_missing(missing).capitalize())
         if p["id"] == active and s.engine.info.swa_restore_ok is False:
@@ -917,12 +919,33 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "sampling_model": (info.sampling or {}) if info else {}, "sampling_effective": effective,
                 "sampling_source": source, "sampling_missing": missing,
                 "mmproj_found": not p.get("mmproj") or mmproj.is_file(),
+                "draft_found": not p.get("draft_model") or draft is not None,
+                "draft": draft.to_json() if draft else None,
                 "model": info.to_json() if info else None,
                 "build": build.to_json(),
                 "warnings": warnings,
                 "estimate": models.estimate(info, p["ctx_per_slot"], p["slots"], p["kv_type"],
                                             p.get("extra_args", ""), p.get("gpu_layers", "all"), mmproj_bytes,
-                                            bool(p.get("swa_full")))}
+                                            bool(p.get("swa_full")), draft)}
+
+    def describe_draft(path: str | None, index: dict[str, models.ModelInfo] | None = None) -> models.ModelInfo | None:
+        if not path:
+            return None
+        if index and path in index:
+            return index[path]
+        return models.describe_file(Path(path)) if Path(path).is_file() else None
+
+    def draft_warnings(build, info, path: str | None, draft) -> list[str]:
+        if not path:
+            return []
+        if draft is None:
+            return ["Draft model file not found."]
+        out = []
+        if problem := models.draft_problem(info, draft):
+            out.append(f"The draft model will not work: {problem}.")
+        if build.flags and "--model-draft" not in build.flags and "-md" not in build.flags:
+            out.append(f"{build.version or 'This build'} does not support draft models (--model-draft).")
+        return out
 
     @api.get("/presets")
     async def list_presets(request: Request):
@@ -961,11 +984,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             build = builds.inspect(str(body.get("binary") or "") or standard or "")
             mmproj = Path(str(body.get("mmproj") or ""))
             mmproj_bytes = mmproj.stat().st_size if body.get("mmproj") and mmproj.is_file() else 0
+            draft_path = str(body.get("draft_model") or "").strip()
+            draft = describe_draft(draft_path)
             return {"sampling_model": info.sampling or {},
                     **models.estimate(info, int(body.get("ctx_per_slot") or 0), int(body.get("slots") or 1),
                                       str(body.get("kv_type") or "f16"), extra, str(body.get("gpu_layers") or "all"),
-                                      mmproj_bytes, bool(body.get("swa_full"))),
-                    "warnings": builds.preset_warnings(build, info.arch, extra), "build": build.to_json()}
+                                      mmproj_bytes, bool(body.get("swa_full")), draft),
+                    "warnings": builds.preset_warnings(build, info.arch, extra)
+                    + draft_warnings(build, info, draft_path, draft),
+                    "build": build.to_json()}
         try:
             return await asyncio.to_thread(check)
         except (ValueError, OSError):

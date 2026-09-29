@@ -699,6 +699,12 @@ dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; ma
 /* visual prefill */
 .seg.projector, .legend i.projector { background: #a855f7; }
 .seg.compute, .legend i.compute { background: #94a3b8; }
+.seg.draft, .legend i.draft { background: #e879a6; }
+.optional-box { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 12px 0; margin: 0 0 12px;
+  display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; }
+.optional-box legend { font-size: 13px; font-weight: 650; padding: 0 4px; }
+.projector-hint:empty { display: none; }
+@media (max-width: 900px) { .optional-box { grid-template-columns: 1fr; } }
 .pill.visual { background: #f3e8ff; color: #7e22ce; }
 .pill.needs_vision { background: var(--warn-soft); color: var(--warn); }
 @media (prefers-color-scheme: dark) { .pill.visual { background: #2e1a47; color: #d8b4fe; } }

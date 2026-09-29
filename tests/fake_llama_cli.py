@@ -23,6 +23,7 @@ HELP = """-m,    --model FNAME                    model path
 --slot-save-path PATH                   path to save slot kv cache
 -ctk,  --cache-type-k TYPE              KV cache data type for K
 -mm,   --mmproj FILE                    path to a multimodal projector file
+-md,   --spec-draft-model, --model-draft FNAME   draft model for speculative decoding
 -t,    --threads N                      number of threads
 """
 

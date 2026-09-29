@@ -166,6 +166,30 @@ values; the card points out a missing one until you add it.
 Changing the model, the KV cache type, flash attention or `--swa-full` creates a new cache
 configuration; its caches are built in the background, and the old ones are kept for when you switch back.
 
+### Draft models (speculative decoding)
+
+A preset can name a **draft model** (optional, next to the optional vision projector): a small
+model of the same family, or a DFlash / Eagle3 / MTP head made for the model (llama.cpp tells the
+kind from the file). It proposes the next tokens and the model verifies several at once: the same
+answers, generated faster when the guesses are good. Atlas passes `--model-draft` with the
+preset's GPU layers and KV cache type (`--gpu-layers-draft`, `--cache-type-k/v-draft`; later
+values in the extra arguments override them). The editor lists drafts with the model's vocabulary
+first and warns when a draft cannot work (different tokenizer or vocabulary, a build without
+`--model-draft`).
+
+- **Memory:** llama.cpp gives the draft its own KV cache for the full context (slots × context per
+  slot; there is no smaller draft context). A draft head with only sliding-window layers, such
+  as a DFlash head, needs little; a full small model at long contexts can need gigabytes. The
+  estimate includes it.
+- **Caches:** the draft does not change the model's KV cache, so adding, changing or removing it
+  keeps all document caches.
+- **With restored documents:** llama-server saves and restores only the model's KV cache, not the
+  draft's. After a document is loaded from its slot file, the draft has not read it, so its
+  guesses about the document's wording are weaker than on a freshly read prompt (heads that only
+  look at a recent window recover as the answer grows). N-gram self-speculation
+  (`--spec-type ngram-mod` in the extra arguments, no draft model) drafts from the slot's whole
+  token history, restored documents included, which suits answers that quote the document.
+
 ## llama-server builds
 
 Each preset can use its own llama-server build: a newer release, or a custom build for a model

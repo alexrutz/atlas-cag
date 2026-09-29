@@ -118,6 +118,7 @@
           ${est.recurrent ? `<span class="seg recurrent" style="width:${pct(est.recurrent, cap)}" title="Recurrent state ${fmtBytes(est.recurrent)}"></span>` : ""}
           ${est.projector ? `<span class="seg projector" style="width:${pct(est.projector, cap)}" title="Vision projector ${fmtGB(est.projector)}"></span>` : ""}
           ${est.compute ? `<span class="seg compute" style="width:${pct(est.compute, cap)}" title="Compute buffers ${fmtGB(est.compute)}"></span>` : ""}
+          ${est.draft ? `<span class="seg draft" style="width:${pct(est.draft, cap)}" title="Draft model ${fmtGB(est.draft)} (KV cache ${fmtGB(est.draft_kv)})"></span>` : ""}
         </div>
         <strong title="${view.gpuBaseline ? `${fmtGB(view.gpuBaseline)} of the GPU is used by other programs` : ""}">≈ ${fmtGB(est.total)}${gpu ? ` of ${fmtGB(gpu)} free` : ""}</strong></div>
       <div class="legend">
@@ -126,6 +127,7 @@
         ${est.recurrent ? `<span><i class="recurrent"></i>recurrent ${fmtBytes(est.recurrent)}</span>` : ""}
         ${est.projector ? `<span><i class="projector"></i>vision projector ${fmtGB(est.projector)}</span>` : ""}
         ${est.compute ? `<span title="Attention mask and, for a quantized KV cache, one layer converted to f16; reserved for a full slot"><i class="compute"></i>compute ${fmtGB(est.compute)}</span>` : ""}
+        ${est.draft ? `<span title="Weights, KV cache (${fmtGB(est.draft_kv)}) and compute buffer of the draft model"><i class="draft"></i>draft model ${fmtGB(est.draft)}</span>` : ""}
       </div>
       ${est.ram ? `<div class="est-row"><span class="est-label">RAM</span>
         <div class="bar"><span class="seg ram" style="width:${pct(est.ram, Math.max(ram, est.ram))}" title="Offloaded weights ${fmtGB(est.ram)}"></span></div>
@@ -252,6 +254,7 @@
           · ${p.slots} slot${p.slots > 1 ? "s" : ""} × ${fmtTok(p.ctx_per_slot)} context · ${esc(p.kv_type)} KV</div>
         ${build ? `<div class="muted small">llama-server ${esc(build)}</div>` : ""}
         ${p.mmproj ? `<div class="muted small">vision: ${esc(p.mmproj.split("/").pop())} · visual prefill available</div>` : ""}
+        ${p.draft_model ? `<div class="muted small">draft: ${esc(p.draft?.name || p.draft_model.split("/").pop())} · speculative decoding</div>` : ""}
         ${samplingSummary(p)}
         ${estimateBar(est)}
         ${problems.map((x) => `<div class="warn-text">${esc(x)}</div>`).join("")}
@@ -562,6 +565,26 @@
     return html + `<option value="__custom" ${custom ? "selected" : ""}>Other path…</option>`;
   }
 
+  // a draft must share the model's vocabulary (llama.cpp allows a difference of 128 tokens)
+  function draftFits(model, d) {
+    if (!model || !d || d.path === model.path) return false;
+    if (model.tokenizer && d.tokenizer && model.tokenizer !== d.tokenizer) return false;
+    return !(model.vocab_size && d.vocab_size && Math.abs(model.vocab_size - d.vocab_size) > 128);
+  }
+
+  function draftOptions(selected, modelPath) {
+    const model = view.models.find((m) => m.path === modelPath);
+    const others = view.models.filter((m) => m.path !== modelPath && !m.error);
+    const fit = others.filter((d) => draftFits(model, d)).sort((a, b) => a.size_bytes - b.size_bytes);
+    const rest = others.filter((d) => !fit.includes(d));
+    const opt = (m) => `<option value="${esc(m.path)}" ${m.path === selected ? "selected" : ""}>${esc(m.name || m.file)}${m.quant ? ` · ${esc(m.quant)}` : ""} · ${fmtBytes(m.size_bytes)}${m.arch && /dflash|eagle|mtp/i.test(m.arch) ? ` · ${esc(m.arch)} head` : ""}</option>`;
+    let html = `<option value="" ${selected ? "" : "selected"}>None · no speculative decoding</option>`;
+    if (fit.length) html += `<optgroup label="Same vocabulary as the model">${fit.map(opt).join("")}</optgroup>`;
+    if (rest.length) html += `<optgroup label="Other models (vocabulary differs: will not work)">${rest.map(opt).join("")}</optgroup>`;
+    const custom = selected && !view.models.some((m) => m.path === selected);
+    return html + `<option value="__custom" ${custom ? "selected" : ""}>Other path…</option>`;
+  }
+
   function buildOptions(selected) {
     const list = view.builds || [];
     const def = list.find((b) => b.default);
@@ -589,14 +612,15 @@
       swa_full: base.swa_full ?? !!model?.sliding_window,
       extra_args: base.extra_args ?? "",
       binary: base.binary ?? "",
-      mmproj: base.mmproj ?? (preset ? "" : suggestProjector(model?.path)),
+      mmproj: base.mmproj ?? "",
+      draft_model: base.draft_model ?? "",
       sampling: base.sampling || {},
     };
     let samplingModel = null;  // the model file's recommendations, from the estimate endpoint
-    let projectorTouched = !!preset;  // follow the model's projector until the user picks one
     const customBuild = p.binary && !(view.builds || []).some((b) => b.command === p.binary);
     const isCustom = p.model_path && !view.models.some((m) => m.path === p.model_path);
     const customProjector = p.mmproj && !view.projectors.some((x) => x.path === p.mmproj);
+    const customDraft = p.draft_model && !view.models.some((m) => m.path === p.draft_model);
     presetForm.innerHTML = `
       <div class="dialog-head"><h3>${preset?.id ? "Edit preset" : "New preset"}</h3>
         <button type="button" class="icon-btn" data-close aria-label="Close"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div>
@@ -630,12 +654,25 @@
             again unless this is on. Off caches only the window for sliding layers (far less memory) and needs a build with the SWA
             restore fix; Atlas checks this when the preset starts.</span>
         </label>
-        <label class="field span2">Vision projector (mmproj) for visual prefill
-          <select name="mmproj_select">${projectorOptions(p.mmproj)}</select>
-          <input name="mmproj" placeholder="/path/to/mmproj.gguf" value="${esc(p.mmproj)}" ${customProjector ? "" : "hidden"}>
-          <span class="muted small">Lets the model read PDF pages and images as pictures (tables, charts, scans). Must belong to the model, e.g. the
-            <code>mmproj-*.gguf</code> from the same Hugging Face repository. Text caches are kept when you add or change it.</span>
-        </label>
+        <fieldset class="span2 optional-box">
+          <legend>Optional</legend>
+          <label class="field">Vision projector (mmproj)
+            <select name="mmproj_select">${projectorOptions(p.mmproj)}</select>
+            <input name="mmproj" placeholder="/path/to/mmproj.gguf" value="${esc(p.mmproj)}" ${customProjector ? "" : "hidden"}>
+            <span class="projector-hint"></span>
+            <span class="muted small">For visual prefill: the model reads PDF pages and images as pictures (tables, charts, scans). Must belong to
+              the model, e.g. the <code>mmproj-*.gguf</code> from the same Hugging Face repository. Text caches are kept when you add or change it.</span>
+          </label>
+          <label class="field">Draft model (speculative decoding)
+            <select name="draft_select">${draftOptions(p.draft_model, p.model_path)}</select>
+            <input name="draft_model" placeholder="/path/to/draft.gguf" value="${esc(p.draft_model)}" ${customDraft ? "" : "hidden"}>
+            <span class="muted small">A small model of the same family, or a DFlash / Eagle3 / MTP head made for this model, guesses the next
+              tokens and the model checks several at once: the same answers, generated faster when the guesses are good. It needs
+              its weights and a KV cache of its own (included in the estimate below). Restoring a document fills only the model's
+              cache, not the draft's, so guesses about the document's wording are weaker than on a freshly read prompt. Caches are kept
+              when you add or change it.</span>
+          </label>
+        </fieldset>
         <label class="field span2">llama-server build
           <select name="build_select">${buildOptions(p.binary)}</select>
           <input name="binary" placeholder="/path/to/llama-server" value="${esc(p.binary)}" ${customBuild ? "" : "hidden"}>
@@ -702,6 +739,11 @@
     const update = () => {
       const m = currentModel();
       $(".model-info", presetForm).innerHTML = modelSummary(m);
+      // the projector is optional: offer the one next to the model instead of choosing it
+      const suggestion = !f.mmproj.value.trim() && suggestProjector(m?.path);
+      const hint = suggestion ? `<button type="button" class="link-btn small" data-use-projector="${esc(suggestion)}">Use ${esc(suggestion.split("/").pop())}, found next to this model</button>` : "";
+      const hintBox = $(".projector-hint", presetForm);
+      if (hintBox.dataset.html !== hint) { hintBox.innerHTML = hint; hintBox.dataset.html = hint; }
       // Rebuild the chips only when the model changes: re-rendering them on every change event
       // would replace a chip between mousedown and mouseup and swallow the click.
       const ctxMax = m?.ctx_train || 1048576;
@@ -721,7 +763,7 @@
           est = await (await api("/api/presets/estimate", { method: "POST", json: {
             model_path: f.model_path.value.trim(), ctx_per_slot: ctx, slots: Number(f.slots.value) || 1, swa_full: f.swa_full.checked,
             kv_type: f.kv_type.value, extra_args: f.extra_args.value, gpu_layers: f.gpu_layers.value.trim() || "all",
-            binary: f.binary.value.trim(), mmproj: f.mmproj.value.trim(),
+            binary: f.binary.value.trim(), mmproj: f.mmproj.value.trim(), draft_model: f.draft_model.value.trim(),
           } })).json();
         } catch { /* shown as "no estimate" */ }
         if (seq !== estimateSeq) return;
@@ -736,8 +778,13 @@
       }, 200);
     };
     presetForm.onchange = (e) => {
+      if (e.target.name === "draft_select") {
+        const custom = e.target.value === "__custom";
+        f.draft_model.hidden = !custom;
+        if (!custom) f.draft_model.value = e.target.value;
+        else f.draft_model.focus();
+      }
       if (e.target.name === "mmproj_select") {
-        projectorTouched = true;
         const custom = e.target.value === "__custom";
         f.mmproj.hidden = !custom;
         if (!custom) f.mmproj.value = e.target.value;
@@ -758,10 +805,8 @@
           f.model_path.value = e.target.value;
           const m = currentModel();
           if (m?.sliding_window) f.swa_full.checked = true;
-          if (!projectorTouched) {
-            f.mmproj.value = suggestProjector(m?.path);
-            f.mmproj_select.value = f.mmproj.value;
-          }
+          // drafts that fit the new model first; a draft that no longer fits stays visible but flagged
+          f.draft_select.innerHTML = draftOptions(f.draft_model.value.trim(), m?.path);
           if (m?.ctx_train && Number(f.ctx_per_slot.value) > m.ctx_train) f.ctx_per_slot.value = m.ctx_train;
         } else {
           f.model_path.focus();
@@ -776,6 +821,13 @@
     presetForm.onclick = (e) => {
       const b = e.target.closest("[data-ctx]");
       if (b) { f.ctx_per_slot.value = b.dataset.ctx; update(); }
+      const use = e.target.closest("[data-use-projector]");
+      if (use) {
+        f.mmproj.value = use.dataset.useProjector;
+        f.mmproj_select.value = f.mmproj.value;
+        f.mmproj.hidden = true;
+        update();
+      }
       if (e.target.closest("[data-act='sampling-reset']")) {
         for (const x of SAMPLING) f[`s_${x.key}`].value = "";
         renderSampling();
@@ -789,7 +841,7 @@
         ctx_per_slot: Number(f.ctx_per_slot.value), slots: Number(f.slots.value),
         kv_type: f.kv_type.value, flash_attn: f.flash_attn.value, gpu_layers: f.gpu_layers.value.trim() || "all",
         swa_full: f.swa_full.checked, extra_args: f.extra_args.value.trim(), binary: f.binary.value.trim(),
-        mmproj: f.mmproj.value.trim(), sampling: ownSampling(),
+        mmproj: f.mmproj.value.trim(), draft_model: f.draft_model.value.trim(), sampling: ownSampling(),
       };
       const err = $(".dialog-error", presetForm);
       const missing = missingSampling();
