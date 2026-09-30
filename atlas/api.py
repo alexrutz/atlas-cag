@@ -1014,7 +1014,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def create_preset(request: Request):
         s = st(request)
         managed(s)
-        data = validate_preset(await request.json())
+        data = await asyncio.to_thread(validate_preset, await request.json())
         if data.get("binary"):
             add_custom_build(s, data["binary"])  # a build typed into a preset joins the custom builds
         preset_id = s.store.save_preset(None, data)
@@ -1027,7 +1027,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         old = s.store.get_preset(preset_id)
         if not old:
             raise HTTPException(404, "preset not found")
-        data = validate_preset(await request.json())
+        data = await asyncio.to_thread(validate_preset, await request.json())
         if data.get("binary") and data["binary"] not in {b["command"] for b in custom_builds(s)}:
             add_custom_build(s, data["binary"])
         s.store.save_preset(preset_id, data)
@@ -1056,7 +1056,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         preset = s.store.get_preset(preset_id)
         if not preset:
             raise HTTPException(404, "preset not found")
-        validate_preset({k: preset[k] for k in PresetConfig.model_fields if k in preset}, complete=False)
+        await asyncio.to_thread(validate_preset, {k: preset[k] for k in PresetConfig.model_fields if k in preset}, False)
         sup._spawn(sup.activate(preset))
         return {"activating": preset_id}
 

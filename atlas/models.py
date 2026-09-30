@@ -388,19 +388,27 @@ def system_memory() -> int:
     return 0
 
 
+_gpu_query: asyncio.subprocess.Process | None = None
+_gpu_last: list[dict] = []
+
+
 async def gpu_info() -> list[dict]:
-    """GPUs as reported by nvidia-smi (empty if unavailable)."""
+    """GPUs as reported by nvidia-smi (empty if unavailable). While an earlier query hangs (the GPU
+    driver under WSL can block nvidia-smi for minutes) no new one is started: the last answer is used."""
+    global _gpu_query, _gpu_last
     exe = shutil.which("nvidia-smi")
     if not exe:
         return []
+    if _gpu_query is not None and _gpu_query.returncode is None:
+        return _gpu_last
     try:
-        proc = await asyncio.create_subprocess_exec(
+        proc = _gpu_query = await asyncio.create_subprocess_exec(
             exe, "--query-gpu=name,memory.total,memory.used", "--format=csv,noheader,nounits",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL, start_new_session=True,
         )
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        out, _ = await asyncio.wait_for(asyncio.shield(proc.communicate()), timeout=5)
     except (OSError, TimeoutError):
-        return []
+        return _gpu_last
     gpus = []
     for line in out.decode().strip().splitlines():
         try:
@@ -408,4 +416,5 @@ async def gpu_info() -> list[dict]:
             gpus.append({"name": name, "memory_total": int(total) * 2**20, "memory_used": int(used) * 2**20})
         except ValueError:
             continue
+    _gpu_last = gpus
     return gpus

@@ -11,6 +11,8 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import procs
+
 ELF_MACHINES = {0x3E: "x86-64", 0xB7: "ARM64", 0x03: "x86", 0x28: "ARM", 0xF3: "RISC-V", 0x15: "PowerPC64"}
 PE_MACHINES = {0x8664: "x86-64", 0xAA64: "ARM64", 0x14C: "x86"}
 HOST_MACHINE = {"x86_64": "x86-64", "amd64": "x86-64", "aarch64": "ARM64", "arm64": "ARM64"}.get(
@@ -113,7 +115,8 @@ def inspect(command: str) -> BuildInfo:
         env = _env_for(exe)
         if shutil.which("ldd") and not open(exe, "rb").read(2) == b"#!":
             try:
-                out = subprocess.run(["ldd", str(exe)], capture_output=True, text=True, timeout=15, env=env).stdout
+                res = procs.run(["ldd", str(exe)], timeout=15, env=env)
+                out = res.stdout if res else ""
                 info.missing_libs = sorted({line.split("=>")[0].strip() for line in out.splitlines() if "not found" in line})
             except (OSError, subprocess.TimeoutExpired):
                 pass
@@ -121,8 +124,9 @@ def inspect(command: str) -> BuildInfo:
             info.problem = "missing libraries: " + ", ".join(info.missing_libs)
         else:
             try:
-                res = subprocess.run([str(exe), *words[1:], "--version"], capture_output=True, text=True,
-                                     timeout=30, env=env)
+                res = procs.run([str(exe), *words[1:], "--version"], timeout=30, env=env)
+                if res is None:
+                    raise subprocess.TimeoutExpired(str(exe), 30)
                 if m := _VERSION.search(res.stdout + res.stderr):
                     semver, build, info.commit = m.groups()
                     # shallow clones (e.g. CI release packages) count only one commit
@@ -131,10 +135,9 @@ def inspect(command: str) -> BuildInfo:
                     info.version = tag
                 elif res.returncode != 0:
                     info.problem = (res.stderr or res.stdout).strip().splitlines()[-1][:300] if (res.stderr or res.stdout).strip() else f"exited with code {res.returncode}"
-                help_out = subprocess.run([str(exe), *words[1:], "--help"], capture_output=True, text=True,
-                                          timeout=30, env=env)
+                help_out = procs.run([str(exe), *words[1:], "--help"], timeout=30, env=env)
                 flags = set()
-                for line in (help_out.stdout + help_out.stderr).splitlines():
+                for line in ((help_out.stdout + help_out.stderr) if help_out else "").splitlines():
                     if line.startswith("-"):
                         flags.update(_FLAG.findall(_FLAG_PART.split(line, 1)[0]))
                 info.flags = sorted(flags)

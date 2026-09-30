@@ -24,13 +24,14 @@ import signal
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import zipfile
 from pathlib import Path
 
 import httpx
 
-from . import builds, models
+from . import builds, models, procs
 from .config import Settings
 from .store import Store
 from .supervisor import PresetConfig, Supervisor, standard_build
@@ -73,22 +74,20 @@ def _cuda_version(text: str) -> tuple[int, int] | None:
 
 def _driver_cuda() -> tuple[int, int] | None:
     """The newest CUDA version the installed driver supports ("CUDA Version" in nvidia-smi)."""
-    try:
-        out = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=20).stdout
-    except (OSError, subprocess.SubprocessError):
+    res = procs.run(["nvidia-smi"], timeout=10)
+    if res is None:
         return None
-    m = re.search(r"CUDA Version:\s*([\d.]+)", out)
+    m = re.search(r"CUDA Version:\s*([\d.]+)", res.stdout)
     return _cuda_version(m.group(1)) if m else None
 
 
 def _nvcc_version(nvcc: Path) -> tuple[int, int] | None:
     if m := re.search(r"cuda-(\d+\.\d+)", str(nvcc.resolve())):
         return _cuda_version(m.group(1))
-    try:
-        out = subprocess.run([str(nvcc), "--version"], capture_output=True, text=True, timeout=20).stdout
-    except (OSError, subprocess.SubprocessError):
+    res = procs.run([str(nvcc), "--version"], timeout=10)
+    if res is None:
         return None
-    m = re.search(r"release\s+([\d.]+)", out)
+    m = re.search(r"release\s+([\d.]+)", res.stdout)
     return _cuda_version(m.group(1)) if m else None
 
 
@@ -108,13 +107,29 @@ def find_nvcc() -> str | None:
 
 
 _toolchain_cache: tuple[float, dict] | None = None
+_toolchain_lock = threading.Lock()
+
+
+def cached_toolchain() -> dict | None:
+    """The last toolchain check, for status pages (never runs commands); refreshed in the background."""
+    stale = _toolchain_cache is None or time.time() - _toolchain_cache[0] > 300
+    if stale and not _toolchain_lock.locked():
+        threading.Thread(target=toolchain, daemon=True).start()
+    return _toolchain_cache[1] if _toolchain_cache else None
 
 
 def toolchain(max_age_s: float = 300.0) -> dict:
-    """What building llama.cpp from source needs, and what is missing (checked every few minutes)."""
+    """What building llama.cpp from source needs, and what is missing. Runs nvidia-smi and nvcc:
+    call it from a thread, not from the event loop."""
     global _toolchain_cache
     if _toolchain_cache and time.time() - _toolchain_cache[0] < max_age_s:
         return _toolchain_cache[1]
+    with _toolchain_lock:
+        return _check_toolchain()
+
+
+def _check_toolchain() -> dict:
+    global _toolchain_cache
     tools = {"git": shutil.which("git"), "cmake": shutil.which("cmake"),
              "c++": shutil.which("c++") or shutil.which("g++") or shutil.which("clang++"), "nvcc": find_nvcc()}
     result = {"tools": tools, "missing": [name for name, path in tools.items() if not path]}
@@ -126,15 +141,9 @@ def cuda_arch(configured: str) -> str:
     """CMAKE_CUDA_ARCHITECTURES for this machine's GPU, e.g. "89" for compute capability 8.9."""
     if configured:
         return configured
-    try:
-        out = subprocess.run(["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
-                             capture_output=True, text=True, timeout=20).stdout
-        caps = sorted({line.strip().replace(".", "") for line in out.splitlines() if line.strip()})
-        if caps:
-            return ";".join(caps)
-    except (OSError, subprocess.SubprocessError):
-        pass
-    return "native"
+    res = procs.run(["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"], timeout=10)
+    caps = sorted({line.strip().replace(".", "") for line in res.stdout.splitlines() if line.strip()}) if res else []
+    return ";".join(caps) if caps and all(c.isdigit() for c in caps) else "native"
 
 
 def patch_files() -> list[Path]:
@@ -218,7 +227,7 @@ class BuildUpdater:
             "source": self.settings.build_update_source,
             "source_repo": self.settings.build_source_repo,
             "patches": [p.stem for p in patch_files()],
-            "toolchain": toolchain()["missing"],
+            "toolchain": (cached_toolchain() or {"missing": []})["missing"],
             "last_check": state.get("last_check"),
             "latest": state.get("latest"),
             "error": state.get("error"),
@@ -396,7 +405,7 @@ class BuildUpdater:
         """Build llama-server for a release from source with Atlas's patches and make it the standard."""
         tag = release["tag"]
         key = tag + PATCHED_SUFFIX
-        tools = toolchain(max_age_s=0)
+        tools = await asyncio.to_thread(toolchain, 0)
         if tools["missing"]:
             raise UpdateError(f"building llama.cpp needs {', '.join(tools['missing'])}: install "
                               f"{'the CUDA toolkit' if 'nvcc' in tools['missing'] else 'the missing tools'}, "
