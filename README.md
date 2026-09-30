@@ -517,8 +517,28 @@ each answer lists them. Clicking a quote, a page chip or a citation `[n]` in a s
 opens the source panel: the page with the passage highlighted (browse to the neighboring pages),
 the text around it, and a button that opens the full text scrolled to the passage. A citation
 opens the quote of that finding that best matches the sentence it stands in. Turns recorded
-before quotes were located get a **Find the quoted passages** link. Visual documents without a
-text layer have nothing to match quotes against.
+before quotes were located get a **Find the quoted passages** link.
+
+### Scans and page citations
+
+Visual documents without a text layer (scans, images) are read by OCR in the background
+(`atlas/ocr.py`, RapidOCR on the CPU, `ATLAS_OCR`, `ATLAS_OCR_THREADS`). The OCR text is only used
+to check answers: the model still reads the page images, so the check is independent of it. OCR
+also keeps where every line and table cell is on its page, so a located quote is marked on the page
+image. A document can be asked while OCR runs; its quotes can be located afterwards. The library
+shows OCR progress, and a read document can also be prefilled from its OCR text.
+
+RapidOCR was chosen by measurement on 30 scanned pages of German company standards (tables,
+prose, sideways margin notes): it read 98.7 % of the words at least three of four engine setups
+agreed on and produced the fewest words no other setup read (66, against 550–640 for Tesseract 5,
+which dropped umlauts and turned table rules into words). Its orientation classifier turned short
+upright lines upside down ("≤ 600" as "009"), so sideways text is read turned both ways instead.
+
+Answers from page images are asked to give the page after each quote (`"…" (p. 3)`; the benchmarked
+prompts for text documents are unchanged). A quote is looked for on that page first; found on
+another page, it is marked with the page the answer said. A quote the OCR text does not contain,
+on a page the answer names, is shown in amber as **check** with that page next to it, since OCR can
+misread a scan; without a named page it counts as not found.
 
 ### Generation details
 
@@ -651,6 +671,8 @@ override the environment.
 | `ATLAS_CHAT_HISTORY` | true | also in the UI; send earlier turns with every question |
 | `ATLAS_DEFAULT_PREFILL` | text | also in the UI; `text` or `visual` for new PDFs and images |
 | `ATLAS_VISUAL_DPI` | 120 | also in the UI; page resolution for visual prefill |
+| `ATLAS_OCR` | true | read visual documents without a text layer by OCR, to locate quotes |
+| `ATLAS_OCR_THREADS` | 4 | CPU threads for OCR |
 | `ATLAS_RELEVANCE_FILTER` | false | also in the UI; see the prompt findings below |
 | `ATLAS_AUTO_BUILD_CACHES` | true | also in the UI |
 | `ATLAS_BUILD_UPDATES` | install | `off` / `install` / `apply`; also in the UI |

@@ -38,6 +38,10 @@ _LINE = r"(?:[^%s\n]|\n(?!\s*\n))*?"  # quoted text: any line breaks but a blank
 # opens an English “…”, and a short "term" must not leave its closing mark to open the next quote
 _QUOTED = re.compile('"(%s)"|“(%s)”|„(%s)[“”]|«\\s?(%s)\\s?»' % (_LINE % '"', _LINE % "”", _LINE % "“”", _LINE % "»"))
 _BLOCKQUOTE = re.compile(r"(?:^[ \t]*>[^\n]*(?:\n|$))+", re.M)
+# the page an answer gives for a quote: "(p. 3)", "(S. 3)", "(Seite 3–4)", "[page 3]", "(Page 8, Tabelle 2)"
+_PAGE_REF = r"[\(\[]\s*(?:pp?|pages?|s|seiten?)(?:\.\s*|\s+)(\d{1,5})(?:\s*(?:-|–|bis|to)\s*(\d{1,5}))?\b[^\)\]\n]{0,40}[\)\]]"
+_REF_AFTER = re.compile(r"[ \t]*[,;:]?[ \t]*" + _PAGE_REF, re.I)
+_REF_AT_END = re.compile(r"[ \t,;:]*" + _PAGE_REF + r"[ \t.]*$", re.I)
 
 
 def squash(text: str) -> str:
@@ -67,20 +71,42 @@ def _strip_quote(text: str) -> str:
 
 
 def quotes(answer: str, question: str = "") -> list[str]:
+    return [q for q, _ in cited_quotes(answer, question)]
+
+
+def _cited(quote: str, after: str) -> tuple[str, tuple[int, int] | None]:
+    """A quote and the pages the answer gives for it, right after it or at its end."""
+    m = _REF_AT_END.search(quote)
+    if m:
+        quote = quote[:m.start()]
+    else:
+        m = _REF_AFTER.match(after)
+    if not m:
+        return quote, None
+    a = int(m.group(1))
+    b = int(m.group(2)) if m.group(2) else a
+    return quote, (a, b) if a <= b <= a + 50 else (a, a)
+
+
+def cited_quotes(answer: str, question: str = "") -> list[tuple[str, tuple[int, int] | None]]:
     """The passages an answer quotes: text in quotation marks and blockquotes, long enough to be a
-    passage rather than a term, and not taken from the question."""
-    found: list[str] = []
+    passage rather than a term, and not taken from the question; each with the pages the answer
+    gives for it ("..." (p. 3)), if it gives any."""
+    found: list[tuple[str, tuple[int, int] | None]] = []
     rest = answer
     for m in _BLOCKQUOTE.finditer(answer):
         lines = [re.sub(r"^[ \t]*>[ \t]?", "", line) for line in m.group().splitlines()]
-        found.append(_strip_quote(" ".join(line.strip() for line in lines if line.strip())))
+        text = " ".join(line.strip() for line in lines if line.strip())
+        quote, pages = _cited(text, "")
+        found.append((_strip_quote(quote), pages or _cited("", answer[m.end():m.end() + 80])[1]))
         rest = rest.replace(m.group(), "\n")
-    found += [next(g for g in m.groups() if g is not None) for m in _QUOTED.finditer(rest)]
+    for m in _QUOTED.finditer(rest):
+        found.append(_cited(next(g for g in m.groups() if g is not None), rest[m.end():m.end() + 80]))
 
     asked = squash(question)
-    out: list[str] = []
+    out: list[tuple[str, tuple[int, int] | None]] = []
     seen: list[str] = []
-    for q in found:
+    for q, pages in found:
         q = " ".join(q.split())
         s = squash(q)
         if len(q) > MAX_QUOTE_CHARS or len(q.split()) < MIN_QUOTE_WORDS or len(s) < MIN_QUOTE_CHARS or (asked and s in asked):
@@ -88,7 +114,7 @@ def quotes(answer: str, question: str = "") -> list[str]:
         if any(s in other for other in seen):
             continue  # the same passage again, or a part of one already listed
         seen.append(s)
-        out.append(q)
+        out.append((q, pages))
         if len(out) >= MAX_QUOTES:
             break
     return out
@@ -221,6 +247,7 @@ class DocText:
         self.marker_ends = [m.end() for m in markers]
         self.page_numbers = [int(m.group(1)) for m in markers]
         self.squashed = Squashed(text, [(m.start(), m.end()) for m in markers])
+        self.ocr = False  # the text was read off page images by OCR (set by TextCache)
 
     def page_at(self, offset: int) -> int | None:
         i = bisect.bisect_right(self.page_starts, offset) - 1
@@ -243,11 +270,24 @@ class DocText:
         end = self.page_starts[inside[-1] + 1] if inside[-1] + 1 < len(self.page_starts) else len(self.text)
         return self.page_starts[inside[0]], end
 
-    def find(self, quote: str, prefer: tuple[int, int] | None = None) -> dict:
-        """Locate one quote; `prefer` is the range of the document part the answer came from."""
+    def find(self, quote: str, prefer: tuple[int, int] | None = None, cited: tuple[int, int] | None = None) -> dict:
+        """Locate one quote; `prefer` is the range of the document part the answer came from, `cited`
+        the pages the answer gives for the quote (looked at first; reported with the result)."""
+        hit = self._match(quote, prefer, cited)
+        if cited and self.page_numbers and 1 <= cited[0] <= max(self.page_numbers):
+            hit.update(cited_page=cited[0], cited_page_end=min(cited[1], max(self.page_numbers)))
+        if self.ocr:
+            hit["ocr"] = True
+        return hit
+
+    def _match(self, quote: str, prefer: tuple[int, int] | None, cited: tuple[int, int] | None) -> dict:
         match, in_part = None, False
         shown, quote = quote, _MARKER_IN_QUOTE.sub(" ", quote).strip() or quote  # a quote may copy "[Page 6]" lines
-        if prefer:
+        span = self.pages_span(*cited) if cited and self.page_numbers else None
+        if span and (on_page := self.squashed.locate(quote, *span)) and on_page.score >= 0.9:
+            match = on_page
+            in_part = bool(prefer) and prefer[0] <= match.start < prefer[1]
+        elif prefer:
             match = self.squashed.locate(quote, *prefer)
             in_part = match is not None
         if match is None or match.score < 0.9:
@@ -255,7 +295,7 @@ class DocText:
             if anywhere and (match is None or anywhere.score > match.score + 0.05):
                 match, in_part = anywhere, bool(prefer) and prefer[0] <= anywhere.start < prefer[1]
         if match is None:
-            return {"quote": shown, "found": False, **self._scattered(quote, prefer)}
+            return {"quote": shown, "found": False, **self._scattered(quote, span or prefer)}
         start, end = match.start, match.end
         while start > 0 and self.text[start - 1].isalnum():  # an approximate match may start mid-word
             start -= 1
@@ -299,8 +339,8 @@ class DocText:
 
     def evidence(self, answer: str, question: str = "", prefer: tuple[int, int] | None = None) -> list[dict]:
         out = []
-        for q in quotes(answer, question):
-            hit = self.find(q, prefer)
+        for q, cited in cited_quotes(answer, question):
+            hit = self.find(q, prefer, cited)
             if not hit["found"] and not hit.get("scattered") and question and restates(q, question):
                 continue  # the model put (a rewording of) the question in quotation marks
             out.append(hit)
@@ -322,6 +362,7 @@ class TextCache:
                 self._items.move_to_end(key)
                 return self._items[key]
         doc = DocText(path.read_text(encoding="utf-8"))
+        doc.ocr = (path.parent / "ocr.json").exists()
         with self._lock:
             self._items[key] = doc
             while len(self._items) > self.size:

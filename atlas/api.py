@@ -20,7 +20,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
-from . import __version__, builds, evidence, models, pdftools, prompts
+from . import __version__, builds, evidence, models, ocr, pdftools, prompts
 from . import pages as page_images
 from .config import RUNTIME_FIELDS, RuntimeSettings, Settings, get_settings
 from .downloads import Downloader, DownloadError
@@ -141,6 +141,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             settings.llama_url = connect_url(settings.llama_host, settings.llama_port)
         engine = Engine(settings)
         ingestor = Ingestor(engine, store, settings)
+        ocr_worker = ocr.OcrWorker(store, settings)
+        ocr_worker.start()
         downloader = Downloader(settings.hf_endpoint, settings.model_dirs[0])
         downloader.start()
         supervisor = Supervisor(settings, store, engine, ingestor) if settings.managed else None
@@ -150,6 +152,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.store = store
         app.state.engine = engine
         app.state.ingestor = ingestor
+        app.state.ocr = ocr_worker
         app.state.queries = QueryService(engine, store, ingestor, settings)
         app.state.downloader = downloader
         app.state.supervisor = supervisor
@@ -165,6 +168,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if supervisor:
                 await supervisor.shutdown()
             await downloader.stop()
+            await ocr_worker.stop()
             await ingestor.stop()
             await engine.aclose()
             store.close()
@@ -347,6 +351,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "queryable": bool(cache and cache.status == "ready" and wanted and cache.built_as == wanted),
             "visual_capable": page_images.supports_visual(doc.name),
             "has_text": doc.n_chars > 0,
+            "ocr": s.ocr.status(doc),  # text read off the page images, for locating quotes
         })
         return d
 
@@ -373,6 +378,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if files:
             (folder / "files.json").write_text(json.dumps(files), encoding="utf-8")
         s.ingestor.enqueue(doc.id)
+        s.ocr.enqueue(doc.id)  # no text: read the pages, so quotes can be checked
         return {"document": doc_json(s, s.store.get_document(doc.id))}
 
     def remove_document(s, doc_id: str) -> None:
@@ -525,8 +531,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def locate_evidence(request: Request, doc_id: str, body: EvidenceRequest):
         """Locate the passages an answer quotes (for answers recorded before quotes were located)."""
         s = st(request)
-        get_doc_or_404(s, doc_id)
+        doc = get_doc_or_404(s, doc_id)
         text = await asyncio.to_thread(doc_text, s, doc_id)
+        if not text.text.strip():
+            waiting = (s.ocr.status(doc) or {}).get("state") in ("queued", "running")
+            raise HTTPException(409, "the pages are still being read (OCR): try again in a moment" if waiting
+                                else "this document has no text to find the quotes in")
         prefer = None
         if body.part and s.engine.info.fingerprint:
             parts = s.store.get_parts(doc_id, s.engine.info.fingerprint, with_tokens=False)
@@ -557,7 +567,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"doc_id": doc_id, "name": doc.name, "start": start, "end": end, "before": text.text[a:start],
                 "passage": text.text[start:end], "after": text.text[end:b], "truncated_before": a > 0,
                 "truncated_after": b < n, "page": text.page_at(start), "page_end": text.page_at(max(start, end - 1)),
-                "n_pages": doc.n_pages, "pdf": PurePath(doc.name).suffix.lower() == ".pdf"}
+                "n_pages": doc.n_pages, "pdf": PurePath(doc.name).suffix.lower() == ".pdf",
+                "pages": page_images.supports_visual(doc.name)}  # has page images to show
 
     def original_pdf(doc_id: str) -> Path:
         original = next((settings.docs_dir / doc_id).glob("original*"), None)
@@ -570,7 +581,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         """Where the part of a located passage that is on `page` appears on the rendered page."""
         s = st(request)
         get_doc_or_404(s, doc_id)
-        original = original_pdf(doc_id)
         text = await asyncio.to_thread(doc_text, s, doc_id)
         span = text.page_range(page)
         if span is None:
@@ -578,6 +588,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         a, b = max(start, span[0]), min(end, span[1])
         if b - a < 4:
             return {"boxes": [], "score": 0.0}
+        layout = await asyncio.to_thread(ocr.load, settings.docs_dir / doc_id)
+        if layout is not None:  # the text was read by OCR, which kept where each piece is
+            return {"boxes": ocr.boxes(layout, page, a, b), "score": 1.0}
+        original = original_pdf(doc_id)
         try:
             return await asyncio.to_thread(evidence.page_boxes, original.read_bytes(), page, text.text[a:b])
         except ValueError as e:

@@ -82,6 +82,10 @@ class Settings(BaseSettings):
     default_prefill: Literal["text", "visual"] = "text"
     # Resolution PDF pages are rendered at for visual prefill; more dots = more image tokens.
     visual_dpi: int = 120
+    # Visual documents without a text layer (scans, images) are read by OCR in the background, so
+    # the quotes in answers can be located and marked on the page. The model never sees this text.
+    ocr: bool = True
+    ocr_threads: int = 4  # CPU threads for OCR (it runs next to llama-server)
 
     # --- generation -------------------------------------------------------------------
     # Off: every per-document answer is synthesized (best recall in testing). On: each answer

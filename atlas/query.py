@@ -374,7 +374,7 @@ class QueryService:
                  **res.stats()}
         return res, stats
 
-    async def _evidence(self, t: Target, answer: str, question: str) -> list[dict]:
+    async def _evidence(self, t: Target, answer: str, question: str) -> list[dict] | None:
         """Where the answer's quotes are in the document (preferring the part it was given)."""
         try:
             return await asyncio.to_thread(self._locate, t, answer, question)
@@ -382,13 +382,13 @@ class QueryService:
             log.exception("locating the quotes of %s failed", t.label)
             return []
 
-    def _locate(self, t: Target, answer: str, question: str) -> list[dict]:
+    def _locate(self, t: Target, answer: str, question: str) -> list[dict] | None:
         path = self.settings.docs_dir / t.doc.id / "text.txt"
         if not path.exists():
             return []
         doc = self.texts.get(path)
         if not doc.text.strip():
-            return []  # visual document without a text layer: nothing to match quotes against
+            return None  # no text yet (OCR still reading the pages): the quotes can be located later
         if t.part.visual:
             prefer = doc.pages_span(t.part.char_start + 1, t.part.char_end)
         else:
@@ -415,7 +415,7 @@ class QueryService:
         async def on_piece(channel: str, text: str) -> None:
             await emit({"type": "delta", "channel": channel, "text": text})
 
-        res, stats = await self._answer_target(plan, t, prompts.single_question_block(plan.question),
+        res, stats = await self._answer_target(plan, t, prompts.single_question_block(plan.question, t.part.visual),
                                                emit, tally, on_piece)
         await emit({"type": "target", "key": t.key, "status": "done", "stats": stats,
                     "evidence": await self._evidence(t, res.answer, plan.question)})
@@ -429,7 +429,8 @@ class QueryService:
             await emit({"type": "target_delta", "key": t.key, "channel": channel, "text": text})
 
         try:
-            block = prompts.map_question_block(plan.question, rate_coverage=self.settings.relevance_filter)
+            block = prompts.map_question_block(plan.question, rate_coverage=self.settings.relevance_filter,
+                                               visual=t.part.visual)
             res, stats = await self._answer_target(plan, t, block, emit, tally, on_piece)
         except asyncio.CancelledError:
             raise

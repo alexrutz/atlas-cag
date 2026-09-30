@@ -1159,17 +1159,29 @@
   const srcPanel = $("#source-panel");
   const src = { turn: null, target: null, index: 0, page: null, seq: 0, urls: [] };
 
-  const chipClass = (e) => (e.found ? (e.score < 0.98 ? " approx" : "") : e.scattered ? " apart" : " missing");
+  // a quote the OCR text does not contain, on a page the answer names: OCR can misread a scan, so the
+  // quote is shown on that page to be checked instead of being flagged as not in the document
+  const unconfirmed = (e) => !e.found && !e.scattered && e.ocr && e.cited_page;
+  const pagesLabel = (a, b) => (b && b !== a ? `p. ${a}–${b}` : `p. ${a}`);
+  // found on (one of) the pages the answer gives for it, or the answer gives none
+  const citedOk = (e) => !e.cited_page || (e.page <= (e.cited_page_end || e.cited_page) && (e.page_end || e.page) >= e.cited_page);
+  const chipClass = (e) => (e.found ? (e.score < 0.98 || !citedOk(e) ? " approx" : "") : e.scattered || unconfirmed(e) ? " apart" : " missing");
 
   function evLabel(e, i) {
-    if (!e.found) return e.scattered ? (e.page ? `p. ${e.page} · apart` : "words apart") : "not found";
-    if (e.page) return e.page_end && e.page_end !== e.page ? `p. ${e.page}–${e.page_end}` : `p. ${e.page}`;
+    if (!e.found) {
+      if (e.scattered) return e.page ? `p. ${e.page} · apart` : "words apart";
+      if (unconfirmed(e)) return `${pagesLabel(e.cited_page, e.cited_page_end)} · check`;
+      return e.cited_page ? `not found (${pagesLabel(e.cited_page, e.cited_page_end)})` : "not found";
+    }
+    if (e.page) return pagesLabel(e.page, e.page_end) + (citedOk(e) ? "" : ` · said ${e.cited_page}`);
     return `quote ${i + 1}`;
   }
   function evQuality(e) {
     if (!e.found && e.scattered) return `its words are ${e.page ? `on page ${e.page}` : "in the document"}, but not next to each other (a table or form)`;
-    if (!e.found) return "not found in the document";
-    return e.score >= 0.98 ? "exact quote" : `approximate match (${Math.round(e.score * 100)} % of the quote)`;
+    if (unconfirmed(e)) return `not in the OCR text of page ${e.cited_page}, which the answer gives: OCR may have misread it, compare it with the page`;
+    if (!e.found) return `not found in ${e.ocr ? "the OCR text of the document" : "the document"}`;
+    const match = e.score >= 0.98 ? "exact quote" : `approximate match (${Math.round(e.score * 100)} % of the quote)`;
+    return citedOk(e) ? match : `${match} on page ${e.page}, but the answer said page ${e.cited_page}`;
   }
   const clip = (text, n = 140) => (text.length > n ? text.slice(0, n).trimEnd() + "…" : text);
 
@@ -1178,8 +1190,11 @@
       return finished && t.text && docById(t.doc_id)
         ? `<button class="link-btn small" data-act="locate" data-key="${esc(t.key)}">Find the quoted passages in the document</button>` : "";
     }
-    if (!t.evidence.length) return "";
-    const missing = t.evidence.filter((e) => !e.found && !e.scattered).length;
+    if (!t.evidence.length) {  // e.g. answered from page images before OCR read them: the quotes can be looked up now
+      return finished && t.visual && /["“„«]/.test(t.text || "") && docById(t.doc_id)?.has_text
+        ? `<button class="link-btn small" data-act="locate" data-key="${esc(t.key)}">Find the quoted passages in the document</button>` : "";
+    }
+    const missing = t.evidence.filter((e) => !e.found && !e.scattered && !unconfirmed(e)).length;
     return `<span class="src-label">Sources</span>${t.evidence.map((e, i) =>
       `<button class="src-chip${chipClass(e)}" data-key="${esc(t.key)}" data-ev="${i}" title="“${esc(clip(e.quote, 300))}” · ${esc(evQuality(e))}">${esc(evLabel(e, i))}</button>`).join("")}${
       missing ? `<span class="src-warn" title="The model put these words in quotation marks, but they are not in the document: it may have paraphrased, or the statement is not backed by the source.">${missing} quote${missing === 1 ? "" : "s"} not found in the document</span>` : ""}`;
@@ -1203,10 +1218,10 @@
         range.setStart(node, a);
         range.setEnd(node, b);
         const span = document.createElement("span");
-        span.className = `quote-link${e.found ? "" : e.scattered ? " apart" : " missing"}`;
+        span.className = `quote-link${e.found ? "" : e.scattered || unconfirmed(e) ? " apart" : " missing"}`;
         span.dataset.key = key;
         span.dataset.ev = i;
-        span.title = e.found || e.scattered ? `${evQuality(e)} · click to see it in the document` : "Not found in the document";
+        span.title = e.found || e.scattered || e.cited_page ? `${evQuality(e)} · click to see it in the document` : "Not found in the document";
         range.surroundContents(span);
         const chip = document.createElement("button");
         chip.className = `src-chip inline${chipClass(e)}`;
@@ -1310,19 +1325,30 @@
       body.innerHTML = `${quote}<p class="muted">This document has been deleted from the library.</p>`;
       return;
     }
-    if (!e.found && e.scattered && e.page && /\.pdf$/i.test(t.doc_name)) {
-      body.innerHTML = `${quote}<div class="src-status approx">Words found apart · page ${e.page}</div>
-        <p class="muted">All words of this quote are on page ${e.page}, but not next to each other in the PDF's text: typical for tables
-          and forms, where the text layer stores the cells in another order than they appear. The quote can still be right: check it on the page.</p>
-        <div class="src-pager">
-          <button class="icon-btn" data-src="prev" aria-label="Previous page">${ICONS.caret}</button>
-          <span id="src-page-label"></span>
-          <button class="icon-btn" data-src="next" aria-label="Next page">${ICONS.caret}</button>
-          <span class="spacer"></span>
-          <button class="link-btn small" data-src="tab">Open page image</button>
-        </div>
-        <div class="page-view" id="src-page"><div class="page-ph"><span class="spinner"></span></div></div>${finding}`;
-      showPage(e.page, docById(t.doc_id)?.n_pages || 0);
+    const how = !t.visual ? "" : e.ocr
+      ? '<div class="src-how">The model read this document as page images. Its quotes are checked against text an OCR engine read off the same pages, independently of the model.</div>'
+      : '<div class="src-how">The model read this document as page images and quoted what it saw; the quote was then found in the PDF\'s text layer to mark it here.</div>';
+    const pager = `<div class="src-pager">
+        <button class="icon-btn" data-src="prev" aria-label="Previous page">${ICONS.caret}</button>
+        <span id="src-page-label"></span>
+        <button class="icon-btn" data-src="next" aria-label="Next page">${ICONS.caret}</button>
+        <span class="spacer"></span>
+        <button class="link-btn small" data-src="tab">Open page image</button>
+      </div>
+      <div class="page-view" id="src-page"><div class="page-ph"><span class="spinner"></span></div></div>`;
+    const onlyPage = !e.found && doc.visual_capable ? (e.scattered ? e.page : e.cited_page) : null;
+    if (onlyPage) {  // no passage to mark: show the page the quote should be on
+      const layer = e.ocr ? "the OCR text" : "the PDF's text";
+      const [status, cls, note] = e.scattered
+        ? [`Words found apart · page ${e.page}`, "approx", `All words of this quote are on page ${e.page}, but not next to each other in ${layer}: typical for tables
+            and forms, where the cells are stored in another order than they appear. The quote can still be right: check it on the page.`]
+        : unconfirmed(e)
+          ? [`Not confirmed · page ${onlyPage}`, "approx", `The answer gives page ${onlyPage} for this quote, but the OCR text of that page does not contain it.
+              OCR can misread scans, and models can misquote: compare the quote with the page.`]
+          : [`Not found · the answer says page ${onlyPage}`, "missing", `The model put these words in quotation marks and named page ${onlyPage}, but they are not
+              in ${esc(t.doc_name)}. It may have paraphrased the passage, or the statement is not backed by the document: check the page.`];
+      body.innerHTML = `${quote}${how}<div class="src-status ${cls}">${status}</div><p class="muted">${note}</p>${pager}${finding}`;
+      showPage(onlyPage, doc.n_pages || 0);
       return;
     }
     if (!e.found) {
@@ -1332,8 +1358,7 @@
         <button class="btn small" data-src="text">Open the full text</button>${finding}`;
       return;
     }
-    const how = t.visual ? '<div class="src-how">The model read this document as page images and quoted what it saw; the quote was then found in the PDF\'s text layer to mark it here.</div>' : "";
-    body.innerHTML = `${quote}${how}<div class="src-status${e.score < 0.98 ? " approx" : ""}">${esc(evQuality(e))}${e.page ? ` · page ${e.page}${e.page_end && e.page_end !== e.page ? `–${e.page_end}` : ""}` : ""}${e.in_part === false && t.n_parts > 1 ? " · in another part of the document" : ""}</div>
+    body.innerHTML = `${quote}${how}<div class="src-status${e.score < 0.98 || !citedOk(e) ? " approx" : ""}">${esc(evQuality(e))}${e.page && citedOk(e) ? ` · page ${e.page}${e.page_end && e.page_end !== e.page ? `–${e.page_end}` : ""}` : ""}${e.in_part === false && t.n_parts > 1 ? " · in another part of the document" : ""}</div>
       <div class="src-loading"><span class="spinner"></span> Loading the source…</div>`;
     let passage;
     try {
@@ -1345,14 +1370,7 @@
     if (seq !== src.seq) return;
     const pageText = (text) => esc(text).replace(/^\[Page (\d+)\]$/gm, '<span class="page-mark">Page $1</span>')
       .replace(/^\[File: (.+)\]\n?/gm, '<span class="page-mark file-mark">$1</span>');  // merged documents
-    const viewer = passage.pdf && e.page ? `<div class="src-pager">
-        <button class="icon-btn" data-src="prev" aria-label="Previous page">${ICONS.caret}</button>
-        <span id="src-page-label"></span>
-        <button class="icon-btn" data-src="next" aria-label="Next page">${ICONS.caret}</button>
-        <span class="spacer"></span>
-        <button class="link-btn small" data-src="tab">Open page image</button>
-      </div>
-      <div class="page-view" id="src-page"><div class="page-ph"><span class="spinner"></span></div></div>` : "";
+    const viewer = (passage.pages ?? passage.pdf) && e.page ? pager : "";
     $(".src-loading", body).outerHTML = `${viewer}
       <h4 class="src-sub">In the text</h4>
       <div class="src-text">${passage.truncated_before ? "… " : ""}${pageText(passage.before)}<mark>${pageText(passage.passage)}</mark>${pageText(passage.after)}${passage.truncated_after ? " …" : ""}</div>

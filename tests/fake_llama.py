@@ -99,7 +99,11 @@ class FakeLlama:
         if "Findings:" in text:
             return f"Synthesized from {text.count('Source:')} findings [1]."
         if "[image " in text:
-            return f"Saw {text.count('[image ')} page image(s)."
+            seen = f"Saw {text.count('[image ')} page image(s)."
+            asked = text.rsplit("Question: ", 1)[1].split("\n\n", 1)[0].lower() if "Question: " in text else ""
+            if "quote" in asked and '(p. 3)' in text:  # asked for quotes with their pages
+                return seen + ' Page 2 says "Page 2: pump pressure table" (p. 2).'
+            return seen
         question = text.rsplit("Question: ", 1)[1].split("\n\n", 1)[0].lower() if "Question: " in text else ""
         source = text[text.find("<document"): text.find("</document>")]
         doc = source.lower()

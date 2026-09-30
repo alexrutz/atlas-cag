@@ -164,7 +164,7 @@
       <td class="name-cell"><span class="lib-name" title="${esc(d.name)}">${esc(d.name)}</span>
         ${d.error && !["ready", "queued"].includes(d.status) ? `<span class="doc-error">${esc(d.error)}</span>` : ""}</td>
       <td class="muted place-cell" title="${esc(A.pathLabel(d.collection_id))}">${where ? esc(where) : "–"}</td>
-      <td>${d.mode === "visual" ? '<span class="pill visual">visual</span>' : '<span class="pill text">text</span>'}${pages}</td>
+      <td>${d.mode === "visual" ? '<span class="pill visual">visual</span>' : '<span class="pill text">text</span>'}${pages}${ocrNote(d)}</td>
       <td class="num">${d.n_tokens ? fmtInt(d.n_tokens) : "–"}</td>
       <td class="num">${d.n_parts || "–"}</td>
       <td class="num">${d.kv_bytes ? fmtBytes(d.kv_bytes) : "–"}</td>
@@ -248,6 +248,18 @@
   // ---------------------------------------------------------------- details panel
 
   let detailSeq = 0;
+  // OCR reads documents without a text layer in the background, so quotes in answers can be checked
+  function ocrText(d) {
+    const o = d.ocr;
+    if (!o) return "";
+    if (o.state === "done") return "read by OCR";
+    if (o.state === "running") return `OCR: page ${o.done || 0} of ${o.total || "?"}`;
+    if (o.state === "queued") return "OCR queued";
+    return `OCR failed${o.error ? `: ${o.error}` : ""}`;
+  }
+  const ocrNote = (d) => (d.ocr && d.ocr.state !== "done"
+    ? ` <span class="muted small" title="Text for checking the quotes in answers is being read off the pages">${esc(ocrText(d))}</span>` : "");
+
   async function renderDetail() {
     const panel = $("#lib-detail");
     const d = A.docById(lib.detail);
@@ -276,13 +288,14 @@
       <label class="field">Collection<select data-field="collection">${collOpts}</select></label>
       ${detail.visual_capable ? `<div class="field">Prefill
         <div class="seg-toggle" role="radiogroup">
-          <button type="button" data-mode="text" aria-pressed="${detail.mode === "text"}" ${detail.has_text ? "" : "disabled title=\"No text layer: this document can only be prefilled visually\""}>Extracted text</button>
+          <button type="button" data-mode="text" aria-pressed="${detail.mode === "text"}" ${detail.has_text ? (detail.ocr?.state === "done" ? 'title="Prefill from the text OCR read off the pages (it may contain reading errors)"' : "") : "disabled title=\"No text layer: this document can only be prefilled visually\""}>${detail.ocr?.state === "done" ? "OCR text" : "Extracted text"}</button>
           <button type="button" data-mode="visual" aria-pressed="${detail.mode === "visual"}">Page images</button>
         </div></div>` : ""}
       <dl class="kv">
         <dt>File</dt><dd>${fmtBytes(detail.size_bytes)}${detail.mime ? ` · ${esc(detail.mime)}` : ""}</dd>
         ${detail.n_pages ? `<dt>Pages</dt><dd>${detail.n_pages}</dd>` : ""}
-        <dt>Text</dt><dd>${detail.n_chars ? `${fmtInt(detail.n_chars)} characters` : "no text layer"}</dd>
+        <dt>Text</dt><dd>${detail.n_chars ? `${fmtInt(detail.n_chars)} characters` : "no text layer"}${detail.ocr
+          ? ` <span class="muted" title="Used to find and mark the quotes of answers on the pages; the model reads the page images">(${esc(ocrText(detail))})</span>` : ""}</dd>
         <dt>Added</dt><dd>${new Date(detail.created_at * 1000).toLocaleString()}</dd>
       </dl>
       ${parts ? `<h3 class="detail-sub">Parts (running model)</h3><ul class="detail-list">${parts}</ul>` : ""}

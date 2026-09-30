@@ -203,17 +203,23 @@ def file_context(text: str, start: int) -> str:
     return last.group(0) + "\n" if last else ""
 
 
-def single_question_block(question: str) -> str:
+# Page images carry no text to check a quote against (unless OCR read them), so an answer from them
+# gives each quote's page: the page is shown next to the quote, and the quote is looked for there.
+PAGE_CITATION = ' Give the page number after each quote, like this: "quoted words" (p. 3).'
+
+
+def single_question_block(question: str, visual: bool = False) -> str:
     # The quotes are located in the document afterwards, so the answer can be checked at its source.
     return (
         "Answer the question using only the document above, in the language of the question. "
-        "Support the answer with short verbatim quotes from the document in quotation marks. "
-        "If the document does not contain the answer, say so clearly.\n\n"
+        "Support the answer with short verbatim quotes from the document in quotation marks."
+        + (PAGE_CITATION if visual else "")
+        + " If the document does not contain the answer, say so clearly.\n\n"
         f"Question: {question}"
     )
 
 
-def map_question_block(question: str, rate_coverage: bool = False) -> str:
+def map_question_block(question: str, rate_coverage: bool = False, visual: bool = False) -> str:
     """Per-document question for the map phase.
 
     Chosen by benchmark (2B model; 5 multi-document questions x 3 runs, facts found in the final
@@ -222,13 +228,14 @@ def map_question_block(question: str, rate_coverage: bool = False) -> str:
     23% faster. Showing the ratings to the synthesis instead of filtering scored 17/27, and an
     early "reply NO_RELEVANT_INFORMATION" exit dropped 20/33 relevant documents on compound
     questions, so neither is used. Rewording the rating prompt moved misses from 3/33 to 14/33:
-    re-run a benchmark before changing any of these texts.
+    re-run a benchmark before changing any of these texts. The page citation sentence is only
+    added for page images (the benchmark used text documents).
     """
     head = (
         f"Question: {question}\n\n"
         "Quote the passages of the document above that are relevant to the question, then answer "
-        "based on those quotes. The question may have several parts and this document may cover "
-        "only some of them"
+        "based on those quotes." + (PAGE_CITATION if visual else "") + " The question may have several "
+        "parts and this document may cover only some of them"
     )
     if rate_coverage:
         return head + (
