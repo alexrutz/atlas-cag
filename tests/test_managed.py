@@ -294,12 +294,24 @@ async def test_builds_api_and_preset_build_validation(managed, tmp_path):
     r = await managed.post("/api/presets", json=preset("Missing", managed.models[0], binary="/nope/llama-server"))
     assert r.status_code == 422 and "not found" in r.json()["detail"]
 
-    assert (await managed.post("/api/builds", json={"command": str(win)})).status_code == 200
+    # one standard build and the custom builds added by hand (nothing is searched for on disk)
+    assert listing["standard"]["default"] and listing["custom"] == []
+    assert (await managed.post("/api/builds", json={"command": str(win), "name": "ARM fork"})).status_code == 200
     listing = (await managed.get("/api/builds")).json()
-    added = next(b for b in listing["builds"] if b["added"])
-    assert not added["runnable"] and "Windows" in added["problem"]
+    (added,) = listing["custom"]
+    assert added["name"] == "ARM fork" and not added["runnable"] and "Windows" in added["problem"]
     await managed.delete("/api/builds", params={"command": str(win)})
-    assert not any(b["added"] for b in (await managed.get("/api/builds")).json()["builds"])
+    assert (await managed.get("/api/builds")).json()["custom"] == []
+
+    # a build typed into a preset joins the list, shows who uses it and cannot be removed meanwhile
+    fork = f"{sys.executable} {CLI} --fake-version 9.9.9"
+    p = (await managed.post("/api/presets", json=preset("Fork preset", managed.models[0], binary=fork))).json()
+    (entry,) = (await managed.get("/api/builds")).json()["custom"]
+    assert entry["command"] == fork and entry["used_by"] == ["Fork preset"] and entry["listed"]
+    assert (await managed.post("/api/builds", json={"command": fork, "name": "Test fork"})).json()["name"] == "Test fork"
+    assert (await managed.delete("/api/builds", params={"command": fork})).status_code == 409
+    await managed.delete(f"/api/presets/{p['id']}")
+    assert (await managed.delete("/api/builds", params={"command": fork})).status_code == 200
 
     est = (await managed.post("/api/presets/estimate", json={**preset("X", managed.models[0]),
                                                              "extra_args": "--lazy-mode on"})).json()

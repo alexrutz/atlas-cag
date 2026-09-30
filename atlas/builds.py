@@ -16,12 +16,6 @@ PE_MACHINES = {0x8664: "x86-64", 0xAA64: "ARM64", 0x14C: "x86"}
 HOST_MACHINE = {"x86_64": "x86-64", "amd64": "x86-64", "aarch64": "ARM64", "arm64": "ARM64"}.get(
     platform.machine().lower(), platform.machine())
 
-SEARCH_PATTERNS = [
-    "~/*/llama-server", "~/*/llama-server.exe", "~/*/build*/bin/llama-server", "~/*/bin/llama-server",
-    "/usr/local/bin/llama-server", "/opt/*/llama-server", "/opt/*/bin/llama-server",
-]
-
-
 @dataclass
 class BuildInfo:
     command: str  # as used on the command line (may include arguments)
@@ -195,29 +189,6 @@ def unknown_flags(info: BuildInfo, extra_args: str) -> list[str]:
     known = set(info.flags)
     return sorted({a.split("=", 1)[0] for a in args if a.startswith("-") and not a[1:2].isdigit()
                    and a.split("=", 1)[0] not in known})
-
-
-def discover(default: str | None, added: list[str]) -> list[BuildInfo]:
-    """The default build, builds added in the UI and llama-server binaries in common places."""
-    commands: list[str] = []
-    if default:
-        commands.append(default)
-    commands += added
-    for pattern in SEARCH_PATTERNS:
-        base = Path(pattern).expanduser()
-        commands += [str(p) for p in Path(base.anchor).glob(str(base.relative_to(base.anchor)))]
-    if found := shutil.which("llama-server"):
-        commands.append(found)
-    seen: set[str] = set()
-    out = []
-    for c in commands:
-        _, exe = _executable(c)
-        ident = c if " " in c.strip() else str(exe.resolve()) if exe.exists() else c
-        if ident in seen:
-            continue
-        seen.add(ident)
-        out.append(inspect(c))
-    return out
 
 
 def preset_warnings(info: BuildInfo, model_arch: str | None, extra_args: str) -> list[str]:

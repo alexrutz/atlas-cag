@@ -64,13 +64,3 @@ def test_architecture_support_is_read_from_libllama(tmp_path):
     assert builds.supports_arch(info, None) is None
     warning = builds.preset_warnings(info, "qwen4exp", "")[0]
     assert "does not seem to support" in warning and "qwen4exp" in warning
-
-
-def test_discover_finds_default_and_added(tmp_path, monkeypatch):
-    monkeypatch.setattr(builds, "SEARCH_PATTERNS", [str(tmp_path / "*" / "llama-server")])
-    (tmp_path / "custom").mkdir()
-    found_exe = elf_file(tmp_path / "custom" / "llama-server", 0x3E if builds.HOST_MACHINE == "x86-64" else 0xB7)
-    default = f"{sys.executable} {CLI}"
-    found = builds.discover(default, [str(pe_file(tmp_path / "win.exe", 0x8664))])
-    assert [b.command for b in found][:2] == [default, str(tmp_path / "win.exe")]
-    assert str(found_exe) in {b.path for b in found}

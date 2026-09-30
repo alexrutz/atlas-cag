@@ -100,6 +100,7 @@ async def managed_updates(tmp_path, github, request):
         llama_start_timeout_s=30,
         github_api=github.url,
         build_update_repo="ai-dock/llama.cpp-cuda",
+        build_update_source="release",  # these tests install the prebuilt packages
         **getattr(request, "param", {"build_updates": "install"}),
     )
     app = create_app(settings)
@@ -144,7 +145,10 @@ async def test_update_becomes_standard_and_pins_incompatible_presets(managed_upd
 
     listing = (await client.get("/api/builds")).json()
     assert listing["default"] == updates["standard"] and listing["configured"] == configured
-    assert any(b["update"] and b["default"] for b in listing["builds"])
+    assert listing["standard"]["tag"] == "v0.5.0" and listing["standard"]["used_by"] == ["plain"]
+    # the preset pinned to the previous build: shown with the custom builds, not yet in the list
+    (pinned,) = listing["custom"]
+    assert pinned["command"] == configured and pinned["used_by"] == ["threads"] and not pinned["listed"]
 
     r = await client.post("/api/server/restart")
     assert r.status_code == 202

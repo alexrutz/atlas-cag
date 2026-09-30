@@ -309,21 +309,25 @@
         </section>
         <section class="card">
           <div class="card-head"><h2>llama-server builds</h2><button class="btn subtle" data-act="refresh-builds">Check again</button></div>
-          <p class="muted">Presets use the standard build unless they name their own, e.g. a custom build for a new model architecture.
-            Atlas keeps the standard build up to date, finds other builds in your home directory and checks that they run on this machine.</p>
+          <p class="muted"><strong>Standard</strong>: upstream llama.cpp with Atlas's fixes, built here and kept up to date. Use it for every
+            model upstream llama.cpp supports. <strong>Custom builds</strong>: llama-server binaries you add for models that need another
+            llama.cpp (a fork for a new architecture); they are not updated. A preset uses the standard build unless it names a custom one.</p>
           <div id="updates-box"></div>
+          <h3 class="builds-sub">Custom builds</h3>
           <div id="builds-list"><div class="muted"><span class="spinner"></span> Checking builds…</div></div>
           <form class="inline-form" id="add-build-form">
+            <input name="name" placeholder="Name, e.g. Qwen3.8 fork" maxlength="80" class="build-name">
             <input name="command" placeholder="/path/to/llama-server (or a command, e.g. /opt/qwen-fork/bin/llama-server)" required>
-            <button class="btn">Add build</button>
+            <button class="btn">Add custom build</button>
           </form>
         </section>`;
       loadBuilds();
       $("#add-build-form").addEventListener("submit", async (e) => {
         e.preventDefault();
         try {
-          const info = await (await api("/api/builds", { method: "POST", json: { command: e.target.elements.command.value.trim() } })).json();
-          toast(info.runnable ? `Added ${info.label}` : `Added, but it cannot run: ${info.problem}`, info.runnable ? "" : "error");
+          const info = await (await api("/api/builds", { method: "POST", json: {
+            command: e.target.elements.command.value.trim(), name: e.target.elements.name.value.trim() } })).json();
+          toast(info.runnable ? `Added ${info.name}` : `Added ${info.name}, but it cannot run: ${info.problem}`, info.runnable ? "" : "error");
           e.target.reset();
           loadBuilds();
         } catch (err) { toast(err.message, "error"); }
@@ -384,33 +388,28 @@
         : `Installing ${esc(job.tag || "")}${job.detail ? ` · ${esc(job.detail)}` : ""}`}…</div>`;
     }
     const latest = u.latest ? ` · newest release <a href="${esc(u.latest.url)}" target="_blank" rel="noopener">${esc(u.latest.tag)}</a>` : "";
+    const patched = (u.standard_tag || "").endsWith("+atlas");
+    const release = (u.standard_tag || "").replace("+atlas", "");
+    const fixes = std?.patched ? Object.entries(std.patched).map(([n, st]) =>
+      `${esc(n.replace(/^\d+-/, "").replace(/-/g, " "))}${st === "applied" ? "" : ` (${esc(st)})`}`).join(" · ") : "";
+    const what = !std ? `<code>${esc(tildify(u.standard) || "none")}</code> <span class="muted small">(ATLAS_LLAMA_SERVER_BIN, until the standard build is installed)</span>`
+      : patched ? `<strong>llama.cpp ${esc(release)} with Atlas's fixes</strong> <span class="muted small">built here ${fmtAgo(std.installed_at)}${fixes ? ` · ${fixes}` : ""}</span>`
+      : `<strong>llama.cpp ${esc(release)}</strong> <span class="warn-text">prebuilt, without Atlas's fixes</span>`;
     return `<div class="updates">
       <div class="updates-head">
+        <div class="standard-what"><div class="muted small">Standard build</div>${what}</div>
         <label class="field">Automatic updates
           <select data-setting="build_updates">${UPDATE_MODES.map(([v, l]) => `<option value="${v}" ${u.mode === v ? "selected" : ""}>${esc(l)}</option>`).join("")}</select>
         </label>
-        <label class="field">Build from
-          <select data-setting="build_update_source">
-            <option value="release" ${u.source === "release" ? "selected" : ""}>Prebuilt releases (${esc(u.repo)})</option>
-            <option value="patched" ${u.source === "patched" ? "selected" : ""}>Source, with Atlas's fixes (SWA restore, slot count)</option>
-          </select>
-        </label>
-        <button class="btn subtle" data-act="check-updates" ${working ? "disabled" : ""}>${u.source === "patched" && !(u.standard_tag || "").endsWith("+atlas") ? "Build now" : "Check now"}</button>
+        <button class="btn subtle" data-act="check-updates" ${working ? "disabled" : ""}>${u.source === "patched" && !patched ? "Build now" : "Check now"}</button>
       </div>
-      ${u.source === "patched" ? `<div class="muted small">Each release is built here from <code>${esc(u.source_repo)}</code> with Atlas's patches
-        (${u.patches.map(esc).join(", ")}) and installed as <code>&lt;tag&gt;+atlas</code>: restored documents of sliding-window models
-        (Gemma, gpt-oss, Spark) are reused without <code>--swa-full</code>, and slot files load after changing the number of slots.
-        If a patch no longer applies to a new release, the current build stays.</div>
-        ${u.toolchain.length ? `<div class="warn-text">Building needs ${u.toolchain.map(esc).join(", ")}${u.toolchain.includes("nvcc") ? " (the CUDA toolkit)" : ""}, which ${u.toolchain.length === 1 ? "is" : "are"} not installed.</div>` : ""}` : ""}
-      <dl class="kv">
-        <dt>Standard build</dt><dd>${std
-          ? `<strong>${esc(u.standard_tag)}</strong> <span class="muted small">released ${esc((std.published_at || "").slice(0, 10))} · installed ${fmtAgo(std.installed_at)}${
-            std.patched ? ` · built from source with ${Object.entries(std.patched).map(([n, st]) => `${esc(n.replace(/^\d+-/, ""))} (${esc(st)})`).join(", ")}` : ""}</span>`
-          : `<code>${esc(tildify(u.standard) || "none")}</code> <span class="muted small">ATLAS_LLAMA_SERVER_BIN</span>`}</dd>
-        <dt>Source</dt><dd><a href="https://github.com/${esc(u.repo)}/releases" target="_blank" rel="noopener">${esc(u.repo)}</a>
-          <span class="muted small">${esc(u.asset)}</span></dd>
-        <dt>Last check</dt><dd>${fmtAgo(u.last_check)}${latest}</dd>
-      </dl>
+      <div class="muted small">Follows the llama.cpp releases (as packaged by <a href="https://github.com/${esc(u.repo)}/releases" target="_blank" rel="noopener">${esc(u.repo)}</a>)${
+        u.source === "patched" ? `, each built here from <code>${esc(u.source_repo)}</code> with Atlas's fixes: restored documents of sliding-window
+        models (Gemma, gpt-oss, Spark) are reused, and slot files load after changing the number of slots. If a fix no longer applies to a
+        new release, the current build stays.` : ": prebuilt packages without Atlas's fixes."} Last check ${fmtAgo(u.last_check)}${latest}.</div>
+      ${u.source === "patched" && u.toolchain.length ? `<div class="warn-text">Building needs ${u.toolchain.map(esc).join(", ")}${u.toolchain.includes("nvcc") ? " (the CUDA toolkit)" : ""},
+        which ${u.toolchain.length === 1 ? "is" : "are"} not installed. <button class="link-btn small" data-act="build-source" data-source="release">Use prebuilt releases without the fixes</button></div>` : ""}
+      ${u.source === "release" ? `<div class="muted small"><button class="link-btn small" data-act="build-source" data-source="patched">Build the standard build with Atlas's fixes</button></div>` : ""}
       ${progress}
       ${u.restart_pending ? `<div class="notice">llama-server still runs the previous build.
         <button class="btn small primary" data-act="restart">Restart llama-server</button> to use ${esc(u.standard_tag || "the standard build")}.</div>` : ""}
@@ -433,20 +432,28 @@
   });
 
   async function loadBuilds() {
+    let res;
     try {
-      view.builds = (await getJSON("/api/builds")).builds;
+      res = await getJSON("/api/builds");
     } catch { return; }
+    view.builds = res.builds;
+    view.standardBuild = res.standard;
     const el = $("#builds-list");
     if (!el) return;
-    el.innerHTML = view.builds.length ? `<div class="table-wrap"><table class="table">
-      <thead><tr><th>Build</th><th>Location</th><th>Status</th><th></th></tr></thead><tbody>${
-      view.builds.map((b) => `<tr>
-        <td><strong>${esc(b.version || "–")}</strong>${b.default ? ' <span class="badge ok">standard</span>' : ""}${b.update ? ' <span class="badge">auto-updated</span>' : ""}${b.configured ? ' <span class="badge" title="ATLAS_LLAMA_SERVER_BIN">configured</span>' : ""}</td>
-        <td><code title="${esc(b.command)}">${esc(tildify(b.command))}</code></td>
-        <td>${b.runnable ? `<span class="ok-text">runs here</span> <span class="muted small">${b.flags} flags</span>`
-                          : `<span class="warn-text">${esc(b.problem)}</span>`}</td>
-        <td>${b.added ? `<button class="btn subtle small" data-act="remove-build" data-command="${esc(b.command)}">Remove</button>` : ""}</td>
-      </tr>`).join("")}</tbody></table></div>` : '<div class="empty-card">No llama-server builds found.</div>';
+    const used = (b) => (b.used_by.length ? b.used_by.map(esc).join(", ") : '<span class="muted">no preset</span>');
+    el.innerHTML = res.custom.length ? `<div class="table-wrap"><table class="table builds-table">
+      <thead><tr><th>Name</th><th>llama-server</th><th>Status</th><th>Used by</th><th></th></tr></thead><tbody>${
+      res.custom.map((b) => `<tr>
+        <td><strong>${esc(b.name)}</strong>${b.listed ? "" : ' <span class="badge warn" title="A preset uses this build, but it is not in the list">not in the list</span>'}</td>
+        <td><code title="${esc(b.command)}">${esc(tildify(b.command))}</code> <span class="muted small">${esc(b.version || "")}</span></td>
+        <td>${b.runnable ? '<span class="ok-text">runs here</span>' : `<span class="warn-text">${esc(b.problem)}</span>`}</td>
+        <td>${used(b)}</td>
+        <td class="build-actions">${b.listed
+          ? `<button class="btn subtle small" data-act="rename-build" data-command="${esc(b.command)}" data-name="${esc(b.name)}">Rename</button>
+             <button class="btn subtle small" data-act="remove-build" data-command="${esc(b.command)}" ${b.used_by.length ? `disabled title="Used by ${esc(b.used_by.join(", "))}"` : ""}>Remove</button>`
+          : `<button class="btn subtle small" data-act="list-build" data-command="${esc(b.command)}">Add to the list</button>`}</td>
+      </tr>`).join("")}</tbody></table></div>`
+      : '<div class="muted small">None. Add a llama-server here if a model needs a build other than the standard one.</div>';
   }
 
   body.addEventListener("click", async (e) => {
@@ -501,6 +508,10 @@
         $("#builds-list").innerHTML = '<div class="muted"><span class="spinner"></span> Checking builds…</div>';
         await loadBuilds();
         return;
+      } else if (act === "build-source") {
+        await api("/api/settings", { method: "PATCH", json: { build_update_source: btn.dataset.source } });
+        setTimeout(() => renderModel(false), 300);
+        return;
       } else if (act === "check-updates") {
         await api("/api/builds/updates/check", { method: "POST" });
         setTimeout(() => renderModel(false), 300);
@@ -513,6 +524,13 @@
         await api(`/api/builds/updates/unskip?tag=${encodeURIComponent(btn.dataset.tag)}`, { method: "POST" });
       } else if (act === "remove-build") {
         await api(`/api/builds?command=${encodeURIComponent(btn.dataset.command)}`, { method: "DELETE" });
+        await loadBuilds();
+        return;
+      } else if (act === "rename-build" || act === "list-build") {
+        const name = await A.promptText(act === "rename-build" ? "Rename custom build" : "Add to the custom builds",
+          "Name (what the build is for)", btn.dataset.name || "", act === "rename-build" ? "Rename" : "Add");
+        if (name === null || name === undefined) return;
+        await api("/api/builds", { method: "POST", json: { command: btn.dataset.command, name: name.trim() } });
         await loadBuilds();
         return;
       } else if (act === "reset-setting") {
@@ -601,13 +619,19 @@
     return html + `<option value="__custom" ${custom ? "selected" : ""}>Other path…</option>`;
   }
 
+  const standardLabel = (b) => !b ? "Standard build"
+    : `Standard · llama.cpp ${esc(b.tag ? b.tag.replace("+atlas", "") : b.version || "")}${b.patched ? " with Atlas's fixes" : ""} (kept up to date)`;
+
   function buildOptions(selected) {
     const list = view.builds || [];
     const def = list.find((b) => b.default);
-    let html = `<option value="" ${selected ? "" : "selected"}>Standard build${def ? ` · ${esc(def.label)}` : ""} (kept up to date)</option>`;
-    for (const b of list.filter((x) => !x.default)) {
-      html += `<option value="${esc(b.command)}" ${b.command === selected ? "selected" : ""} ${b.runnable ? "" : "disabled"}>${esc(b.label)}${b.runnable ? "" : ` — ${esc(b.problem)}`}</option>`;
+    let html = `<option value="" ${selected ? "" : "selected"}>${standardLabel(def)}</option>`;
+    const customBuilds = list.filter((x) => !x.default);
+    if (customBuilds.length) html += '<optgroup label="Custom builds">';
+    for (const b of customBuilds) {
+      html += `<option value="${esc(b.command)}" ${b.command === selected ? "selected" : ""} ${b.runnable ? "" : "disabled"}>${esc(b.name)} · ${esc(tildify(b.command))}${b.runnable ? "" : ` — ${esc(b.problem)}`}</option>`;
     }
+    if (customBuilds.length) html += "</optgroup>";
     const custom = selected && !list.some((b) => b.command === selected);
     return html + `<option value="__custom" ${custom ? "selected" : ""}>Other command…</option>`;
   }

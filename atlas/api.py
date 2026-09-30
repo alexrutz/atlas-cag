@@ -116,6 +116,7 @@ class DownloadRequest(BaseModel):
 
 class BuildRequest(BaseModel):
     command: str = Field(min_length=1, max_length=2000)
+    name: str = Field(default="", max_length=80)  # what the build is for, e.g. "Qwen3.8 fork"
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -1013,7 +1014,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def create_preset(request: Request):
         s = st(request)
         managed(s)
-        preset_id = s.store.save_preset(None, validate_preset(await request.json()))
+        data = validate_preset(await request.json())
+        if data.get("binary"):
+            add_custom_build(s, data["binary"])  # a build typed into a preset joins the custom builds
+        preset_id = s.store.save_preset(None, data)
         return s.store.get_preset(preset_id)
 
     @api.put("/presets/{preset_id}")
@@ -1024,6 +1028,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not old:
             raise HTTPException(404, "preset not found")
         data = validate_preset(await request.json())
+        if data.get("binary") and data["binary"] not in {b["command"] for b in custom_builds(s)}:
+            add_custom_build(s, data["binary"])
         s.store.save_preset(preset_id, data)
         running = s.supervisor.preset if s.supervisor else None
         restart = False
@@ -1056,22 +1062,55 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # --- llama-server builds -----------------------------------------------------------
 
-    def added_builds(s) -> list[str]:
-        return s.store.get_state("builds") or []
+    # Builds: one standard build (upstream llama.cpp with Atlas's patches, kept up to date by the
+    # updater) and a list of custom builds the user adds for models that need another llama.cpp.
+
+    def custom_builds(s) -> list[dict]:
+        """[{command, name}] as added in Settings (older versions stored bare commands)."""
+        return [{"command": b, "name": ""} if isinstance(b, str) else b for b in s.store.get_state("builds") or []]
+
+    def add_custom_build(s, command: str, name: str = "") -> None:
+        items = custom_builds(s)
+        for item in items:
+            if item["command"] == command:
+                item["name"] = name or item["name"]
+                break
+        else:
+            items.append({"command": command, "name": name})
+        s.store.set_state("builds", items)
+
+    def build_name(info, name: str) -> str:
+        return name or info.version or Path(info.path).parent.name
 
     @api.get("/builds")
     async def list_builds(request: Request):
         s = st(request)
-        added = added_builds(s)
         standard = standard_build(settings, s.store)
-        updates = s.updater.installed_commands() if s.updater else []
-        configured = [settings.llama_server_bin] if settings.llama_server_bin else []
-        found = await asyncio.to_thread(builds.discover, standard, [*updates, *configured, *added])
-        return {"default": standard, "configured": settings.llama_server_bin,
-                "updates": s.updater.to_json() if s.updater else None,
-                "builds": [{**b.to_json(), "default": b.command == standard, "added": b.command in added,
-                            "update": b.command in updates,
-                            "configured": b.command == settings.llama_server_bin} for b in found]}
+        custom = custom_builds(s)
+        presets = s.store.list_presets()
+        listed = {b["command"] for b in custom}
+        # builds presets use that are in no list (set before custom builds were a list, or pinned
+        # by an update): shown so they can be added or the preset switched
+        unlisted = sorted({p["binary"] for p in presets if p.get("binary") and p["binary"] not in listed
+                           and p["binary"] != standard})
+        commands = [standard or "", *(b["command"] for b in custom), *unlisted]
+        infos = await asyncio.to_thread(lambda: [builds.inspect(c) if c else None for c in commands])
+        updates = s.updater.to_json() if s.updater else None
+        tag = updates["standard_tag"] if updates else None
+        installed = {i["tag"]: i for i in (updates or {}).get("installed", [])}
+        used = lambda command: [p["name"] for p in presets if (p.get("binary") or standard) == command]  # noqa: E731
+        standard_entry = None
+        if infos[0]:
+            standard_entry = {**infos[0].to_json(), "default": True, "tag": tag,
+                              "patched": (installed.get(tag) or {}).get("patched"),
+                              "configured": standard == settings.llama_server_bin, "used_by": used(standard)}
+        entries = [{**info.to_json(), "name": build_name(info, b["name"]), "default": False, "added": True,
+                    "listed": True, "used_by": used(b["command"])} for b, info in zip(custom, infos[1:1 + len(custom)])]
+        entries += [{**info.to_json(), "name": build_name(info, ""), "default": False, "added": False,
+                     "listed": False, "used_by": used(c)} for c, info in zip(unlisted, infos[1 + len(custom):])]
+        return {"default": standard, "configured": settings.llama_server_bin, "updates": updates,
+                "standard": standard_entry, "custom": entries,
+                "builds": ([standard_entry] if standard_entry else []) + entries}
 
     def updater_or_409(s) -> BuildUpdater:
         return managed(s) and s.updater
@@ -1103,20 +1142,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @api.post("/builds")
     async def add_build(request: Request, body: BuildRequest):
+        """Add a custom build (or rename one that is in the list)."""
         s = st(request)
         command = body.command.strip()
         info = await asyncio.to_thread(builds.inspect, command)
         if info.problem == "file not found":
             raise HTTPException(400, f"not found: {command}")
-        added = added_builds(s)
-        if command not in added:
-            s.store.set_state("builds", added + [command])
-        return info.to_json()
+        add_custom_build(s, command, body.name.strip())
+        return {**info.to_json(), "name": build_name(info, body.name.strip())}
 
     @api.delete("/builds")
     async def remove_build(request: Request, command: str):
         s = st(request)
-        s.store.set_state("builds", [c for c in added_builds(s) if c != command])
+        users = [p["name"] for p in s.store.list_presets() if p.get("binary") == command]
+        if users:
+            raise HTTPException(409, f"used by the preset{'s' if len(users) > 1 else ''} {', '.join(users)}: "
+                                     "switch them to another build first")
+        s.store.set_state("builds", [b for b in custom_builds(s) if b["command"] != command])
         return {"removed": command}
 
     @api.get("/server")

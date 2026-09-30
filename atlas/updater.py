@@ -251,7 +251,12 @@ class BuildUpdater:
             try:
                 mode = self.settings.build_updates
                 due = time.time() - (self.state.get("last_check") or 0) >= self.settings.build_update_interval_h * 3600
-                if mode != "off" and due and not self.busy:
+                # the standard build is still a prebuilt one: build the patched one now (after a
+                # failed attempt, only at the next regular check)
+                unpatched = (self.settings.build_update_source == "patched"
+                             and not (self.state.get("standard") or "").endswith(PATCHED_SUFFIX)
+                             and not self.state.get("error"))
+                if mode != "off" and (due or unpatched) and not self.busy:
                     await self.check_now()
                 if mode == "apply":
                     await self.apply_if_idle()
@@ -566,8 +571,8 @@ class BuildUpdater:
 
     def _lib_dirs(self, exe: Path) -> list[Path]:
         dirs = [self.runtime_dir]
-        for command in [self.settings.llama_server_bin, *self.installed_commands(),
-                        *(self.store.get_state("builds") or [])]:
+        custom = [b if isinstance(b, str) else b.get("command") for b in self.store.get_state("builds") or []]
+        for command in [self.settings.llama_server_bin, *self.installed_commands(), *custom]:
             if command:
                 _, path = builds._executable(command)
                 if path.is_file() and path.resolve().parent != exe.parent.resolve():

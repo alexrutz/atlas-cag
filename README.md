@@ -202,12 +202,19 @@ first and warns when a draft cannot work (different tokenizer or vocabulary, a b
 
 ## llama-server builds
 
-Each preset can use its own llama-server build: a newer release, or a custom build for a model
-architecture the standard build does not know. Leave the preset's build empty to use the standard
-build, which Atlas keeps up to date (below; before the first update it is
-`ATLAS_LLAMA_SERVER_BIN`). **Settings → Model → llama-server builds** lists the builds Atlas
-finds (`~/*/llama-server`, `~/*/build*/bin/llama-server`, `/opt`, `/usr/local/bin`, `PATH`) and
-the ones you add. Commands with arguments work too (e.g. a wrapper script). Each build is checked:
+There are two kinds of builds (**Settings → Model → llama-server builds**):
+
+- **Standard**: upstream llama.cpp with Atlas's fixes (restored documents of sliding-window models
+  are reused; slot files load after changing the number of slots), built here from source for each
+  llama.cpp release and kept up to date (below). Use it for every model upstream llama.cpp
+  supports; a preset without a build of its own uses it. Before it is built the first time,
+  `ATLAS_LLAMA_SERVER_BIN` stands in.
+- **Custom builds**: llama-server binaries you add, with a name, for models that need another
+  llama.cpp (a fork for a new architecture). They are not updated. The list shows which presets use
+  each one; a build in use cannot be removed. A build typed into a preset ("Other command…") joins
+  the list. Commands with arguments work too (e.g. a wrapper script).
+
+Atlas does not search the disk for builds. Each build is checked:
 
 - that it can run here at all: Windows downloads (`.exe`) and builds for another CPU are flagged
   with the reason;
@@ -250,11 +257,12 @@ A new build must not break a working setup:
 
 The two newest updates and any build a preset uses are kept; older ones are deleted.
 
-**Build from source with Atlas's fixes.** Standard llama.cpp releases re-prefill a restored
-document of a sliding-window model (Gemma, gpt-oss, Spark) unless `--swa-full` is set, and cannot
-load slot files saved with another number of slots. With **Build from: Source, with Atlas's fixes**
-(`ATLAS_BUILD_UPDATE_SOURCE=patched`) Atlas builds each release itself instead of downloading the
-package:
+**Built from source with Atlas's fixes.** Upstream llama.cpp re-prefills a restored document of a
+sliding-window model (Gemma, gpt-oss, Spark) unless `--swa-full` is set, and cannot load slot files
+saved with another number of slots. So the standard build is built here
+(`ATLAS_BUILD_UPDATE_SOURCE=patched`, the default) instead of using the downloaded package; without
+a compiler the settings page offers the prebuilt package without the fixes
+(`ATLAS_BUILD_UPDATE_SOURCE=release`):
 
 1. `git clone --depth 1` of the release tag from `ATLAS_BUILD_SOURCE_REPO` (ggml-org/llama.cpp);
 2. the patches in `atlas/patches/llama.cpp/` (restored slots keep the sliding-window cache; slot
@@ -268,8 +276,8 @@ package:
    restart work the same). The build log stays in `data/builds/<tag>+atlas.build.log`.
 
 It needs git, cmake, a C++ compiler and the CUDA toolkit (`nvcc`); the settings page says what is
-missing. Switching the source builds (or fetches) the current release in the chosen form at once;
-**Build now** does it by hand.
+missing. When the standard build is not the patched one yet, Atlas builds it a minute after
+starting; **Build now** does it by hand.
 
 Caches are shared between builds when they are compatible. Every start restores a canary cache
 and checks that it still predicts the same next token as when it was built (the reference is taken
