@@ -355,6 +355,8 @@ def estimate(model: ModelInfo | None, ctx_per_slot: int, slots: int, kv_type: st
     # a draft model gets its own context of the same size (llama.cpp has no smaller draft context)
     # and a KV cache of the preset's type (Atlas passes -ctkd / -ctvd)
     d = estimate(draft, ctx_per_slot, slots, kv_type, "", gpu_layers, 0, swa_full) if draft else {}
+    if draft and not d:  # a format Atlas cannot size (e.g. a gemma4-assistant head): at least its weights
+        d = {"weights": draft.size_bytes, "unknown": True}
     draft_bytes = sum(d.get(k, 0) for k in ("weights", "kv_cache", "recurrent", "compute"))
     ram += d.get("ram", 0)
     return {
@@ -365,6 +367,7 @@ def estimate(model: ModelInfo | None, ctx_per_slot: int, slots: int, kv_type: st
         "compute": int(compute),
         "draft": int(draft_bytes),
         "draft_kv": int(d.get("kv_cache", 0)),
+        "draft_unknown": bool(d.get("unknown")),  # only the weights are counted
         "total": int(gpu_weights + kv + recurrent + mmproj_bytes + compute + draft_bytes),  # GPU
         "ram": int(ram),
         "ssd": int(lazy_ssd),

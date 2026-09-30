@@ -127,7 +127,7 @@
         ${est.recurrent ? `<span><i class="recurrent"></i>recurrent ${fmtBytes(est.recurrent)}</span>` : ""}
         ${est.projector ? `<span><i class="projector"></i>vision projector ${fmtGB(est.projector)}</span>` : ""}
         ${est.compute ? `<span title="Attention mask and, for a quantized KV cache, one layer converted to f16; reserved for a full slot"><i class="compute"></i>compute ${fmtGB(est.compute)}</span>` : ""}
-        ${est.draft ? `<span title="Weights, KV cache (${fmtGB(est.draft_kv)}) and compute buffer of the draft model"><i class="draft"></i>draft model ${fmtGB(est.draft)}</span>` : ""}
+        ${est.draft ? `<span title="${est.draft_unknown ? "Only the weights: Atlas cannot size this draft format's cache and buffers" : `Weights, KV cache (${fmtGB(est.draft_kv)}) and compute buffer of the draft model`}"><i class="draft"></i>draft model ${fmtGB(est.draft)}${est.draft_unknown ? "+" : ""}</span>` : ""}
       </div>
       ${est.ram ? `<div class="est-row"><span class="est-label">RAM</span>
         <div class="bar"><span class="seg ram" style="width:${pct(est.ram, Math.max(ram, est.ram))}" title="Offloaded weights ${fmtGB(est.ram)}"></span></div>
