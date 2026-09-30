@@ -1313,7 +1313,8 @@
         <button class="btn small" data-src="text">Open the full text</button>${finding}`;
       return;
     }
-    body.innerHTML = `${quote}<div class="src-status${e.score < 0.98 ? " approx" : ""}">${esc(evQuality(e))}${e.page ? ` · page ${e.page}${e.page_end && e.page_end !== e.page ? `–${e.page_end}` : ""}` : ""}${e.in_part === false && t.n_parts > 1 ? " · in another part of the document" : ""}</div>
+    const how = t.visual ? '<div class="src-how">The model read this document as page images and quoted what it saw; the quote was then found in the PDF\'s text layer to mark it here.</div>' : "";
+    body.innerHTML = `${quote}${how}<div class="src-status${e.score < 0.98 ? " approx" : ""}">${esc(evQuality(e))}${e.page ? ` · page ${e.page}${e.page_end && e.page_end !== e.page ? `–${e.page_end}` : ""}` : ""}${e.in_part === false && t.n_parts > 1 ? " · in another part of the document" : ""}</div>
       <div class="src-loading"><span class="spinner"></span> Loading the source…</div>`;
     let passage;
     try {
@@ -1398,12 +1399,12 @@
   const tps = (v) => dash(v, (x) => `${fmtInt(Math.round(x))} tok/s`);
   const rate = (n, ms) => (ms ? n / (ms / 1000) : null);
 
-  function callRow(label, title, st) {
+  function callRow(label, title, st, visual = false) {
     const used = (st.n_prompt || 0) + (st.n_gen || 0);
     const ctx = st.n_ctx ? `${fmtTok(used)} / ${fmtTok(st.n_ctx)} (${Math.round((100 * used) / st.n_ctx)}%)` : fmtTok(used);
     const think = st.n_reasoning ? ` <span class="muted">(${fmtInt(st.n_reasoning)} thinking)</span>` : "";
     const draft = st.draft_n ? ` <span class="muted" title="speculative decoding: drafted tokens the model accepted">· ${Math.round((100 * st.draft_accepted) / st.draft_n)}% drafts</span>` : "";
-    return `<tr><td class="gd-label" title="${esc(title)}">${esc(label)}</td>
+    return `<tr><td class="gd-label" title="${esc(title)}">${visual ? '<span class="pill visual" title="Prefilled from page images: the model read the pages as pictures">images</span> ' : ""}${esc(label)}</td>
       <td class="num">${dash(st.slot)}</td>
       <td class="num">${dash(st.wait_ms, fmtMs)}</td>
       <td class="num">${dash(st.restore_ms, fmtMs)}</td>
@@ -1473,7 +1474,7 @@
         <th class="num" title="tokens reused from the restored KV cache">Cached</th><th class="num" title="prompt tokens evaluated">Evaluated</th>
         <th class="num">Prompt speed</th><th class="num">Generated</th><th class="num">Speed</th><th class="num" title="request sent → first generated token">First token</th>
         <th class="num" title="tokens in the slot after the answer / slot size">Context</th><th>Stop</th></tr></thead>
-      <tbody>${calls.map((t) => callRow(t.n_parts > 1 || calls.length > 1 ? `[${t.n}] ${t.label}` : t.label, t.label, t.stats)).join("")}
+      <tbody>${calls.map((t) => callRow(t.n_parts > 1 || calls.length > 1 ? `[${t.n}] ${t.label}` : t.label, t.label, t.stats, t.visual)).join("")}
         ${s.synthesis ? callRow("Synthesis", "the final answer from the per-document answers", s.synthesis) : ""}</tbody></table></div>` : "";
     return `<dl class="kv gd-kv">${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl>${table}`;
   }
