@@ -106,6 +106,43 @@ def reader(data: bytes):
     return _reader(data)
 
 
+def merge(sources: list[tuple[str, bytes]]) -> tuple[bytes, list[dict]]:
+    """One PDF of several, in the given order, with a bookmark per file (its own bookmarks nested
+    below it). Returns the PDF and where each file starts: [{"name", "page", "pages"}]."""
+    from pypdf import PdfWriter
+    if len(sources) < 2:
+        raise PdfToolError("choose at least two PDFs to merge")
+    writer = PdfWriter()
+    files, page = [], 1
+    for name, data in sources:
+        source = _reader(data)
+        try:
+            n = len(source.pages)
+            if n:
+                writer.append(source, outline_item=re.sub(r"(?i)\.pdf$", "", name) or name)
+        except Exception as e:  # encrypted or damaged files fail here, in many ways
+            raise PdfToolError(f"cannot merge {name}: {e}") from e
+        if not n:
+            raise PdfToolError(f"{name} has no pages")
+        files.append({"name": name, "page": page, "pages": n})
+        page += n
+    buf = io.BytesIO()
+    writer.write(buf)
+    return buf.getvalue(), files
+
+
+def file_starts(files: list[dict], pages: list[int]) -> list[dict]:
+    """Where each merged file starts in a document of the given pages of the merged PDF (1-based,
+    in order): [{"name", "page"}] with the page in the new document."""
+    starts, current = [], None
+    for local, p in enumerate(pages, 1):
+        f = next((f for f in files if f["page"] <= p < f["page"] + f["pages"]), None)
+        if f is not None and f is not current:
+            starts.append({"name": f["name"], "page": local})
+        current = f
+    return starts
+
+
 FILENAME_CHARS = 180  # document names are at most 200 characters (with suffix and counter)
 
 

@@ -144,10 +144,63 @@ def defuse(text: str) -> str:
     return text.replace("<", "<\u200b").replace("[", "[\u200b")
 
 
-def visual_document_block(name: str, part_idx: int, n_parts: int, page_numbers: list[int]) -> str:
+def visual_document_block(name: str, part_idx: int, n_parts: int, page_numbers: list[int],
+                          files: list[dict] | None = None) -> str:
+    """files: where the PDFs of a merged document start ([{"name", "page"}]); each start gets a
+    file line, and a part that begins inside a file names that file first."""
     part = f' part="{part_idx + 1} of {n_parts}"' if n_parts > 1 else ""
-    pages = "".join(f"[Page {n}]\n{MEDIA_PLACEHOLDER}\n\n" for n in page_numbers)
+    starts: dict[int, list[str]] = {}
+    for f in files or ():
+        starts.setdefault(f["page"], []).append(f["name"])
+    if page_numbers and files and page_numbers[0] not in starts:
+        inside = [f["name"] for f in files if f["page"] < page_numbers[0]]
+        if inside:
+            starts[page_numbers[0]] = inside[-1:]
+    pages = "".join("".join(file_line(defuse(_attr(f))) + "\n" for f in starts.get(n, ()))
+                    + f"[Page {n}]\n{MEDIA_PLACEHOLDER}\n\n" for n in page_numbers)
     return f'<document name="{defuse(_attr(name))}"{part}>\n{pages}</document>\n\n'
+
+
+# --- merged documents ----------------------------------------------------------------------
+# Several PDFs merged into one document are read in one context. A line before the first page of
+# each file tells the model which file a page comes from.
+
+_FILE_LINE = re.compile(r"^\[File: (.+)\]$", re.M)
+_LEADING_FILE_LINE = re.compile(r"\s*\[File: .+\]$", re.M)
+_PAGE_LINE = re.compile(r"^\[Page (\d+)\]$", re.M)
+
+
+def file_line(name: str) -> str:
+    return f"[File: {name}]"
+
+
+def mark_files(text: str, files: list[dict]) -> str:
+    """Put a file line before the first page of each file into extracted text ("[Page n]" lines).
+    A file without any text keeps its line, directly before the next file's."""
+    if not files:
+        return text
+    out, pos, i = [], 0, 0
+    for m in _PAGE_LINE.finditer(text):
+        lines = []
+        while i < len(files) and files[i]["page"] <= int(m.group(1)):
+            lines.append(file_line(files[i]["name"]) + "\n")
+            i += 1
+        if lines:
+            out.append(text[pos:m.start()] + "".join(lines))
+            pos = m.start()
+    out.append(text[pos:])
+    return "".join(out) + "".join("\n\n" + file_line(f["name"]) for f in files[i:])
+
+
+def file_context(text: str, start: int) -> str:
+    """The file line to repeat at the start of a part that begins inside a file ("" if it starts
+    with its own file line or comes before the first one)."""
+    if _LEADING_FILE_LINE.match(text, start):
+        return ""
+    last = None
+    for last in _FILE_LINE.finditer(text, 0, start):
+        pass
+    return last.group(0) + "\n" if last else ""
 
 
 def single_question_block(question: str) -> str:

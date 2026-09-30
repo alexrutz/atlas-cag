@@ -20,7 +20,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
-from . import __version__, builds, evidence, models, pdftools
+from . import __version__, builds, evidence, models, pdftools, prompts
 from . import pages as page_images
 from .config import RUNTIME_FIELDS, RuntimeSettings, Settings, get_settings
 from .downloads import Downloader, DownloadError
@@ -359,7 +359,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return collection_id or None
 
     def register(s, name: str, mime: str | None, data: bytes, text: str, collection_id: str | None,
-                 mode: str = "text", n_pages: int = 0) -> dict:
+                 mode: str = "text", n_pages: int = 0, files: list[dict] | None = None) -> dict:
+        """files: where the PDFs of a merged document start ([{"name", "page"}])."""
         sha = hashlib.sha256(data).hexdigest()
         existing = s.store.find_by_sha(sha)
         if existing:
@@ -369,6 +370,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         folder.mkdir(parents=True, exist_ok=True)
         (folder / f"original{PurePath(name).suffix.lower()}").write_bytes(data)
         (folder / "text.txt").write_text(text, encoding="utf-8")
+        if files:
+            (folder / "files.json").write_text(json.dumps(files), encoding="utf-8")
         s.ingestor.enqueue(doc.id)
         return {"document": doc_json(s, s.store.get_document(doc.id))}
 
@@ -682,6 +685,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if data is not None and len(data) > limit:
             raise HTTPException(413, f"larger than {settings.max_upload_mb} MB")
         data, name = tool_source(s, data, file.filename if file else None, doc_id)
+        return await load_workspace(s, data, name, doc_id)
+
+    async def load_workspace(s, data: bytes, name: str, doc_id: str | None, files: list[dict] | None = None) -> dict:
+        """Analyze a PDF for the tools and keep it in a workspace (with the file starts of a merge)."""
         try:
             result = await asyncio.to_thread(pdftools.analyze, data)
         except pdftools.PdfToolError as e:
@@ -691,11 +698,52 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         folder = tools_dir / ws_id
         folder.mkdir(parents=True, exist_ok=True)
         (folder / "source.pdf").write_bytes(data)
+        (folder / "name").write_text(name, encoding="utf-8")
+        if files:
+            (folder / "files.json").write_text(json.dumps(files), encoding="utf-8")
         pages = [{k: v for k, v in p.items() if k != "text"} | {"tokens": t} for p, t in zip(result["pages"], tokens)]
         overhead = await s.engine.count(document_block(name, 98, 99, "")) if s.engine.ready else 64
+        if files:  # the file lines in the text
+            overhead += sum([await s.engine.count(prompts.file_line(f["name"]) + "\n") if s.engine.ready else 8
+                             for f in files])
         return {"id": ws_id, "name": name, "doc_id": doc_id, "n_pages": result["n_pages"], "pages": pages,
-                "outline": result["outline"], "exact": exact, "total_tokens": sum(tokens),
+                "outline": result["outline"], "exact": exact, "total_tokens": sum(tokens), "files": files or [],
                 "shard_overhead_tokens": overhead, **throughput(s)}
+
+    @api.post("/tools/pdf/merge")
+    async def merge_pdfs(request: Request, files: list[UploadFile] | None = None, order: str = Form(...),
+                         name: str = Form("")):
+        """Merge uploaded and library PDFs into one PDF (a tools workspace). order: a JSON list of
+        {"file": index into files} and {"doc": library document id}, in the order to merge."""
+        s = st(request)
+        try:
+            items = json.loads(order)
+            assert isinstance(items, list) and all(isinstance(i, dict) for i in items)
+        except (ValueError, AssertionError) as e:
+            raise HTTPException(400, "order must be a JSON list") from e
+        limit = settings.max_upload_mb * 1024 * 1024
+        files = files or []
+        sources = []
+        for item in items:
+            if "doc" in item:
+                data, dname = tool_source(s, None, None, str(item["doc"]))
+                sources.append((dname, data))
+                continue
+            k = item.get("file")
+            if not isinstance(k, int) or not 0 <= k < len(files):
+                raise HTTPException(400, "order refers to a file that was not sent")
+            data = await files[k].read(limit + 1)
+            await files[k].seek(0)  # the same upload may be listed twice
+            fname = PurePath(files[k].filename or "document.pdf").name
+            if len(data) > limit:
+                raise HTTPException(413, f"{fname} is larger than {settings.max_upload_mb} MB")
+            sources.append((fname, data))
+        try:
+            merged, starts = await asyncio.to_thread(pdftools.merge, sources)
+        except pdftools.PdfToolError as e:
+            raise HTTPException(400, str(e)) from e
+        name = pdftools.shard_filename(name.strip() or " + ".join(n.removesuffix(".pdf") for n, _ in sources), set())
+        return await load_workspace(s, merged, name, None, starts)
 
     def tool_workspace(ws_id: str) -> Path:
         try:
@@ -716,11 +764,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             cached.write_bytes(png)
         return FileResponse(cached, media_type="image/png", headers={"Cache-Control": "private, max-age=86400"})
 
+    @api.get("/tools/pdf/{ws_id}/pdf")
+    async def download_pdf(ws_id: str):
+        folder = tool_workspace(ws_id)
+        name = (folder / "name").read_text(encoding="utf-8") if (folder / "name").exists() else "document.pdf"
+        return FileResponse(folder / "source.pdf", media_type="application/pdf", filename=name)
+
     @api.post("/tools/pdf/{ws_id}/shards")
     async def create_shards(request: Request, ws_id: str, body: ShardRequest):
         """Cut the loaded PDF into shards and add them to the library as documents."""
         s = st(request)
-        data = (tool_workspace(ws_id) / "source.pdf").read_bytes()
+        folder = tool_workspace(ws_id)
+        data = (folder / "source.pdf").read_bytes()
+        merged = json.loads((folder / "files.json").read_text(encoding="utf-8")) if (folder / "files.json").exists() else []
         collection_id = check_collection(s, body.collection_id)
         try:
             source = await asyncio.to_thread(pdftools.reader, data)  # parsed once for all shards
@@ -749,8 +805,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             except (pdftools.PdfToolError, ExtractionError, page_images.PageError) as e:
                 results.append({"name": name, "error": str(e)})
                 continue
-            result = register(s, name, "application/pdf", shard_data, prepared["text"], folder_for(shard.folder),
-                              prepared["mode"], prepared["n_pages"])
+            starts = pdftools.file_starts(merged, shard.pages)
+            result = register(s, name, "application/pdf", shard_data, prompts.mark_files(prepared["text"], starts),
+                              folder_for(shard.folder), prepared["mode"], prepared["n_pages"], starts)
             if prepared["note"]:
                 result["note"] = prepared["note"]
             results.append(result)

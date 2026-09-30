@@ -27,7 +27,10 @@ RESTATED = 0.6  # share of an unfound quote's words taken from the question: the
 GRAM = 12  # characters per anchor when matching approximately
 MAX_HITS_PER_GRAM = 64
 
-PAGE_MARKER = re.compile(r"^\[Page (\d+)\]$", re.M)  # written by extract._pdf before each page's text
+# written by extract._pdf before each page's text; in merged documents a file's first page is
+# preceded by "[File: name]" lines, which belong to that page
+PAGE_MARKER = re.compile(r"^(?:\[File: .+\]\n)*\[Page (\d+)\]$", re.M)
+_MARKER_IN_QUOTE = re.compile(r"\[(?:File: [^\]\n]+|Page \d+)\]")
 _ALNUM = re.compile(r"[^\W_]+")
 _ELLIPSIS = re.compile(r"\s*(?:\.{3,}|…|\[\s*(?:\.{3}|…)\s*\]|\(\s*(?:\.{3}|…)\s*\))\s*")
 _LINE = r"(?:[^%s\n]|\n(?!\s*\n))*?"  # quoted text: any line breaks but a blank line
@@ -215,6 +218,7 @@ class DocText:
         self.text = text
         markers = list(PAGE_MARKER.finditer(text))
         self.page_starts = [m.start() for m in markers]
+        self.marker_ends = [m.end() for m in markers]
         self.page_numbers = [int(m.group(1)) for m in markers]
         self.squashed = Squashed(text, [(m.start(), m.end()) for m in markers])
 
@@ -227,7 +231,7 @@ class DocText:
         if page not in self.page_numbers:
             return None
         i = self.page_numbers.index(page)
-        start = self.text.index("\n", self.page_starts[i]) + 1 if "\n" in self.text[self.page_starts[i]:] else len(self.text)
+        start = min(self.marker_ends[i] + 1, len(self.text))
         end = self.page_starts[i + 1] if i + 1 < len(self.page_starts) else len(self.text)
         return start, end
 
@@ -242,6 +246,7 @@ class DocText:
     def find(self, quote: str, prefer: tuple[int, int] | None = None) -> dict:
         """Locate one quote; `prefer` is the range of the document part the answer came from."""
         match, in_part = None, False
+        shown, quote = quote, _MARKER_IN_QUOTE.sub(" ", quote).strip() or quote  # a quote may copy "[Page 6]" lines
         if prefer:
             match = self.squashed.locate(quote, *prefer)
             in_part = match is not None
@@ -250,7 +255,7 @@ class DocText:
             if anywhere and (match is None or anywhere.score > match.score + 0.05):
                 match, in_part = anywhere, bool(prefer) and prefer[0] <= anywhere.start < prefer[1]
         if match is None:
-            return {"quote": quote, "found": False, **self._scattered(quote, prefer)}
+            return {"quote": shown, "found": False, **self._scattered(quote, prefer)}
         start, end = match.start, match.end
         while start > 0 and self.text[start - 1].isalnum():  # an approximate match may start mid-word
             start -= 1
@@ -261,7 +266,7 @@ class DocText:
             start -= len(head)
         if tail and self.text.startswith(tail, end):
             end += len(tail)
-        return {"quote": quote, "found": True, "start": start, "end": end, "score": match.score,
+        return {"quote": shown, "found": True, "start": start, "end": end, "score": match.score,
                 "page": self.page_at(start), "page_end": self.page_at(max(start, end - 1)), "in_part": in_part}
 
     def _page_words(self) -> dict[int | None, set[str]]:

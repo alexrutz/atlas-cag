@@ -1343,7 +1343,8 @@
       return;
     }
     if (seq !== src.seq) return;
-    const pageText = (text) => esc(text).replace(/^\[Page (\d+)\]$/gm, '<span class="page-mark">Page $1</span>');
+    const pageText = (text) => esc(text).replace(/^\[Page (\d+)\]$/gm, '<span class="page-mark">Page $1</span>')
+      .replace(/^\[File: (.+)\]\n?/gm, '<span class="page-mark file-mark">$1</span>');  // merged documents
     const viewer = passage.pdf && e.page ? `<div class="src-pager">
         <button class="icon-btn" data-src="prev" aria-label="Previous page">${ICONS.caret}</button>
         <span id="src-page-label"></span>

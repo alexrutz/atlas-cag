@@ -1,12 +1,15 @@
 """PDF tools (analysis, shards) and the token estimator."""
 
 import io
+import json
 import zipfile
 
 from pypdf import PdfReader, PdfWriter
 
-from .helpers import wait_for
-from .test_visual import image_pdf, text_pdf
+from atlas import evidence, prompts
+
+from .helpers import query, wait_for
+from .test_visual import image_pdf, ready, text_pdf
 
 
 def book(chapters: dict[str, list[str]]) -> bytes:
@@ -138,3 +141,79 @@ async def test_long_shard_names_are_shortened_not_rejected(atlas):
 
     r = await atlas.post(f"/api/tools/pdf/{a['id']}/shards", json={"shards": [{"name": "ok", "pages": [1]}, {"name": "", "pages": [2]}]})
     assert r.status_code == 422 and r.json()["detail"].startswith("shards › #2 › name:"), r.json()
+
+
+async def test_pdfs_merge_into_one_document_read_in_one_context(atlas, fake):
+    fake.vision = True
+    await atlas.app.state.engine.refresh()
+    r = await atlas.post("/api/documents", files={"files": ("pump.pdf", text_pdf("Pump data sheet: the pump flow is 3,30 m/s."))},
+                         data={"mode": "text"})
+    pump = r.json()["results"][0]["document"]
+    await ready(atlas, pump["id"])
+
+    # uploads and a library PDF, in the order given
+    uploads = [("files", ("manual.pdf", BOOK)), ("files", ("scan.pdf", image_pdf(1)))]
+    r = await atlas.post("/api/tools/pdf/merge", files=uploads,
+                         data={"order": json.dumps([{"file": 0}, {"doc": pump["id"]}, {"file": 1}])})
+    assert r.status_code == 200, r.text
+    m = r.json()
+    assert m["name"] == "manual + pump + scan.pdf" and m["n_pages"] == 7
+    assert m["files"] == [{"name": "manual.pdf", "page": 1, "pages": 5}, {"name": "pump.pdf", "page": 6, "pages": 1},
+                          {"name": "scan.pdf", "page": 7, "pages": 1}]
+    # a bookmark per file, with the file's own bookmarks below it
+    assert [(o["title"], o["page"], o["level"]) for o in m["outline"]] == [
+        ("manual", 1, 1), ("1 Introduction", 1, 2), ("2 Maintenance", 3, 2), ("3 Appendix", 5, 2),
+        ("pump", 6, 1), ("scan", 7, 1)]
+    pdf = await atlas.get(f"/api/tools/pdf/{m['id']}/pdf")
+    assert pdf.status_code == 200 and len(PdfReader(io.BytesIO(pdf.content)).pages) == 7
+    assert "manual%20%2B%20pump%20%2B%20scan.pdf" in pdf.headers["content-disposition"]
+
+    # added as one document: a line before each file's first page (the scan has no text)
+    r = await atlas.post(f"/api/tools/pdf/{m['id']}/shards",
+                         json={"shards": [{"name": m["name"], "pages": list(range(1, 8))}], "mode": "text"})
+    doc = r.json()["results"][0]["document"]
+    await ready(atlas, doc["id"])
+    text = (await atlas.get(f"/api/documents/{doc['id']}/text")).text
+    assert text.startswith("[File: manual.pdf]\n[Page 1]\n") and "\n\n[File: pump.pdf]\n[Page 6]\n" in text
+    assert text.endswith("\n\n[File: scan.pdf]")
+    # the model gets the file lines; quotes are located on the merged document's pages
+    events = await query(atlas, "Please quote the pump flow.", [doc["id"]])
+    (ev,) = next(e for e in events if e["type"] == "target" and e["status"] == "done")["evidence"]
+    assert ev["found"] and ev["page"] == 6
+
+    # a shard across two files: file lines at its own page numbers; prefilled visually, the page
+    # images get them too
+    r = await atlas.post(f"/api/tools/pdf/{m['id']}/shards",
+                         json={"shards": [{"name": "tail", "pages": [5, 6]}], "mode": "visual"})
+    tail = r.json()["results"][0]["document"]
+    await ready(atlas, tail["id"])
+    text = (await atlas.get(f"/api/documents/{tail['id']}/text")).text
+    assert text.startswith("[File: manual.pdf]\n[Page 1]\n") and "[File: pump.pdf]\n[Page 2]\n" in text
+    (part,) = atlas.app.state.store.get_parts(tail["id"])
+    assert "[File: manual.pdf]\n[Page 1]\n" in part.prefix_text and "[File: pump.pdf]\n[Page 2]\n" in part.prefix_text
+
+    # errors
+    one = await atlas.post("/api/tools/pdf/merge", files=uploads[:1], data={"order": json.dumps([{"file": 0}])})
+    assert one.status_code == 400 and "at least two" in one.json()["detail"]
+    bad = await atlas.post("/api/tools/pdf/merge", files=uploads[:1], data={"order": json.dumps([{"file": 0}, {"file": 3}])})
+    assert bad.status_code == 400
+
+
+def test_parts_of_merged_documents_name_their_file():
+    files = [{"name": "a.pdf", "page": 1}, {"name": "b.pdf", "page": 3}]
+    text = prompts.mark_files("[Page 1]\nalpha\n\n[Page 2]\nbeta\n\n[Page 3]\ngamma", files)
+    assert text == "[File: a.pdf]\n[Page 1]\nalpha\n\n[Page 2]\nbeta\n\n[File: b.pdf]\n[Page 3]\ngamma"
+    # a part that begins inside a file repeats its line; one that begins with a file line does not
+    assert prompts.file_context(text, text.index("[Page 2]")) == "[File: a.pdf]\n"
+    assert prompts.file_context(text, text.index("[File: b.pdf]") - 2) == ""
+    block = prompts.visual_document_block("m.pdf", 1, 2, [2, 3], files)
+    assert block.index("[File: a.pdf]\n[Page 2]") < block.index("[File: b.pdf]\n[Page 3]")
+    # a file line belongs to the page after it, and quotes that copy the lines are still found
+    doc = evidence.DocText(prompts.mark_files("[Page 1]\nThe pump is inspected yearly.\n\n[Page 2]\nValve V2 is closed "
+                                              "before the pump starts.", [{"name": "a.pdf", "page": 1}, {"name": "b.pdf", "page": 2}]))
+    hit = doc.find("[File: b.pdf] [Page 2] Valve V2 is closed before the pump starts.")
+    assert hit["found"] and hit["score"] == 1.0 and hit["page"] == hit["page_end"] == 2
+    assert hit["quote"].startswith("[File: b.pdf]") and doc.page_range(2)[0] == doc.text.index("Valve")
+    # documents that are not merged are unchanged
+    assert prompts.visual_document_block("m.pdf", 0, 1, [1]) == prompts.visual_document_block("m.pdf", 0, 1, [1], [])
+    assert prompts.mark_files("[Page 1]\nalpha", []) == "[Page 1]\nalpha"

@@ -612,9 +612,10 @@ class Engine:
             return None
         return f"visual:{self.vision_ident or 'external'}:{dpi}"
 
-    async def visual_prefix(self, name: str, idx: int, n_parts: int, page_numbers: list[int]) -> str:
+    async def visual_prefix(self, name: str, idx: int, n_parts: int, page_numbers: list[int],
+                            files: list[dict] | None = None) -> str:
         lay = await self.layout(self.settings.system_prompt, self.settings.enable_thinking)
-        return lay.head + prompts.visual_document_block(name, idx, n_parts, page_numbers) + lay.mid
+        return lay.head + prompts.visual_document_block(name, idx, n_parts, page_numbers, files) + lay.mid
 
     def multimodal(self, text: str, images: list[bytes]) -> dict:
         marker = self.info.media_marker

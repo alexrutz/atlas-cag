@@ -1,7 +1,7 @@
 "use strict";
 
-// PDF tools: cut large PDFs into shards (by chapters, token budget, page count or ranges) and
-// estimate what a text or file costs with the running model.
+// PDF tools: cut large PDFs into shards (by chapters, token budget, page count or ranges), merge
+// several PDFs into one document, and estimate what a text or file costs with the running model.
 (() => {
   const A = window.Atlas;
   const { api, esc, toast, fmtInt, fmtTok, fmtBytes, store } = A;
@@ -27,6 +27,15 @@
     thumbs: new Map(),  // page -> object URL
   };
   const PAGE_MARKER_TOKENS = 6;  // "[Page n]" line that text extraction puts before every page
+  const mg = {
+    items: [],  // {kind: "file", file, name, info} or {kind: "doc", id, name, info}, in merge order
+    name: "",
+    named: false,  // the user typed a name
+    result: null,  // the merged PDF's analysis (a workspace, like POST /api/tools/pdf)
+    busy: false,
+    collection: store.get("atlas.uploadTarget", ""),
+    mode: null,
+  };
 
   // ---------------------------------------------------------------- layout
 
@@ -45,6 +54,18 @@
           </div>
           <div id="pdf-work"></div>
         </section>
+        <div class="tools-side">
+        <section class="card" id="merger">
+          <div class="card-head"><h2>Merge PDFs</h2></div>
+          <p class="muted">Several PDFs as one document: the model reads them in one context and can connect them, as long as
+            the result fits one part of the running model.</p>
+          <div class="pdf-source">
+            <button class="btn" data-act="merge-pick">Add PDFs…</button>
+            <select id="merge-library" aria-label="Add a PDF from the library"></select>
+            <input type="file" id="merge-input" accept=".pdf,application/pdf" multiple hidden>
+          </div>
+          <div id="merge-work"></div>
+        </section>
         <section class="card" id="estimator">
           <div class="card-head"><h2>Token estimator</h2><span class="muted small" id="est-model"></span></div>
           <p class="muted">Paste text or drop a file to count its tokens with the running model's tokenizer and see what it takes to prefill.</p>
@@ -55,9 +76,11 @@
           </div>
           <div id="est-result" class="est-result"></div>
         </section>
+        </div>
       </div>`;
     t.built = true;
     wire();
+    renderMerge();
   }
 
   // ---------------------------------------------------------------- analysis
@@ -66,14 +89,7 @@
     t.loading = true;
     $("#pdf-work").innerHTML = `<div class="muted"><span class="spinner"></span> Reading ${esc(label)}: text and tokens of every page…</div>`;
     try {
-      const pdf = await (await api("/api/tools/pdf", { method: "POST", body: form })).json();
-      for (const url of t.thumbs.values()) URL.revokeObjectURL(url);
-      t.thumbs.clear();
-      Object.assign(t, { pdf, excluded: new Set(), names: new Map(), budget: null, ranges: "" });
-      const scanned = pdf.pages.filter((p) => !p.has_text).length;
-      t.mode = scanned > pdf.n_pages / 2 ? "visual" : (A.state.status?.limits?.default_prefill || "text");
-      if (pdf.outline.length) t.level = Math.min(...pdf.outline.map((o) => o.level));
-      applyStrategy();
+      load(await (await api("/api/tools/pdf", { method: "POST", body: form })).json());
     } catch (e) {
       t.pdf = null;
       $("#pdf-work").innerHTML = `<div class="response-error">${esc(e.message)}</div>`;
@@ -81,6 +97,18 @@
       t.loading = false;
     }
   }
+
+  function load(pdf) {
+    for (const url of t.thumbs.values()) URL.revokeObjectURL(url);
+    t.thumbs.clear();
+    Object.assign(t, { pdf, excluded: new Set(), names: new Map(), budget: null, ranges: "" });
+    t.mode = defaultMode(pdf);
+    if (pdf.outline.length) t.level = Math.min(...pdf.outline.map((o) => o.level));
+    applyStrategy();
+  }
+
+  const defaultMode = (pdf) => (pdf.pages.filter((p) => !p.has_text).length > pdf.n_pages / 2
+    ? "visual" : (A.state.status?.limits?.default_prefill || "text"));
 
   function openLibraryPdf(docId) {
     const d = A.docById(docId);
@@ -182,11 +210,12 @@
   // ---------------------------------------------------------------- rendering
 
   function renderLibraryPdfs() {
-    const sel = $("#pdf-library");
     const pdfs = A.state.docs.filter((d) => d.name.toLowerCase().endsWith(".pdf"));
     const html = `<option value="">${pdfs.length ? "Library PDF…" : "no PDFs in the library"}</option>` +
       pdfs.map((d) => `<option value="${esc(d.id)}">${esc(d.name)}${d.n_pages ? ` · ${d.n_pages} p.` : ""}</option>`).join("");
-    if (sel.dataset.html !== html) { sel.innerHTML = html; sel.dataset.html = html; }
+    for (const sel of [$("#pdf-library"), $("#merge-library")]) {
+      if (sel.dataset.html !== html) { sel.innerHTML = html; sel.dataset.html = html; }
+    }
   }
 
   function render() {
@@ -367,6 +396,125 @@
     } catch (e) { toast(e.message, "error"); }
   }
 
+  // ---------------------------------------------------------------- merge
+
+  function mergeName() {
+    if (mg.named && mg.name) return mg.name;
+    const names = mg.items.map((it) => it.name.replace(/\.pdf$/i, ""));
+    return `${names.length > 3 ? `${names[0]} + ${names.length - 1} more` : names.join(" + ") || "merged"}.pdf`;
+  }
+
+  function addToMerge(items) {
+    mg.items.push(...items);
+    mg.result = null;
+    renderMerge();
+  }
+
+  function addMergeFiles(files) {
+    const pdfs = [...files].filter((f) => /\.pdf$/i.test(f.name) || f.type === "application/pdf");
+    if (pdfs.length < files.length) toast(`Only PDFs can be merged: left out ${files.length - pdfs.length} file${files.length - pdfs.length === 1 ? "" : "s"}`, "error");
+    addToMerge(pdfs.map((file) => ({ kind: "file", file, name: file.name, info: fmtBytes(file.size) })));
+  }
+
+  // what the merged document costs as one part: its pages, their "[Page n]" lines, the document header
+  const mergedTokens = (r) => r.total_tokens + r.n_pages * PAGE_MARKER_TOKENS + (r.shard_overhead_tokens || 0);
+
+  function renderMerge() {
+    const box = $("#merge-work");
+    if (!box) return;
+    if (!mg.items.length) {
+      box.innerHTML = '<div class="muted small">Add two or more PDFs from this computer or the library, or drop them on this card.</div>';
+      return;
+    }
+    const r = mg.result;
+    const part = partTokens();
+    const tokens = r ? mergedTokens(r) : 0;
+    const parts = part ? Math.max(1, Math.ceil(tokens / part)) : 1;
+    const colls = [["", "Unfiled"], ...A.groups().filter((g) => g.id).map((g) => [g.id, A.indent(g.depth) + g.name])];
+    box.innerHTML = `
+      <ol class="merge-list">${mg.items.map((it, i) => `<li>
+        <span class="merge-name" title="${esc(it.name)}">${esc(it.name)}</span>
+        <span class="muted small">${esc(it.info)}</span>
+        <span class="merge-btns">
+          <button class="icon-btn" data-merge="up" data-i="${i}" ${i ? "" : "disabled"} aria-label="Move up" title="Move up">↑</button>
+          <button class="icon-btn" data-merge="down" data-i="${i}" ${i < mg.items.length - 1 ? "" : "disabled"} aria-label="Move down" title="Move down">↓</button>
+          <button class="icon-btn" data-merge="remove" data-i="${i}" aria-label="Remove" title="Remove">×</button>
+        </span></li>`).join("")}</ol>
+      <label class="merge-field">Name <input id="merge-name" value="${esc(mergeName())}"></label>
+      ${r ? `<div class="pdf-summary">
+          <div><strong>${fmtInt(r.n_pages)}</strong><span>pages</span></div>
+          <div><strong>${fmtTok(tokens)}</strong><span>tokens${r.exact ? "" : " (estimate)"}</span></div>
+          <div><strong>${!part ? "–" : parts === 1 ? "yes" : `${parts} parts`}</strong><span>fits one part${part ? ` (${fmtTok(part)})` : ""}?</span></div>
+        </div>
+        ${parts > 1 ? `<div class="notice">Larger than one part: Atlas splits it into ${parts} parts, and only pages in the same part are read
+          together. Leave pages out in the splitter, or use a preset with more context per slot.</div>` : ""}
+        <div class="shard-out">
+          <label>Collection <select id="merge-coll">${colls.map(([v, n]) => `<option value="${esc(v)}" ${v === mg.collection ? "selected" : ""}>${esc(n)}</option>`).join("")}</select></label>
+          <label>Prefill <select id="merge-mode"><option value="text" ${mg.mode === "text" ? "selected" : ""}>extracted text</option>
+            <option value="visual" ${mg.mode === "visual" ? "selected" : ""}>page images</option></select></label>
+        </div>
+        <div class="merge-actions">
+          <button class="btn primary" data-act="merge-add">Add to the library</button>
+          <button class="btn" data-act="merge-split">Open in the splitter</button>
+          <button class="link-btn small" data-act="merge-download">Download PDF</button>
+        </div>`
+      : `<div class="merge-actions"><button class="btn primary" data-act="merge" ${mg.items.length < 2 || mg.busy ? "disabled" : ""}>${mg.busy
+          ? '<span class="spinner"></span> Merging…' : mg.items.length < 2 ? "Add at least two PDFs" : `Merge ${mg.items.length} PDFs`}</button></div>`}`;
+  }
+
+  async function merge() {
+    const form = new FormData();
+    const order = [];
+    let files = 0;
+    for (const it of mg.items) {
+      if (it.kind === "doc") order.push({ doc: it.id });
+      else { order.push({ file: files++ }); form.append("files", it.file, it.name); }
+    }
+    form.append("order", JSON.stringify(order));
+    form.append("name", mergeName());
+    mg.busy = true;
+    renderMerge();
+    try {
+      mg.result = await (await api("/api/tools/pdf/merge", { method: "POST", body: form })).json();
+      mg.mode = defaultMode(mg.result);
+    } catch (e) {
+      toast(e.message, "error");
+    } finally {
+      mg.busy = false;
+      renderMerge();
+    }
+  }
+
+  async function addMerged() {
+    const r = mg.result;
+    const pages = r.pages.map((p) => p.n);
+    const body = { shards: [{ name: mergeName(), pages }], collection_id: mg.collection || null, mode: mg.mode };
+    try {
+      const { results } = await (await api(`/api/tools/pdf/${r.id}/shards`, { method: "POST", json: body })).json();
+      const [res] = results;
+      if (res.error) return toast(`${res.name}: ${res.error}`, "error");
+      toast(res.duplicate ? `${res.document.name} is already in the library` : `Added ${res.document.name} to ${A.collectionName(mg.collection || null)}`);
+      A.refresh();
+    } catch (e) { toast(e.message, "error"); }
+  }
+
+  function openMergedInSplitter() {
+    t.collection = mg.collection;
+    load({ ...mg.result, name: mergeName() });
+    $("#splitter").scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  async function downloadMerged() {
+    try {
+      const blob = await (await api(`/api/tools/pdf/${mg.result.id}/pdf`)).blob();
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = mergeName();
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    } catch (e) { toast(e.message, "error"); }
+  }
+
   // ---------------------------------------------------------------- estimator
 
   let estTimer = null, estSeq = 0;
@@ -408,6 +556,19 @@
     root.addEventListener("click", async (e) => {
       const act = e.target.closest("[data-act]")?.dataset.act;
       if (act === "pick-pdf") return $("#pdf-input").click();
+      if (act === "merge-pick") return $("#merge-input").click();
+      if (act === "merge") return merge();
+      if (act === "merge-add") return addMerged();
+      if (act === "merge-split") return openMergedInSplitter();
+      if (act === "merge-download") return downloadMerged();
+      const move = e.target.closest("[data-merge]");
+      if (move) {
+        const i = +move.dataset.i, j = move.dataset.merge === "up" ? i - 1 : i + 1;
+        if (move.dataset.merge === "remove") mg.items.splice(i, 1);
+        else [mg.items[i], mg.items[j]] = [mg.items[j], mg.items[i]];
+        mg.result = null;
+        return renderMerge();
+      }
       if (act === "est-pick") return $("#est-input").click();
       const strat = e.target.closest("[data-strategy]");
       if (strat && !strat.disabled) {
@@ -449,6 +610,17 @@
         form.append("file", f, f.name);
         analyze(form, f.name);
         e.target.value = "";
+      } else if (e.target.id === "merge-input" && e.target.files.length) {
+        addMergeFiles(e.target.files);
+        e.target.value = "";
+      } else if (e.target.id === "merge-library" && e.target.value) {
+        const d = A.docById(e.target.value);
+        if (d) addToMerge([{ kind: "doc", id: d.id, name: d.name, info: d.n_pages ? `${d.n_pages} p.` : "library" }]);
+        e.target.value = "";
+      } else if (e.target.id === "merge-coll") {
+        mg.collection = e.target.value;
+      } else if (e.target.id === "merge-mode") {
+        mg.mode = e.target.value;
       } else if (e.target.id === "pdf-library" && e.target.value) {
         openLibraryPdf(e.target.value);
         e.target.value = "";
@@ -473,6 +645,10 @@
       if (e.key === "Enter" && e.target.closest(".strategy-opts input")) { e.preventDefault(); readOptions(); applyStrategy(); }
     });
     root.addEventListener("input", (e) => {
+      if (e.target.id === "merge-name") {
+        mg.name = e.target.value.trim();
+        mg.named = !!mg.name;
+      }
       if (e.target.id === "est-text") {
         clearTimeout(estTimer);
         estTimer = setTimeout(() => {
@@ -492,6 +668,18 @@
       e.preventDefault();
       est.classList.remove("dragging");
       if (e.dataTransfer.files[0]) estimateFile(e.dataTransfer.files[0]);
+    });
+    const merger = $("#merger");
+    merger.addEventListener("dragover", (e) => {
+      if (![...e.dataTransfer.types].includes("Files")) return;
+      e.preventDefault();
+      merger.classList.add("dragging");
+    });
+    merger.addEventListener("dragleave", (e) => { if (!merger.contains(e.relatedTarget)) merger.classList.remove("dragging"); });
+    merger.addEventListener("drop", (e) => {
+      e.preventDefault();
+      merger.classList.remove("dragging");
+      if (e.dataTransfer.files.length) addMergeFiles(e.dataTransfer.files);
     });
     const splitter = $("#splitter");
     splitter.addEventListener("dragover", (e) => { if ([...e.dataTransfer.types].includes("Files")) e.preventDefault(); });

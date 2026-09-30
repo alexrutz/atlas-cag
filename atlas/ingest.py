@@ -5,6 +5,7 @@ configurations are kept, so switching presets back does not rebuild them.
 """
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -295,6 +296,9 @@ class Ingestor:
             raise ValueError("this document has no extractable text: use visual prefill")
         head, mid = await eng.prefix_overhead()
         header = await eng.count(prompts.document_block(doc.name, 98, 99, ""))
+        files = self._merged_files(doc_id)
+        if files:  # room for the file line repeated at the start of a part
+            header += max([await eng.count(prompts.file_line(f["name"]) + "\n") for f in files])
         prefix_limit = await self._prefix_limit()
         budget = prefix_limit - len(head) - len(mid) - header
         if budget < 256:
@@ -309,7 +313,10 @@ class Ingestor:
             for k, (start, end) in enumerate(spans):
                 await self._wait_ready()
                 self._check(doc_id)
-                prefix = await eng.document_prefix(doc.name, k, n, text[start:end])
+                body = text[start:end]
+                if files and k:
+                    body = prompts.file_context(text, start) + body
+                prefix = await eng.document_prefix(doc.name, k, n, body)
                 if len(prefix) > prefix_limit:
                     raise ValueError(f"part {k + 1} has {len(prefix)} tokens, limit is {prefix_limit}")
 
@@ -360,11 +367,12 @@ class Ingestor:
         if len(pages) != doc.n_pages:
             self.store.update_document(doc_id, n_pages=len(pages))
         prefix_limit = await self._prefix_limit()
+        files = self._merged_files(doc_id)
 
         async with eng.pool.lease(PRIORITY_INGEST, f"ingest · {doc.name} (sizing)") as slot:
             if eng.info.fingerprint != fingerprint:
                 raise ConfigChanged(doc_id)
-            spans = await self._plan_pages(doc, pages, slot, prefix_limit)
+            spans = await self._plan_pages(doc, pages, slot, prefix_limit, files)
         n = len(spans)
         log.info("ingesting %s (%s) visually: %d page(s) -> %d part(s), limit %d tokens/part",
                  doc.name, doc_id, len(pages), n, prefix_limit)
@@ -374,7 +382,7 @@ class Ingestor:
             for k, (a, b) in enumerate(spans):
                 await self._wait_ready()
                 self._check(doc_id)
-                text = await eng.visual_prefix(doc.name, k, n, list(range(a + 1, b + 1)))
+                text = await eng.visual_prefix(doc.name, k, n, list(range(a + 1, b + 1)), files)
                 images = await asyncio.to_thread(lambda a=a, b=b: [p.read_bytes() for p in pages[a:b]])
 
                 def on_progress(done: int, total: int, k: int = k) -> None:
@@ -406,7 +414,15 @@ class Ingestor:
             raise
         return created
 
-    async def _plan_pages(self, doc: Document, pages: list, slot: int, limit: int) -> list[tuple[int, int]]:
+    def _merged_files(self, doc_id: str) -> list[dict]:
+        """Where the PDFs of a merged document start ([{"name", "page"}]); empty for other documents."""
+        try:
+            return json.loads((self.settings.docs_dir / doc_id / "files.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+
+    async def _plan_pages(self, doc: Document, pages: list, slot: int, limit: int,
+                          files: list[dict] | None = None) -> list[tuple[int, int]]:
         """Split pages into runs whose prompt fits `limit` tokens, measuring instead of guessing:
         how many tokens an image takes depends on the vision encoder and the image size."""
         eng = self.engine
@@ -414,7 +430,7 @@ class Ingestor:
 
         async def measure(a: int, b: int) -> int:
             if (a, b) not in sizes:
-                text = await eng.visual_prefix(doc.name, 98, 99, list(range(a + 1, b + 1)))
+                text = await eng.visual_prefix(doc.name, 98, 99, list(range(a + 1, b + 1)), files)
                 images = await asyncio.to_thread(lambda: [p.read_bytes() for p in pages[a:b]])
                 sizes[(a, b)] = await eng.measure(slot, text, images)
             return sizes[(a, b)]

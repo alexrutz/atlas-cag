@@ -842,6 +842,22 @@ dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; ma
 .shard-table tr.too-big td { background: var(--warn-soft); }
 .shard-out { display: flex; align-items: center; gap: 8px 14px; flex-wrap: wrap; font-size: 13px; }
 .shard-out .spacer { flex: 1; }
+.tools-side { display: grid; gap: 16px; min-width: 0; }
+#merge-work { display: grid; gap: 10px; }
+.merge-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; counter-reset: merge; }
+.merge-list li { display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; align-items: center; gap: 8px; counter-increment: merge;
+  padding: 3px 4px 3px 8px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-sm); font-size: 13px; }
+.merge-list li::before { content: counter(merge); font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.merge-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.merge-btns { display: flex; }
+.merge-btns .icon-btn { width: 24px; height: 24px; font-size: 14px; }
+.merge-btns .icon-btn:disabled { opacity: .3; cursor: default; background: none; }
+.merge-field { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.merge-field input { flex: 1; min-width: 0; border: 1px solid var(--border-strong); border-radius: 5px; background: var(--surface); padding: 4px 6px; }
+.merge-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+#merger .pdf-summary { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+#merger .shard-out select { max-width: 200px; }
+#merger.dragging { outline: 2px dashed var(--accent); outline-offset: -4px; }
 .est-input { display: grid; gap: 8px; }
 .est-input textarea { width: 100%; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); padding: 8px 10px; background: var(--surface); font: 13px/1.5 var(--mono); resize: vertical; }
 .est-file { display: flex; align-items: center; gap: 8px; }
@@ -898,6 +914,7 @@ body.source-open .chat-module { grid-template-columns: 340px minmax(0, 1fr) minm
 }
 .src-text mark, .doc-text mark { background: rgba(255, 200, 0, .45); color: inherit; border-radius: 2px; box-shadow: 0 0 0 2px rgba(255, 200, 0, .45); }
 .page-mark { display: inline-block; font: 600 10.5px var(--sans); color: var(--muted); background: var(--surface); border: 1px solid var(--border); border-radius: 4px; padding: 0 5px; }
+.page-mark.file-mark { color: var(--accent); margin-right: 6px; }
 .src-actions { margin-top: 10px; }
 .src-finding { margin-top: 16px; border: 1px solid var(--border); border-radius: var(--radius-sm); }
 .src-finding summary { cursor: pointer; padding: 7px 10px; font-size: 12.5px; color: var(--muted); }
