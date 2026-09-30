@@ -1388,6 +1388,21 @@
       + "Check the server log (Settings → Model) for the reason.";
   }
 
+  // what the evaluated prompt tokens were: the question next to each cached document, earlier turns,
+  // documents read again after a cache miss, and the synthesis input (the per-document answers)
+  function promptSplit(calls, s) {
+    const parts = calls.reduce((n, t) => n + (t.stats.n_processed || 0), 0);
+    const bits = [];
+    if (calls.length) {
+      const what = s.history_turns ? `question and ${s.history_turns} earlier turn${s.history_turns === 1 ? "" : "s"}` : "question";
+      bits.push(s.cache_misses
+        ? `${fmtInt(parts)} for ${calls.length} part${calls.length === 1 ? "" : "s"} (documents read again after cache misses, plus the ${what})`
+        : `${fmtInt(parts)} for the ${what} next to ${calls.length === 1 ? "the cached document" : `${calls.length} cached document parts`}`);
+    }
+    if (s.synthesis) bits.push(`${fmtInt(s.synthesis.n_processed || 0)} for the synthesis (the per-document answers)`);
+    return bits.length ? `(${bits.join(" + ")})` : "";
+  }
+
   function genDetails(turn, s) {
     const calls = [...turn.targets.values()].filter((t) => t.stats);
     const generated = s.tokens_generated || 0;
@@ -1402,7 +1417,7 @@
         s.kv_bytes_read ? ` (${fmtBytes(s.kv_bytes_read)})` : ""} loaded in ${fmtMs(s.restore_ms)}${s.cache_misses
           ? ` · <span class="warn-text">${s.cache_misses} cache miss${s.cache_misses > 1 ? "es" : ""}: loaded but not reused</span>` : ""}`],
       ["Prompt evaluation", `${fmtInt(s.tokens_processed)} tokens${s.prompt_ms ? ` in ${fmtMs(s.prompt_ms)} · ${tps(promptTps)}` : ""}
-        <span class="muted">${s.cache_misses ? "(documents read again, plus conversation and question)" : "(conversation and question; the documents came from the cache)"}</span>`],
+        <span class="muted">${promptSplit(calls, s)}</span>`],
       ["Generation", `${fmtInt(generated)} tokens${thinking ? ` (${fmtInt(thinking)} thinking, ${fmtInt(generated - thinking)} answer)` : ""}${
         s.gen_ms ? ` in ${fmtMs(s.gen_ms)} · ${tps(genTps)}` : ""}${s.truncated ? ` · <span class="warn-text">${s.truncated} cut off</span>` : ""}`],
       s.draft_n ? ["Speculative decoding", `${fmtInt(s.draft_accepted)} of ${fmtInt(s.draft_n)} drafted tokens accepted (${Math.round((100 * s.draft_accepted) / s.draft_n)}%)`] : null,
