@@ -1159,12 +1159,15 @@
   const srcPanel = $("#source-panel");
   const src = { turn: null, target: null, index: 0, page: null, seq: 0, urls: [] };
 
+  const chipClass = (e) => (e.found ? (e.score < 0.98 ? " approx" : "") : e.scattered ? " apart" : " missing");
+
   function evLabel(e, i) {
-    if (!e.found) return "not found";
+    if (!e.found) return e.scattered ? (e.page ? `p. ${e.page} · apart` : "words apart") : "not found";
     if (e.page) return e.page_end && e.page_end !== e.page ? `p. ${e.page}–${e.page_end}` : `p. ${e.page}`;
     return `quote ${i + 1}`;
   }
   function evQuality(e) {
+    if (!e.found && e.scattered) return `its words are ${e.page ? `on page ${e.page}` : "in the document"}, but not next to each other (a table or form)`;
     if (!e.found) return "not found in the document";
     return e.score >= 0.98 ? "exact quote" : `approximate match (${Math.round(e.score * 100)} % of the quote)`;
   }
@@ -1176,9 +1179,9 @@
         ? `<button class="link-btn small" data-act="locate" data-key="${esc(t.key)}">Find the quoted passages in the document</button>` : "";
     }
     if (!t.evidence.length) return "";
-    const missing = t.evidence.filter((e) => !e.found).length;
+    const missing = t.evidence.filter((e) => !e.found && !e.scattered).length;
     return `<span class="src-label">Sources</span>${t.evidence.map((e, i) =>
-      `<button class="src-chip${e.found ? (e.score < 0.98 ? " approx" : "") : " missing"}" data-key="${esc(t.key)}" data-ev="${i}" title="“${esc(clip(e.quote, 300))}” · ${esc(evQuality(e))}">${esc(evLabel(e, i))}</button>`).join("")}${
+      `<button class="src-chip${chipClass(e)}" data-key="${esc(t.key)}" data-ev="${i}" title="“${esc(clip(e.quote, 300))}” · ${esc(evQuality(e))}">${esc(evLabel(e, i))}</button>`).join("")}${
       missing ? `<span class="src-warn" title="The model put these words in quotation marks, but they are not in the document: it may have paraphrased, or the statement is not backed by the source.">${missing} quote${missing === 1 ? "" : "s"} not found in the document</span>` : ""}`;
   }
 
@@ -1200,13 +1203,13 @@
         range.setStart(node, a);
         range.setEnd(node, b);
         const span = document.createElement("span");
-        span.className = `quote-link${e.found ? "" : " missing"}`;
+        span.className = `quote-link${e.found ? "" : e.scattered ? " apart" : " missing"}`;
         span.dataset.key = key;
         span.dataset.ev = i;
-        span.title = e.found ? `${evQuality(e)} · click to see it in the document` : "Not found in the document";
+        span.title = e.found || e.scattered ? `${evQuality(e)} · click to see it in the document` : "Not found in the document";
         range.surroundContents(span);
         const chip = document.createElement("button");
-        chip.className = `src-chip inline${e.found ? (e.score < 0.98 ? " approx" : "") : " missing"}`;
+        chip.className = `src-chip inline${chipClass(e)}`;
         chip.dataset.key = key;
         chip.dataset.ev = i;
         chip.textContent = evLabel(e, i);
@@ -1292,7 +1295,7 @@
     src.urls.splice(0).forEach((u) => URL.revokeObjectURL(u));
     highlightInThread(t, index);
     $("#source-quotes").innerHTML = list.length > 1 ? list.map((e, i) =>
-      `<button class="src-chip${e.found ? (e.score < 0.98 ? " approx" : "") : " missing"}${i === index ? " current" : ""}" data-pick="${i}" title="“${esc(clip(e.quote, 300))}”">${esc(evLabel(e, i))}</button>`).join("") : "";
+      `<button class="src-chip${chipClass(e)}${i === index ? " current" : ""}" data-pick="${i}" title="“${esc(clip(e.quote, 300))}”">${esc(evLabel(e, i))}</button>`).join("") : "";
     const body = $("#source-body");
     const e = list[index];
     const doc = docById(t.doc_id);
@@ -1307,9 +1310,25 @@
       body.innerHTML = `${quote}<p class="muted">This document has been deleted from the library.</p>`;
       return;
     }
+    if (!e.found && e.scattered && e.page && /\.pdf$/i.test(t.doc_name)) {
+      body.innerHTML = `${quote}<div class="src-status approx">Words found apart · page ${e.page}</div>
+        <p class="muted">All words of this quote are on page ${e.page}, but not next to each other in the PDF's text: typical for tables
+          and forms, where the text layer stores the cells in another order than they appear. The quote can still be right: check it on the page.</p>
+        <div class="src-pager">
+          <button class="icon-btn" data-src="prev" aria-label="Previous page">${ICONS.caret}</button>
+          <span id="src-page-label"></span>
+          <button class="icon-btn" data-src="next" aria-label="Next page">${ICONS.caret}</button>
+          <span class="spacer"></span>
+          <button class="link-btn small" data-src="tab">Open page image</button>
+        </div>
+        <div class="page-view" id="src-page"><div class="page-ph"><span class="spinner"></span></div></div>${finding}`;
+      showPage(e.page, docById(t.doc_id)?.n_pages || 0);
+      return;
+    }
     if (!e.found) {
-      body.innerHTML = `${quote}<div class="src-status missing">Not found in the document</div>
-        <p class="muted">The model put these words in quotation marks, but they do not appear in ${esc(t.doc_name)}${t.n_parts > 1 ? "" : ""}. It may have paraphrased the passage, or the statement is not backed by the document. Check it in the full text.</p>
+      body.innerHTML = `${quote}${e.scattered ? `<div class="src-status approx">Words found apart</div>
+        <p class="muted">All words of this quote appear in ${esc(t.doc_name)}${e.page ? ` on page ${e.page}` : ""}, but not next to each other, as in a table or form. The quote can still be right: check it in the full text.</p>` : `<div class="src-status missing">Not found in the document</div>
+        <p class="muted">The model put these words in quotation marks, but they do not appear in ${esc(t.doc_name)}. It may have paraphrased the passage, or the statement is not backed by the document. Check it in the full text.</p>`}
         <button class="btn small" data-src="text">Open the full text</button>${finding}`;
       return;
     }
@@ -1352,7 +1371,7 @@
     if (!box) return;
     box.innerHTML = '<div class="page-ph"><span class="spinner"></span></div>';
     const width = Math.min(2000, Math.ceil((box.clientWidth || 500) * (window.devicePixelRatio || 1) / 100) * 100);
-    const onPage = n >= e.page && n <= (e.page_end || e.page);
+    const onPage = e.found && n >= e.page && n <= (e.page_end || e.page);  // only a located passage has boxes
     try {
       const [blob, boxes] = await Promise.all([
         api(`/api/documents/${t.doc_id}/render/${n}?width=${width}`).then((r) => r.blob()),

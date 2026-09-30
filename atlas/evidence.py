@@ -22,6 +22,8 @@ MIN_QUOTE_CHARS = 12  # squashed (letters and digits)
 MAX_QUOTE_CHARS = 2000
 MAX_QUOTES = 40
 MIN_SCORE = 0.5  # share of the quote found in one place; below this the quote counts as not found
+SCATTERED = 0.8  # share of a quote's words on one page for "words found apart" (tables, forms)
+RESTATED = 0.6  # share of an unfound quote's words taken from the question: the model quoted the question
 GRAM = 12  # characters per anchor when matching approximately
 MAX_HITS_PER_GRAM = 64
 
@@ -37,6 +39,20 @@ _BLOCKQUOTE = re.compile(r"(?:^[ \t]*>[^\n]*(?:\n|$))+", re.M)
 
 def squash(text: str) -> str:
     return "".join(m.group().casefold() for m in _ALNUM.finditer(text))
+
+
+def _words(text: str) -> list[str]:
+    """Words of three letters or more and all numbers, case-folded (what a quote is compared by)."""
+    return [w.casefold() for w in _ALNUM.findall(text) if len(w) >= 3 or w.isdigit()]
+
+
+def restates(quote: str, question: str) -> bool:
+    """The quote mostly repeats the question in other words (compared by the first five letters, so
+    "sortiere" and "sortieren" match): the model quoted the request, not the document."""
+    words = [w[:5] for w in _words(quote)]
+    asked = {w[:5] for w in _words(question)}
+    hits = sum(1 for w in words if w in asked)
+    return hits >= 2 and hits / max(len(words), 1) >= RESTATED
 
 
 def _strip_quote(text: str) -> str:
@@ -234,7 +250,7 @@ class DocText:
             if anywhere and (match is None or anywhere.score > match.score + 0.05):
                 match, in_part = anywhere, bool(prefer) and prefer[0] <= anywhere.start < prefer[1]
         if match is None:
-            return {"quote": quote, "found": False}
+            return {"quote": quote, "found": False, **self._scattered(quote, prefer)}
         start, end = match.start, match.end
         while start > 0 and self.text[start - 1].isalnum():  # an approximate match may start mid-word
             start -= 1
@@ -248,8 +264,42 @@ class DocText:
         return {"quote": quote, "found": True, "start": start, "end": end, "score": match.score,
                 "page": self.page_at(start), "page_end": self.page_at(max(start, end - 1)), "in_part": in_part}
 
+    def _page_words(self) -> dict[int | None, set[str]]:
+        """Each page's words (the whole text as one "page" if it has no page markers)."""
+        if not hasattr(self, "_pw"):
+            if self.page_numbers:
+                self._pw = {n: set(_words(self.text[a:b])) for n in self.page_numbers
+                            if (span := self.page_range(n)) for a, b in [span]}
+            else:
+                self._pw = {None: set(_words(self.text))}
+        return self._pw
+
+    def _scattered(self, quote: str, prefer: tuple[int, int] | None) -> dict:
+        """A quote not found as one passage whose words are nearly all on one page: typical for tables
+        and forms, where the text layer stores cells in another order than they appear on the page."""
+        words = _words(quote)
+        if len(words) < 3:
+            return {}
+        pages = self._page_words()
+        candidates = [pages]
+        if prefer and self.page_numbers:  # the pages of the part the answer came from first
+            first, last = self.page_at(prefer[0]), self.page_at(max(prefer[0], prefer[1] - 1))
+            if near := {n: w for n, w in pages.items() if first and last and first <= n <= last}:
+                candidates.insert(0, near)
+        for group in candidates:
+            page, have = max(((n, sum(1 for w in words if w in ws)) for n, ws in group.items()), key=lambda x: x[1])
+            if have / len(words) >= SCATTERED:
+                return {"scattered": True, "coverage": round(have / len(words), 2), "page": page, "page_end": page}
+        return {}
+
     def evidence(self, answer: str, question: str = "", prefer: tuple[int, int] | None = None) -> list[dict]:
-        return [self.find(q, prefer) for q in quotes(answer, question)]
+        out = []
+        for q in quotes(answer, question):
+            hit = self.find(q, prefer)
+            if not hit["found"] and not hit.get("scattered") and question and restates(q, question):
+                continue  # the model put (a rewording of) the question in quotation marks
+            out.append(hit)
+        return out
 
 
 class TextCache:

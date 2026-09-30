@@ -969,3 +969,5 @@ body.source-open .chat-module { grid-template-columns: 340px minmax(0, 1fr) minm
 .answer .katex { font-size: 1.05em; }
 .src-how { font-size: 12px; color: var(--muted); margin: -2px 0 6px; }
 .gd-label .pill { vertical-align: 1px; }
+.src-chip.apart { color: var(--warn); border-style: dashed; }
+.quote-link.apart { text-decoration-color: var(--warn); }

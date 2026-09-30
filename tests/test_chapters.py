@@ -191,3 +191,28 @@ def test_part_range_is_preferred_for_repeated_passages():
     first = doc.find("Keep the valve closed during maintenance.")
     second = doc.find("Keep the valve closed during maintenance.", prefer=(50, len(text)))
     assert first["start"] == 0 and second["start"] == text.rindex("Keep") and second["in_part"]
+
+
+def test_quotes_from_tables_are_found_apart_and_restated_questions_dropped():
+    # a title block as the text layer stores it: labels first, values after, in another order
+    text = ("[Page 1]\nGeneral notes on the drawing.\n\n[Page 2]\nBearbeiter Konstruktion Revision Datum\n"
+            "Muster Designer 2024-03-01 B\nFlow Air Water\nm/s l/min\n3,30 12\n\n[Page 3]\nThe valve is serviced yearly.")
+    doc = evidence.DocText(text)
+    apart = doc.find("Bearbeiter, Konstruktion: Designer Muster")
+    assert not apart["found"] and apart["scattered"] and apart["page"] == apart["page_end"] == 2
+    assert apart["coverage"] == 1.0 and "start" not in apart  # no passage to mark
+    assert doc.find("Water l/min 12")["scattered"] and doc.find("Revision B, Datum 2024-03-01")["scattered"]
+    # an invented quote stays not found, and so does one with too few words to judge
+    assert doc.find("the pump must be replaced after a flood") == {
+        "quote": "the pump must be replaced after a flood", "found": False}
+    assert "scattered" not in doc.find("Muster 2024")
+
+    # the model put the question (reworded) in quotation marks: dropped; real quotes are kept
+    question = "Wie kann ich die Anfragen nach Datum sortieren?"
+    answer = ('Sie möchten "die Anfragen nach Datum zu sortieren". Laut Dokument: "The valve is serviced yearly." '
+              'Nicht belegt: "the pump must be replaced after a flood".')
+    got = doc.evidence(answer, question)
+    assert [e["quote"] for e in got] == ["The valve is serviced yearly.", "the pump must be replaced after a flood"]
+    assert got[0]["found"] and got[0]["page"] == 3 and not got[1]["found"]
+    assert evidence.restates("die Anfragen nach Datum zu sortieren", question)
+    assert not evidence.restates("The valve is serviced yearly.", question)
