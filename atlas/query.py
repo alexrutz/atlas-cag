@@ -304,7 +304,9 @@ class QueryService:
             "draft_accepted": tally.draft_accepted,
             "config": {"model": self.engine.info.config_label or self.engine.info.model,
                        "fingerprint": plan.fingerprint, "build": self.engine.info.build,
-                       "n_slots": self.engine.info.n_slots, "n_ctx_slot": self.engine.info.n_ctx_slot},
+                       "n_slots": self.engine.info.n_slots, "n_ctx_slot": self.engine.info.n_ctx_slot,
+                       # False: this build re-evaluates restored documents of sliding-window models
+                       "swa_restore_ok": self.engine.info.swa_restore_ok},
             "history_turns": len(plan.history) if plan.history_sent is None else plan.history_sent,
             "sampling": dict(self.engine.sampling),
             **tally.extra,
@@ -362,8 +364,11 @@ class QueryService:
         cache_miss = res.n_cached < t.part.n_tokens - 1
         if cache_miss:
             tally.cache_misses += 1
-            log.warning("cache miss on %s: only %d/%d prefix tokens reused; check llama-server flags",
-                        t.label, res.n_cached, t.part.n_tokens)
+            log.warning("cache miss on %s: the restored cache was loaded but only %d of %d prefix tokens were reused%s",
+                        t.label, res.n_cached, t.part.n_tokens,
+                        " (this llama-server build re-evaluates restored documents of sliding-window models: use a "
+                        "build with Atlas's SWA fix or --swa-full)" if eng.info.swa_restore_ok is False else
+                        "; check llama-server flags")
         stats = {"slot": slot, "wait_ms": round(wait_ms, 1), "restore_ms": round(restore_ms, 1),
                  "kv_bytes": restored.get("n_read"), "cache_miss": cache_miss, "n_ctx": eng.info.n_ctx_slot,
                  **res.stats()}

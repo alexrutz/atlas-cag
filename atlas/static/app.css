@@ -950,3 +950,7 @@ body.source-open .chat-module { grid-template-columns: 340px minmax(0, 1fr) minm
 .gd-table .gd-label { max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
 .gen-body .table-wrap { overflow-x: auto; }
 .lib-missing { margin: 0 0 10px; justify-content: space-between; }
+.miss-note { flex-basis: 100%; color: var(--warn); font-size: 12px; line-height: 1.45; }
+.cache-warning { margin: 8px auto 0; width: min(860px, calc(100% - 32px)); padding: 8px 12px; border-radius: var(--radius-sm);
+  background: var(--warn-soft); color: var(--text); font-size: 12.5px; line-height: 1.45; }
+.cache-warning a { color: var(--accent); }

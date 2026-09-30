@@ -631,6 +631,16 @@
     $("#ask").disabled = state.busy || !ready || !docs.length || !question.value.trim();
     $("#ask").hidden = state.busy;
     $("#stop").hidden = !state.busy;
+    // a preset whose build cannot reuse restored caches re-reads every document for every question
+    const warning = $("#cache-warning");
+    const noReuse = state.status?.ready && state.status.engine?.swa_restore_ok === false;
+    warning.hidden = !noReuse;
+    if (noReuse && !warning.dataset.shown) {
+      warning.dataset.shown = "1";
+      warning.innerHTML = `<strong>Documents are read again for every question with this preset.</strong> Its llama-server build does not
+        reuse restored caches of sliding-window models (Gemma, gpt-oss, Spark), so each question prefills its documents from scratch.
+        Use a build with Atlas's SWA fix, or enable “Full SWA cache” in the preset: <a href="#settings/model">Settings → Model</a>.`;
+    }
     const supports = !!state.status?.engine?.supports_thinking;
     $("#thinking-wrap").hidden = !supports;
     if (supports && !state.thinkingTouched) $("#thinking").checked = !!state.status.limits.enable_thinking;
@@ -942,8 +952,10 @@
       if (ev.stats) {
         const s = ev.stats;
         $(".finding-stats", row).textContent =
-          `slot ${s.slot} · ${fmtInt(s.n_cached)} tok restored in ${fmtMs(s.restore_ms)} · ${fmtInt(s.n_processed)} evaluated · ${fmtInt(s.n_gen)} generated` +
-          (s.gen_tps ? ` @ ${s.gen_tps} tok/s` : "") + (s.cache_miss ? " · CACHE MISS" : "");
+          `slot ${s.slot} · ` + (s.cache_miss
+            ? `cache loaded in ${fmtMs(s.restore_ms)} but not reused (CACHE MISS)`
+            : `${fmtInt(s.n_cached)} tok reused from the cache (loaded in ${fmtMs(s.restore_ms)})`) +
+          ` · ${fmtInt(s.n_processed)} evaluated · ${fmtInt(s.n_gen)} generated` + (s.gen_tps ? ` @ ${s.gen_tps} tok/s` : "");
       }
       this.updateCount();
     }
@@ -1041,15 +1053,18 @@
       if (!s) return;
       const bits = [
         `<strong>${fmtMs(s.total_ms)}</strong>`,
-        `<span class="hero">${fmtInt(s.tokens_restored)} tokens restored from KV cache in ${fmtMs(s.restore_ms)}</span>`,
+        s.cache_misses && !s.tokens_restored
+          ? `<span class="warn-text">KV caches loaded in ${fmtMs(s.restore_ms)} but not reused: the documents were read again</span>`
+          : `<span class="hero">${fmtInt(s.tokens_restored)} tokens reused from the KV cache (loaded in ${fmtMs(s.restore_ms)})</span>`,
         `${fmtInt(s.tokens_processed)} evaluated`,
         `${fmtInt(s.tokens_generated)} generated`,
       ];
       if (this.mode === "map_reduce") bits.push(`${s.n_relevant ?? 0} of ${s.n_targets} answers synthesized`);
       if (s.history_turns) bits.push(`${s.history_turns} earlier turn${s.history_turns === 1 ? "" : "s"} sent`);
-      if (s.cache_misses) bits.push(`<span style="color:var(--warn)">${s.cache_misses} cache miss${s.cache_misses > 1 ? "es" : ""}</span>`);
+      if (s.cache_misses) bits.push(`<span style="color:var(--warn)" title="${esc(missReason(s))}">${s.cache_misses} cache miss${s.cache_misses > 1 ? "es" : ""}</span>`);
       if (s.truncated) bits.push(`<span style="color:var(--warn)">${s.truncated} generation${s.truncated > 1 ? "s" : ""} hit the token limit</span>`);
-      this.el.foot.innerHTML = bits.join("<span>·</span>");
+      this.el.foot.innerHTML = bits.join("<span>·</span>") +
+        (s.cache_misses ? `<div class="miss-note">${esc(missReason(s))}</div>` : "");
       this.el.foot.hidden = false;
       $(".gen-body", this.el.details).innerHTML = genDetails(this, s);
       this.el.details.hidden = false;
@@ -1362,6 +1377,17 @@
       <td>${esc(st.truncated ? "context full" : STOP_LABELS[st.stop_type] || st.stop_type || "–")}${st.cache_miss ? ' <span class="warn-text">cache miss</span>' : ""}</td></tr>`;
   }
 
+  // why llama-server evaluated a restored document again
+  function missReason(s) {
+    if (s.config?.swa_restore_ok === false) {
+      return "The llama-server build of this preset re-reads restored documents of sliding-window models (Gemma, gpt-oss, Spark): "
+        + "the cache files were loaded, then every part was evaluated again. Use a build with Atlas's SWA fix "
+        + "(Settings → Model → llama-server builds → Build from: Source, or the preset's build) or enable “Full SWA cache” in the preset.";
+    }
+    return "llama-server loaded the cache files but did not reuse them, so the documents were evaluated again. "
+      + "Check the server log (Settings → Model) for the reason.";
+  }
+
   function genDetails(turn, s) {
     const calls = [...turn.targets.values()].filter((t) => t.stats);
     const generated = s.tokens_generated || 0;
@@ -1372,10 +1398,11 @@
     const rows = [
       ["Total time", `${fmtMs(s.total_ms)}${s.first_token_ms != null ? ` · first token after ${fmtMs(s.first_token_ms)}` : ""}${
         s.first_answer_ms != null && s.first_answer_ms !== s.first_token_ms ? ` · first answer token after ${fmtMs(s.first_answer_ms)}` : ""}`],
-      ["From the KV cache", `${fmtInt(s.tokens_restored)} tokens restored from ${calls.length} slot file${calls.length === 1 ? "" : "s"}${
-        s.kv_bytes_read ? ` · ${fmtBytes(s.kv_bytes_read)} read` : ""} in ${fmtMs(s.restore_ms)}${s.cache_misses ? ` · <span class="warn-text">${s.cache_misses} cache miss${s.cache_misses > 1 ? "es" : ""}</span>` : ""}`],
+      ["From the KV cache", `${fmtInt(s.tokens_restored)} tokens reused · ${calls.length} slot file${calls.length === 1 ? "" : "s"}${
+        s.kv_bytes_read ? ` (${fmtBytes(s.kv_bytes_read)})` : ""} loaded in ${fmtMs(s.restore_ms)}${s.cache_misses
+          ? ` · <span class="warn-text">${s.cache_misses} cache miss${s.cache_misses > 1 ? "es" : ""}: loaded but not reused</span>` : ""}`],
       ["Prompt evaluation", `${fmtInt(s.tokens_processed)} tokens${s.prompt_ms ? ` in ${fmtMs(s.prompt_ms)} · ${tps(promptTps)}` : ""}
-        <span class="muted">(conversation and question; the documents came from the cache)</span>`],
+        <span class="muted">${s.cache_misses ? "(documents read again, plus conversation and question)" : "(conversation and question; the documents came from the cache)"}</span>`],
       ["Generation", `${fmtInt(generated)} tokens${thinking ? ` (${fmtInt(thinking)} thinking, ${fmtInt(generated - thinking)} answer)` : ""}${
         s.gen_ms ? ` in ${fmtMs(s.gen_ms)} · ${tps(genTps)}` : ""}${s.truncated ? ` · <span class="warn-text">${s.truncated} cut off</span>` : ""}`],
       s.draft_n ? ["Speculative decoding", `${fmtInt(s.draft_accepted)} of ${fmtInt(s.draft_n)} drafted tokens accepted (${Math.round((100 * s.draft_accepted) / s.draft_n)}%)`] : null,
