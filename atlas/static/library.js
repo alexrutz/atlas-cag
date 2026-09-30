@@ -17,7 +17,6 @@
     lastChecked: null,  // for selecting a range with shift
     collapsed: new Set(store.get("atlas.lib.collapsed", [])),
     detail: null,  // document id shown in the details panel
-    target: store.get("atlas.uploadTarget", ""),
     uploadMode: store.get("atlas.uploadMode", null),  // null: the server's default prefill mode
     built: false,
   };
@@ -49,7 +48,7 @@
             </div>
           </div>
           <div class="lib-drop" id="lib-drop">
-            <span>Drop files anywhere here to add them to <select id="lib-target" aria-label="Collection for new documents"></select></span>
+            <span>Upload or drop files anywhere here to add them to <strong id="lib-target"></strong></span>
             <span title="Visual prefill sends page images to a vision model (needs a preset with a vision projector); it reads tables, charts and scans that text extraction misses.">
               PDFs &amp; images from <select id="lib-mode" aria-label="Prefill mode for PDFs and images">
                 <option value="text">extracted text</option><option value="visual">page images (vision)</option>
@@ -210,13 +209,16 @@
 
   const collectionOptions = () => [["", "Unfiled"], ...A.groups().filter((g) => g.id).map((g) => [g.id, A.indent(g.depth) + g.name])];
 
+  // new documents go where the library is showing: the open collection, else Unfiled
+  const here = () => (S().collections.some((c) => c.id === lib.coll) ? lib.coll : "");
+
   function renderUploadControls() {
-    const opts = collectionOptions();
-    if (lib.target && !S().collections.some((c) => c.id === lib.target)) lib.target = "";
-    const html = opts.map(([v, n]) => `<option value="${esc(v)}"${v === lib.target ? " selected" : ""}>${esc(n)}</option>`).join("");
-    for (const sel of [$("#lib-target"), $("#paste-collection")]) {
-      if (sel.dataset.html !== html) { sel.innerHTML = html; sel.dataset.html = html; }
-    }
+    const html = collectionOptions().map(([v, n]) => `<option value="${esc(v)}">${esc(n)}</option>`).join("");
+    const sel = $("#paste-collection");
+    if (sel.dataset.html !== html) { sel.innerHTML = html; sel.dataset.html = html; }
+    const target = $("#lib-target");
+    target.textContent = collName(here());
+    target.title = here() ? A.pathLabel(here()) : "";
     const mode = $("#lib-mode");
     if (document.activeElement !== mode) mode.value = uploadMode();
   }
@@ -498,7 +500,7 @@
   function setColl(coll) {
     lib.coll = coll;
     store.set("atlas.lib.coll", coll);
-    if (coll !== "all") { lib.target = coll; store.set("atlas.uploadTarget", coll); }
+    store.set("atlas.uploadTarget", coll === "all" ? "" : coll);  // the PDF tools' default collection
     render();
   }
 
@@ -506,7 +508,7 @@
 
   const uploadMode = () => lib.uploadMode || S().status?.limits?.default_prefill || "text";
 
-  async function uploadFiles(files, target = lib.target) {
+  async function uploadFiles(files, target = here()) {
     if (!files.length) return;
     const form = new FormData();
     for (const f of files) form.append("files", f, f.name);
@@ -535,13 +537,13 @@
     $("#file-input").click();
   }
   $("#file-input").addEventListener("change", (e) => {
-    uploadFiles([...e.target.files], pickTarget ?? lib.target);
+    uploadFiles([...e.target.files], pickTarget ?? here());
     pickTarget = null;
     e.target.value = "";
   });
 
   const pasteDialog = $("#paste-dialog");
-  function openPaste(target = lib.target) {
+  function openPaste(target = here()) {
     renderUploadControls();
     $("#paste-collection").value = target || "";
     pasteDialog.showModal();
@@ -569,7 +571,7 @@
       const act = e.target.closest("[data-act]")?.dataset.act;
       const tr = e.target.closest("#lib-rows tr");
       const coll = e.target.closest(".coll");
-      if (act === "upload") return pickFiles(lib.target);
+      if (act === "upload") return pickFiles(here());
       if (act === "paste") return openPaste();
       if (act === "new-coll") {
         const name = await A.promptText("New collection", "Name", "", "Create");
@@ -650,7 +652,6 @@
         renderTable();
       } else if (e.target.id === "lib-status") { lib.status = e.target.value; renderTable(); }
       else if (e.target.id === "lib-modefilter") { lib.mode = e.target.value; renderTable(); }
-      else if (e.target.id === "lib-target") { lib.target = e.target.value; store.set("atlas.uploadTarget", lib.target); }
       else if (e.target.id === "lib-mode") {
         lib.uploadMode = e.target.value;
         store.set("atlas.uploadMode", lib.uploadMode);
@@ -712,7 +713,7 @@
         move(docs, target || null);
       } else if (isFiles(e)) {
         e.preventDefault();
-        uploadFiles([...e.dataTransfer.files], target ?? lib.target);
+        uploadFiles([...e.dataTransfer.files], target ?? here());
       }
     });
   }
