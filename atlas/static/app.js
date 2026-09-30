@@ -677,9 +677,31 @@
 
   // ---------------------------------------------------------------- markdown
 
+  // Math (KaTeX, bundled in static/vendor): \( \) and $ $ inline, \[ \] and $$ $$ as blocks. A $ counts
+  // only when the text right after the opening and before the closing one is not a space and no digit
+  // follows the closing one, so "$5 and $10" stays text.
+  const MATH_RE = /\$\$([\s\S]+?)\$\$|\\\[([\s\S]+?)\\\]|\\\(([\s\S]+?)\\\)|\$(?![\s$])([^$\n]+?)(?<![\s\\])\$(?!\d)/g;
+
+  function renderMath(tex, display) {
+    if (!window.katex) return null;
+    try {
+      return window.katex.renderToString(tex, { displayMode: display, throwOnError: false, output: "html" });
+    } catch {
+      return null;
+    }
+  }
+
   function inline(text, cite) {
     return text.split(/(`[^`\n]+`)/g).map((part, i) => {
       if (i % 2) return `<code>${esc(part.slice(1, -1))}</code>`;
+      // math first, so markdown inside it (a_b, *) is not formatted; placeholders survive escaping
+      const math = [];
+      part = part.replace(MATH_RE, (m, dd, bracket, paren, dollar) => {
+        const html = renderMath(dd ?? bracket ?? paren ?? dollar, dd !== undefined || bracket !== undefined);
+        if (html === null) return m;
+        math.push(html);
+        return `\u0000${math.length - 1}\u0000`;
+      });
       let t = esc(part);
       t = t.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>").replace(/__(.+?)__/g, "<strong>$1</strong>");
       t = t.replace(/(^|[^*\w])\*(?!\s)([^*\n]+?)\*(?!\w)/g, "$1<em>$2</em>");
@@ -690,7 +712,8 @@
           return label ? `<span class="cite" role="button" tabindex="0" data-n="${n}" title="${esc(label)} · click to see the source">${n}</span>` : m;
         });
       }
-      return t.replace(/\n/g, "<br>");
+      t = t.replace(/\n/g, "<br>");
+      return math.length ? t.replace(/\u0000(\d+)\u0000/g, (m, k) => math[Number(k)]) : t;
     }).join("");
   }
 
@@ -743,6 +766,23 @@
         continue;
       }
       if (!line.trim()) { flush(); i++; continue; }
+      const open = line.trim().match(/^(\$\$|\\\[)/);
+      if (open) {  // a display formula on its own lines: $$ … $$ or \[ … \]
+        const close = open[1] === "$$" ? "$$" : "\\]";
+        const buf = [line.trim().slice(2)];
+        let j = i;
+        while (!buf[buf.length - 1].trimEnd().endsWith(close) && j + 1 < lines.length && j - i < 60) buf.push(lines[++j]);
+        const body = buf.join("\n").trimEnd();
+        if (body.endsWith(close)) {
+          const html = renderMath(body.slice(0, -close.length), true);
+          if (html !== null) {
+            flush();
+            out.push(`<div class="math-display">${html}</div>`);
+            i = j + 1;
+            continue;
+          }
+        }
+      }
       if ((m = line.match(/^(#{1,6})\s+(.*?)\s*#*$/))) {
         flush();
         const lvl = Math.min(m[1].length, 4);
@@ -1658,7 +1698,7 @@
     api, getJSON, esc, toast, refresh, openModal, confirmAction, promptText, openMenu,
     fmtInt, fmtTok, fmtBytes, fmtMs, fmtAgo, state, store, ICONS, STATUS_LABELS,
     docMeta, statusPill, groups, docsIn, docsUnder, childItems, childCollections, subtreeIds, collectionPath, pathLabel,
-    libraryOrder, indent, docById, collectionById, collectionName, patchList, run, setMode, openTextDialog, setSelected,
+    libraryOrder, indent, docById, collectionById, collectionName, patchList, run, setMode, openTextDialog, setSelected, renderMarkdown,
     subscribe: (fn) => subscribers.push(fn),
     registerModule, current: () => currentModule,
   };

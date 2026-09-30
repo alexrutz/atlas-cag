@@ -965,3 +965,5 @@ body.source-open .chat-module { grid-template-columns: 340px minmax(0, 1fr) minm
 .form-grid .field, .optional-box > .field { min-width: 0; }
 .form-grid select, .form-grid input:not([type=checkbox]) { width: 100%; min-width: 0; max-width: 100%; }
 .input-row .toggle-btn { height: auto; align-self: stretch; }
+.math-display { overflow-x: auto; overflow-y: hidden; margin: 0 0 .75em; padding: 2px 0; }
+.answer .katex { font-size: 1.05em; }
