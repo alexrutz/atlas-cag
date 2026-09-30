@@ -132,7 +132,7 @@
       ${est.ram ? `<div class="est-row"><span class="est-label">RAM</span>
         <div class="bar"><span class="seg ram" style="width:${pct(est.ram, Math.max(ram, est.ram))}" title="Offloaded weights ${fmtGB(est.ram)}"></span></div>
         <strong>≈ ${fmtGB(est.ram)}${ram ? ` of ${fmtGB(ram)}` : ""}</strong></div>` : ""}
-      ${est.streamed_experts && est.ubatch < 2048 ? `<div class="muted small">Prefill copies the ${fmtGB(est.streamed_experts)} of experts kept in RAM to the GPU once per micro-batch (now ${est.ubatch} tokens), so it is limited by PCIe. A larger micro-batch, e.g. <code>-ub 2048 -b 2048</code> or 4096, makes prefill of long documents several times faster; it costs compute buffer memory, shown above.</div>` : ""}
+      ${est.streamed_experts && est.ubatch < 2048 ? `<div class="muted small" title="Prefill copies the experts kept in RAM to the GPU once per micro-batch (now ${est.ubatch} tokens), so it is limited by PCIe. A larger micro-batch costs compute buffer memory.">Faster prefill of long documents: add <code>-ub 2048 -b 2048</code> (experts are streamed per micro-batch).</div>` : ""}
       ${est.ssd ? `<div class="muted small">${fmtGB(est.ssd)} of embeddings stay on disk and are read on demand (--lazy-mode).</div>` : ""}
       ${gpuOver ? `<div class="warn-text">Does not fit: about ${fmtGB(est.total)} needed plus 1 GB kept free for the desktop, ${fmtGB(gpu)} free. Windows would move the rest into shared system memory: slow, and the desktop can stutter or freeze. Reduce context per slot or slots, use a smaller KV type, or offload experts (-cmoe / --n-cpu-moe N).</div>` : ""}
       ${ramOver ? '<div class="warn-text">The weights kept in system RAM exceed most of the memory available to this system.</div>' : ""}
@@ -309,9 +309,8 @@
         </section>
         <section class="card">
           <div class="card-head"><h2>llama-server builds</h2><button class="btn subtle" data-act="refresh-builds">Check again</button></div>
-          <p class="muted"><strong>Standard</strong>: upstream llama.cpp with Atlas's fixes, built here and kept up to date. Use it for every
-            model upstream llama.cpp supports. <strong>Custom builds</strong>: llama-server binaries you add for models that need another
-            llama.cpp (a fork for a new architecture); they are not updated. A preset uses the standard build unless it names a custom one.</p>
+          <p class="muted"><strong>Standard</strong>: upstream llama.cpp with Atlas's fixes, kept up to date: for every model llama.cpp supports.
+            <strong>Custom builds</strong>: binaries you add for models that need another llama.cpp.</p>
           <div id="updates-box"></div>
           <h3 class="builds-sub">Custom builds</h3>
           <div id="builds-list"><div class="muted"><span class="spinner"></span> Checking builds…</div></div>
@@ -403,10 +402,8 @@
         </label>
         <button class="btn subtle" data-act="check-updates" ${working ? "disabled" : ""}>${u.source === "patched" && !patched ? "Build now" : "Check now"}</button>
       </div>
-      <div class="muted small">Follows the llama.cpp releases (as packaged by <a href="https://github.com/${esc(u.repo)}/releases" target="_blank" rel="noopener">${esc(u.repo)}</a>)${
-        u.source === "patched" ? `, each built here from <code>${esc(u.source_repo)}</code> with Atlas's fixes: restored documents of sliding-window
-        models (Gemma, gpt-oss, Spark) are reused, and slot files load after changing the number of slots. If a fix no longer applies to a
-        new release, the current build stays.` : ": prebuilt packages without Atlas's fixes."} Last check ${fmtAgo(u.last_check)}${latest}.</div>
+      <div class="muted small" title="${u.source === "patched" ? `Each llama.cpp release (as packaged by ${esc(u.repo)}) is built here from ${esc(u.source_repo)} with Atlas's fixes: restored documents of sliding-window models are reused, and slot files load after changing the number of slots. If a fix no longer applies, the current build stays.` : "Prebuilt packages without Atlas's fixes."}">${
+        u.source === "patched" ? "Rebuilt here for each llama.cpp release." : "Prebuilt packages, without Atlas's fixes."} Last check ${fmtAgo(u.last_check)}${latest}.</div>
       ${u.source === "patched" && u.toolchain.length ? `<div class="warn-text">Building needs ${u.toolchain.map(esc).join(", ")}${u.toolchain.includes("nvcc") ? " (the CUDA toolkit)" : ""},
         which ${u.toolchain.length === 1 ? "is" : "are"} not installed. <button class="link-btn small" data-act="build-source" data-source="release">Use prebuilt releases without the fixes</button></div>` : ""}
       ${u.source === "release" ? `<div class="muted small"><button class="link-btn small" data-act="build-source" data-source="patched">Build the standard build with Atlas's fixes</button></div>` : ""}
@@ -679,7 +676,7 @@
         </label>
         <label class="field">Slots (parallel requests)
           <input name="slots" type="number" min="1" max="32" value="${p.slots}" required>
-          <span class="muted small">More slots answer more documents at once; each needs its own context memory.</span>
+          <span class="muted small">Answers in parallel; each slot needs its own context memory.</span>
         </label>
         <label class="field">KV cache type
           <select name="kv_type">${KV_TYPES.map(([v, l]) => `<option value="${v}" ${v === p.kv_type ? "selected" : ""}>${esc(l)}</option>`).join("")}</select>
@@ -693,12 +690,10 @@
             <button type="button" class="btn small toggle-btn" data-cmoe aria-pressed="${p.cpu_moe}"
               title="Keep the mixture-of-experts weights in system RAM (--cpu-moe); attention and shared weights stay on the GPU">-cmoe</button>
           </span>
-          <span class="muted small gpu-layers-help"></span>
+          <span class="muted small">all, auto or a number · -cmoe keeps MoE experts in RAM</span>
         </label>
         <label class="field check-field"><span><input type="checkbox" name="swa_full" ${p.swa_full ? "checked" : ""}> Full SWA cache (--swa-full)</span>
-          <span class="muted small">Sliding-window models (Gemma, gpt-oss, Spark): standard llama-server builds prefill a restored document
-            again unless this is on. Off caches only the window for sliding layers (far less memory) and needs a build with the SWA
-            restore fix; Atlas checks this when the preset starts.</span>
+          <span class="muted small">Only for builds without Atlas's SWA fix (the standard build has it). Needs much more memory.</span>
         </label>
         <fieldset class="span2 optional-box">
           <legend>Optional</legend>
@@ -706,21 +701,18 @@
             <select name="mmproj_select">${projectorOptions(p.mmproj)}</select>
             <input name="mmproj" placeholder="/path/to/mmproj.gguf" value="${esc(p.mmproj)}" ${customProjector ? "" : "hidden"}>
             <span class="projector-hint"></span>
-            <span class="muted small">For visual prefill: the model reads PDF pages and images as pictures (tables, charts, scans).
-              Use the <code>mmproj-*.gguf</code> from the model's repository. Text caches are kept.</span>
+            <span class="muted small">For visual prefill: reads PDF pages and images as pictures.</span>
           </label>
           <label class="field">Draft model (speculative decoding)
             <select name="draft_select">${draftOptions(p.draft_model, p.model_path)}</select>
             <input name="draft_model" placeholder="/path/to/draft.gguf" value="${esc(p.draft_model)}" ${customDraft ? "" : "hidden"}>
-            <span class="muted small">Faster answers: a small model of the same family (or a DFlash / Eagle3 / MTP head for this model)
-              guesses ahead and the model checks several tokens at once. Needs extra memory (in the estimate). Guesses are weaker on
-              restored documents, because llama-server restores only the model's cache. Document caches are kept.</span>
+            <span class="muted small" title="A small model of the same family, or a DFlash / Eagle3 / MTP head made for this model, guesses ahead and the model checks several tokens at once. Guesses are weaker on restored documents, because llama-server restores only the model's cache.">Speculative decoding: faster answers, needs extra memory.</span>
           </label>
         </fieldset>
         <label class="field span2">llama-server build
           <select name="build_select">${buildOptions(p.binary)}</select>
           <input name="binary" placeholder="/path/to/llama-server" value="${esc(p.binary)}" ${customBuild ? "" : "hidden"}>
-          <span class="muted small">Use a newer or custom build for models the default build does not support.</span>
+          <span class="muted small">Custom builds are for models the standard build cannot run.</span>
         </label>
         <fieldset class="span2 sampling-box">
           <legend>Sampling</legend>
@@ -735,7 +727,7 @@
         </fieldset>
         <label class="field span2">Extra llama-server arguments
           <input name="extra_args" value="${esc(p.extra_args)}" placeholder="--threads 8 --batch-size 4096">
-          <span class="muted small">Advanced. Flags Atlas controls (port, slots, context, KV cache, slot path…) are rejected.</span>
+          <span class="muted small">Flags Atlas sets itself (slots, context, KV cache, …) are rejected.</span>
         </label>
       </div>
       <div class="estimate-panel"></div>
@@ -768,9 +760,7 @@
       cmoeButton.disabled = !moe;
       cmoeButton.title = moe ? "Keep the mixture-of-experts weights in system RAM (--cpu-moe); attention and shared weights stay on the GPU"
         : "Only for mixture-of-experts models";
-      $(".gpu-layers-help", presetForm).textContent = cmoeOn()
-        ? "Sent as -cmoe instead of --n-gpu-layers: experts stay in system RAM, llama.cpp puts as many other layers on the GPU as fit. For MoE models larger than the GPU."
-        : "“all”, “auto” or a number; fewer layers spill weights to system RAM (slower).";
+
     };
     const ownSampling = () => Object.fromEntries(SAMPLING.map((x) => {
       const raw = f[`s_${x.key}`].value.trim();
@@ -788,8 +778,7 @@
       const known = SAMPLING.filter((x) => model[x.key] !== undefined);
       $(".sampling-note", presetForm).innerHTML = samplingModel === null ? "Reading the model file…"
         : known.length
-          ? `Recommended by the model file: ${known.map((x) => `${x.short} ${esc(fmtSample(x, model[x.key]))}`).join(" · ")}.
-             Empty fields use these values; enter a value to override one for this preset.`
+          ? `From the model file: ${known.map((x) => `${x.short} ${esc(fmtSample(x, model[x.key]))}`).join(" · ")}. Empty fields use these.`
           : `<span class="warn-text">The model file recommends no sampling parameters. Enter them, e.g. from the model card.</span>`;
       for (const x of SAMPLING) {
         const input = f[`s_${x.key}`];
@@ -841,9 +830,7 @@
         $(".estimate-panel", presetForm).innerHTML = `
           ${(est?.warnings || []).map((w) => `<div class="warn-text strong">${esc(w)}</div>`).join("")}
           <h4>Estimated memory</h4>${estimateBar(est)}
-          <div class="muted small">Largest document per part ≈ ${fmtInt(Math.max(0, ctx - reserve))} tokens
-            (larger documents are split and answered part by part)${est?.slot_file_per_100k_tokens ? ` · slot files ≈ ${fmtBytes(est.slot_file_per_100k_tokens)} per 100k document tokens` : ""}.
-            GPU figures include compute buffers.</div>`;
+          <div class="muted small">Largest document part ≈ ${fmtInt(Math.max(0, ctx - reserve))} tokens${est?.slot_file_per_100k_tokens ? ` · slot files ≈ ${fmtBytes(est.slot_file_per_100k_tokens)} per 100k tokens` : ""}</div>`;
       }, 200);
     };
     presetForm.onchange = (e) => {

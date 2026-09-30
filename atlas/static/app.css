@@ -621,7 +621,7 @@ dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; ma
 .btn.danger-outline { color: var(--err); border-color: var(--err); background: transparent; }
 .link-btn.small { font-size: 12px; padding: 0; justify-self: start; }
 
-.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 18px; }
+.form-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 4px 18px; }
 .form-grid .field { margin-bottom: 10px; min-width: 0; }
 .form-grid .span2 { grid-column: 1 / -1; }
 .form-section { grid-column: 1 / -1; margin: 10px 0 4px; font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--faint); }
@@ -701,7 +701,7 @@ dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; ma
 .seg.compute, .legend i.compute { background: #94a3b8; }
 .seg.draft, .legend i.draft { background: #e879a6; }
 .optional-box { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 12px 0; margin: 0 0 12px;
-  display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; align-items: start; }
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0 16px; align-items: start; min-width: 0; }
 .optional-box > .field { align-content: start; }
 .optional-box legend { font-size: 13px; font-weight: 650; padding: 0 4px; }
 .projector-hint:empty { display: none; }
@@ -934,7 +934,7 @@ body.source-open .chat-module { grid-template-columns: 340px minmax(0, 1fr) minm
 .address-note code { font-size: 11.5px; }
 .toggle-btn { flex: none; font: 600 12px var(--mono); }
 .toggle-btn[aria-pressed=true] { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
-.input-row input:disabled { color: var(--faint); background: var(--surface-2); cursor: not-allowed; font-family: var(--mono); }
+.input-row input:disabled { color: var(--faint); background: var(--surface-2); cursor: not-allowed; }
 
 /* ================================================================ generation details */
 .gen-details { border-top: 1px solid var(--border); }
@@ -961,3 +961,7 @@ body.source-open .chat-module { grid-template-columns: 340px minmax(0, 1fr) minm
 .updates-head .field { flex: 0 1 280px; min-width: 200px; }
 .updates-head .field select { width: 100%; }
 .updates-head > .btn { flex: none; }
+/* long model names: a select is as wide as its longest option unless told otherwise */
+.form-grid .field, .optional-box > .field { min-width: 0; }
+.form-grid select, .form-grid input:not([type=checkbox]) { width: 100%; min-width: 0; max-width: 100%; }
+.input-row .toggle-btn { height: auto; align-self: stretch; }
