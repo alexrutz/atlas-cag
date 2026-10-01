@@ -70,12 +70,12 @@ class Settings(BaseSettings):
     ingest_concurrency: int = 1
     # Overlap between consecutive parts when a document exceeds one slot's context.
     part_overlap_tokens: int = 256
-    # Build KV caches automatically: for new documents, for every document when a new model
-    # configuration becomes active, and to repair missing or broken caches.
+    # Prefill new documents automatically when they are added.
     auto_build_caches: bool = True
-    # When another model configuration becomes active (other preset, model, KV type, build that
-    # computes differently), build the caches it lacks for the whole library. Off: documents show
-    # "not built" for it until built from the Library (Build all, or per document).
+    # Rebuild caches by themselves when they become unusable: another model configuration (other
+    # preset, model, KV type, build that computes differently, also mid-prefill), cache files that
+    # are missing or fail to restore, a slot too small for them. Off: such documents show what is
+    # wrong and wait until you build them in the Library (Build all, or per document).
     build_on_model_change: bool = False
     # How new PDFs and images are prefilled: "text" (extracted text) or "visual" (page images,
     # needs a preset with a vision projector). Each document can be switched later.

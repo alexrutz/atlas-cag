@@ -50,6 +50,7 @@ class Ingestor:
         self._cancelled: set[str] = set()
         self._retries: dict[str, int] = {}
         self._active: dict[str, str | None] = {}  # doc id -> fingerprint being built
+        self._jobs: dict[str, asyncio.Task] = {}  # doc id -> its running ingestion (cancelled by stop)
         self._workers: set[asyncio.Task] = set()
         self._target = 0
 
@@ -98,7 +99,35 @@ class Ingestor:
         return queued
 
     def cancel(self, doc_id: str) -> None:
+        """Stop building a document's cache: dropped from the queue, or interrupted mid-prefill."""
+        if not self.is_busy(doc_id):
+            return
         self._cancelled.add(doc_id)
+        job = self._jobs.get(doc_id)
+        if job:
+            job.cancel()  # closes the request: llama-server stops evaluating
+        else:
+            self._settle_cancelled(doc_id, self.engine.info.fingerprint)  # still waiting in the queue
+
+    def cancel_all(self) -> list[str]:
+        busy = sorted(self._pending | set(self._active))
+        for doc_id in busy:
+            self.cancel(doc_id)
+        return busy
+
+    def _settle_cancelled(self, doc_id: str, fp: str | None) -> None:
+        """After a stop: an untouched cache keeps its parts (back to ready, checked as usual), a
+        cache whose rebuild had begun has none left and shows as not built."""
+        cache = self.store.get_cache(doc_id, fp) if fp else None
+        if cache is None or cache.status not in ("queued", "ingesting") or not self.store.get_document(doc_id):
+            return
+        parts = self.store.get_parts(doc_id, fp, with_tokens=False)
+        if parts:  # a cache queued for a repair is stale again
+            missing = any(not (self.settings.kv_dir / p.kv_file).exists() for p in parts)
+            self.store.set_cache(doc_id, fp, status="stale" if missing else "ready",
+                                 error="KV cache file is missing" if missing else None)
+        else:
+            self.store.delete_cache(doc_id, fp)
 
     def is_busy(self, doc_id: str) -> bool:
         return doc_id in self._pending or doc_id in self._active
@@ -157,8 +186,9 @@ class Ingestor:
             if c.doc_id not in self._active:
                 self.remove_parts(c.doc_id, c.fingerprint)
                 self.store.delete_cache(c.doc_id, c.fingerprint)
-        auto = self.settings.auto_build_caches  # repairs of this configuration's caches
-        on_change = self.settings.build_on_model_change  # caches this configuration never had
+        # caches that became unusable (another configuration, missing files, a smaller slot) are only
+        # rebuilt by themselves with build_on_model_change; otherwise they wait for the user
+        on_change = self.settings.build_on_model_change
         caches = self.store.caches_for(fp)
         n_ctx = self.engine.info.n_ctx_slot
         for doc in self.store.list_documents():
@@ -192,8 +222,7 @@ class Ingestor:
             elif status == "stale" and valid:
                 self.store.set_cache(doc.id, fp, status="ready", error=None)
                 status = "ready"
-            # a missing file is repaired; parts larger than the slot come from a smaller slot size
-            if status == "stale" and not self.is_busy(doc.id) and (on_change if too_big else auto):
+            if status == "stale" and not self.is_busy(doc.id) and on_change:
                 self.enqueue(doc.id)
 
     # --- worker ------------------------------------------------------------------------
@@ -206,17 +235,21 @@ class Ingestor:
             self._pending.discard(doc_id)
             self._active[doc_id] = None
             try:
-                await self._ingest(doc_id)
+                await self._run_job(doc_id)
             except asyncio.CancelledError:
                 raise
             except IngestCancelled:
-                log.info("ingestion of %s cancelled", doc_id)
+                log.info("ingestion of %s stopped", doc_id)
+                self._settle_cancelled(doc_id, self._active.get(doc_id) or self.engine.info.fingerprint)
             except ConfigChanged:
-                log.info("model configuration changed while ingesting %s; restarting it", doc_id)
                 fp = self._active.pop(doc_id, None)
                 if fp:
                     self.store.delete_cache(doc_id, fp)
-                self.enqueue(doc_id)
+                if self.settings.build_on_model_change:
+                    log.info("model configuration changed while ingesting %s; restarting it", doc_id)
+                    self.enqueue(doc_id)
+                else:
+                    log.info("model configuration changed while ingesting %s; stopped (build it in the Library)", doc_id)
             except LlamaError as e:
                 if e.status is None and self._retries.get(doc_id, 0) < MAX_RETRIES:
                     # connection-level failure: llama-server restarting or unreachable
@@ -235,6 +268,22 @@ class Ingestor:
                 self.progress.pop(doc_id, None)
                 self._cancelled.discard(doc_id)
                 self.queue.task_done()
+
+    async def _run_job(self, doc_id: str) -> None:
+        """Ingest in a task of its own, so a stop can interrupt it mid-prefill."""
+        job = asyncio.create_task(self._ingest(doc_id), name=f"ingest-{doc_id}")
+        self._jobs[doc_id] = job
+        try:
+            await asyncio.wait({job})
+        except asyncio.CancelledError:  # the worker itself is shutting down
+            job.cancel()
+            await asyncio.gather(job, return_exceptions=True)
+            raise
+        finally:
+            self._jobs.pop(doc_id, None)
+        if job.cancelled():
+            raise IngestCancelled(doc_id)
+        job.result()  # the ingestion's own exception, if any
 
     def _fail(self, doc_id: str, e: Exception) -> None:
         log.exception("ingestion of %s failed", doc_id, exc_info=e)

@@ -626,6 +626,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(409, "no model is running")
         return {"queued": s.ingestor.build_missing()}
 
+    @api.post("/documents/stop-builds")
+    async def stop_all_builds(request: Request):
+        """Stop every queued and running prefill."""
+        return {"stopped": st(request).ingestor.cancel_all()}
+
+    @api.post("/documents/{doc_id}/stop")
+    async def stop_build(request: Request, doc_id: str):
+        """Stop prefilling a document: taken out of the queue, or interrupted mid-prefill."""
+        s = st(request)
+        doc = get_doc_or_404(s, doc_id)
+        s.ingestor.cancel(doc_id)
+        return doc_json(s, doc)
+
     @api.post("/documents/{doc_id}/reingest")
     async def reingest_document(request: Request, doc_id: str):
         s = st(request)

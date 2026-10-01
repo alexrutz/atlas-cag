@@ -66,6 +66,7 @@
             </select>
           </div>
           <div class="notice lib-missing" id="lib-missing" hidden></div>
+          <div class="notice lib-busy" id="lib-busy" hidden></div>
           <div class="bulkbar" id="lib-bulk" hidden>
             <strong id="lib-bulk-n"></strong>
             <button class="btn small" data-act="bulk-chat">Ask in chat</button>
@@ -170,6 +171,7 @@
       <td class="num">${d.kv_bytes ? fmtBytes(d.kv_bytes) : "–"}</td>
       <td class="num">${fmtBytes(d.size_bytes)}</td>
       <td class="state-cell"><span class="pill ${esc(d.status)}">${esc(STATUS_LABELS[d.status] || d.status)}</span>
+        ${busy(d) ? '<button class="link-btn small stop-build" data-act="stop-build" title="Stop prefilling this document">stop</button>' : ""}
         ${d.status === "ingesting" ? `<div class="progress wide"><span style="width:${Math.round((d.progress || 0) * 100)}%"></span></div>` : ""}</td>
       <td class="muted small-cell" title="${new Date(d.created_at * 1000).toLocaleString()}">${fmtAgo(d.created_at)}</td>
       <td><button class="icon-btn" data-act="doc-menu" title="Actions" aria-haspopup="menu">${ICONS.more}</button></td>
@@ -234,6 +236,25 @@
       <button class="btn small primary" data-act="build-missing">Build all</button>` : "";
     if (box.dataset.html !== html) { box.innerHTML = html; box.dataset.html = html; }
     box.hidden = !html;
+    renderBusy();
+  }
+
+  // prefill can be stopped: queued documents leave the queue, a running one stops mid-prefill
+  function renderBusy() {
+    const box = $("#lib-busy");
+    const running = S().docs.filter((d) => d.status === "ingesting").length;
+    const queued = S().docs.filter((d) => d.status === "queued").length;
+    const html = running + queued ? `<span><strong>Prefilling ${running + queued} document${running + queued === 1 ? "" : "s"}</strong>
+      (${[running && `${running} running`, queued && `${queued} queued`].filter(Boolean).join(", ")}).</span>
+      <button class="btn small" data-act="stop-all">Stop all</button>` : "";
+    if (box.dataset.html !== html) { box.innerHTML = html; box.dataset.html = html; }
+    box.hidden = !html;
+  }
+
+  async function stopBuilds(docs) {
+    await A.run(async () => {
+      for (const d of docs) await api(`/api/documents/${d.id}/stop`, { method: "POST" });
+    }, docs.length === 1 ? `Stopped prefilling ${docs[0].name}` : `Stopped prefilling ${docs.length} documents`);
   }
 
   function render() {
@@ -304,7 +325,8 @@
         <button class="btn small" data-act="detail-view">${detail.mode === "visual" ? "View pages" : "View text"}</button>
         <button class="btn small" data-act="detail-chat" ${detail.queryable ? "" : "disabled"}>Ask in chat</button>
         <button class="btn small" data-act="detail-download">Download</button>
-        <button class="btn small" data-act="detail-rebuild" ${busy(detail) || detail.status === "waiting" ? "disabled" : ""}>Rebuild cache</button>
+        ${busy(detail) ? '<button class="btn small" data-act="detail-stop">Stop prefilling</button>'
+          : `<button class="btn small" data-act="detail-rebuild" ${detail.status === "waiting" ? "disabled" : ""}>${detail.status === "ready" ? "Rebuild cache" : "Build cache"}</button>`}
         ${detail.name.toLowerCase().endsWith(".pdf") ? '<button class="btn small" data-act="detail-shard">Cut into shards</button>' : ""}
         <button class="btn small danger-outline" data-act="detail-delete">Delete…</button>
       </div>`;
@@ -458,7 +480,9 @@
       ...(d.visual_capable ? [d.mode === "visual"
         ? { label: "Prefill from extracted text", disabled: !d.has_text || busy(d), action: () => setModes([d], "text") }
         : { label: "Prefill from page images", disabled: busy(d), action: () => setModes([d], "visual") }] : []),
-      { label: d.status === "ready" ? "Rebuild KV cache" : "Build KV cache", disabled: busy(d) || d.status === "waiting", action: () => rebuild([d]) },
+      busy(d)
+        ? { label: "Stop prefilling", action: () => stopBuilds([d]) }
+        : { label: d.status === "ready" ? "Rebuild KV cache" : "Build KV cache", disabled: d.status === "waiting", action: () => rebuild([d]) },
       { label: "Download original", action: () => download(d) },
       ...(d.name.toLowerCase().endsWith(".pdf") ? [{ label: "Cut into shards (PDF tools)", action: () => { location.hash = `#tools/${d.id}`; } }] : []),
       "-",
@@ -601,6 +625,12 @@
         return renderCollections();
       }
       if (coll) return setColl(coll.dataset.coll);
+      if (act === "stop-all") {
+        return A.run(async () => {
+          const { stopped } = await (await api("/api/documents/stop-builds", { method: "POST" })).json();
+          return stopped;
+        }, "Stopped prefilling");
+      }
       if (act === "build-missing") {
         return A.run(async () => {
           const { queued } = await (await api("/api/documents/build-missing", { method: "POST" })).json();
@@ -635,6 +665,7 @@
         if (act === "detail-chat") return askInChat([d]);
         if (act === "detail-download") return download(d);
         if (act === "detail-rebuild") return rebuild([d]);
+        if (act === "detail-stop") return stopBuilds([d]);
         if (act === "detail-shard") { location.hash = `#tools/${d.id}`; return; }
         if (act === "detail-delete") return remove([d]);
         const modeBtn = e.target.closest("[data-mode]");
@@ -645,6 +676,7 @@
         const d = A.docById(tr.dataset.id);
         if (!d) return;
         if (act === "doc-menu") return docMenu(e.target.closest("button"), d);
+        if (act === "stop-build") return stopBuilds([d]);
         const box = e.target.matches("input[type=checkbox]");
         if (box || e.shiftKey || e.ctrlKey || e.metaKey) {
           const on = box ? e.target.checked : !lib.checked.has(d.id);

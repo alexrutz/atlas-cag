@@ -287,12 +287,18 @@ evaluating everything again, as standard builds do for sliding-window models), e
 for Gemma 4 with the same build and settings. A build that stores the cache differently or
 computes differently gets its own caches; an equivalent build (e.g. a newer release) reuses them.
 
-After another model configuration becomes active, Atlas does not prefill the library by itself:
-documents without a cache for it show *not built*, and the Library offers **Build all** (or build
-single documents). Settings → Generation → *Build the whole library when another model
-configuration starts* (`ATLAS_BUILD_ON_MODEL_CHANGE`) restores the automatic rebuild. New documents
-and repairs (a cache file that disappeared) are still built automatically
-(`ATLAS_AUTO_BUILD_CACHES`).
+Only new documents are prefilled by themselves (`ATLAS_AUTO_BUILD_CACHES`). A cache that becomes
+unusable is never rebuilt without asking: after another model configuration becomes active
+(also in the middle of a prefill), when a cache file is missing or fails to restore, or when the
+slot became too small for it, the documents show *not built* or *stale* with the reason, and the
+Library offers **Build all** (or build single documents). Settings → Generation → *Rebuild caches
+by themselves when they become unusable* (`ATLAS_BUILD_ON_MODEL_CHANGE`) turns automatic rebuilds
+on.
+
+Prefill can be stopped at any time: **stop** next to a document that is queued or being prefilled
+(also in its ⋯ menu and its details), or **Stop all** above the list. A queued document leaves the
+queue; a running prefill is interrupted at once (the request to llama-server is closed). A
+document stopped before its rebuild began keeps its previous cache; otherwise it shows *not built*.
 
 Atlas keeps logs in `data/logs/`: `atlas.log` for Atlas itself and `llama-server.log` for every
 llama-server start with its full command line. Both rotate.
@@ -630,21 +636,21 @@ Caches are stored per (document, fingerprint), so several configurations coexist
 
 | event | detection | reaction |
 |---|---|---|
-| preset switch or model change | new fingerprint | caches for the new configuration are built; the old ones are kept |
+| preset switch or model change | new fingerprint | documents show *not built* for the new configuration (built on request, or by themselves with `ATLAS_BUILD_ON_MODEL_CHANGE`); the old caches are kept |
 | system prompt changed in Settings | new fingerprint | same as above |
-| cache format changed without Atlas knowing (external server flags, llama.cpp upgrade, another build) | a canary slot file per configuration is rejected on restore, or no longer predicts its reference token (checked on connect, on llama-server restart and after a rejected restore) | that configuration's epoch is bumped and its caches are rebuilt |
+| cache format changed without Atlas knowing (external server flags, llama.cpp upgrade, another build) | a canary slot file per configuration is rejected on restore, or no longer predicts its reference token (checked on connect, on llama-server restart and after a rejected restore) | that configuration's epoch is bumped; its caches need rebuilding (as for a model change) |
 | llama-server unreachable or failing during a restore | connection error or HTTP 5xx | retried or reported; caches are only invalidated when llama-server explicitly rejects a file |
 | llama-server restart between health polls | `/props` `media_marker` is random per process | re-validation as above |
 | managed llama-server crashes | process exit | restarted with backoff (at most 3 times in 5 minutes) |
-| missing or corrupt slot file | existence check / failed restore | that document's cache is rebuilt |
-| model switched while a document was being ingested | fingerprint checked before every part | the job restarts under the new configuration |
+| missing or corrupt slot file | existence check / failed restore | that document is flagged *stale* with the reason, to be rebuilt |
+| model switched while a document was being ingested | fingerprint checked before every part | the job stops (restarts under the new configuration with `ATLAS_BUILD_ON_MODEL_CHANGE`) |
 | llama-server outage during ingestion | connection-level error | up to 5 retries with backoff |
 | hard crash mid-ingestion | unreferenced `atlas-*.bin` files | swept at startup |
-| slot context shrinks below a part's size | per-part size check | the document is rebuilt with smaller parts |
+| slot context shrinks below a part's size | per-part size check | the document is flagged *stale*, to be rebuilt with smaller parts |
 
 The **Storage** tab lists caches per configuration with their size. Delete configurations you no
-longer use; they are rebuilt if you switch back to them. With `ATLAS_AUTO_BUILD_CACHES=false`
-caches are only built on demand (a document's ⋯ menu → Build KV cache).
+longer use; they can be rebuilt if you switch back to them. With `ATLAS_AUTO_BUILD_CACHES=false`
+new documents are only built on demand too (a document's ⋯ menu → Build KV cache).
 
 ## Configuration
 
@@ -674,7 +680,8 @@ override the environment.
 | `ATLAS_OCR` | true | read visual documents without a text layer by OCR, to locate quotes |
 | `ATLAS_OCR_THREADS` | 4 | CPU threads for OCR |
 | `ATLAS_RELEVANCE_FILTER` | false | also in the UI; see the prompt findings below |
-| `ATLAS_AUTO_BUILD_CACHES` | true | also in the UI |
+| `ATLAS_AUTO_BUILD_CACHES` | true | also in the UI; prefill new documents when they are added |
+| `ATLAS_BUILD_ON_MODEL_CHANGE` | false | also in the UI; rebuild unusable caches by themselves (other model configuration, missing or broken files) |
 | `ATLAS_BUILD_UPDATES` | install | `off` / `install` / `apply`; also in the UI |
 | `ATLAS_BUILD_UPDATE_REPO` | `ai-dock/llama.cpp-cuda` | GitHub repository whose releases provide the standard build |
 | `ATLAS_BUILD_UPDATE_ASSET` | *(empty)* | part of the asset name to pick, e.g. `cuda-12.8-amd64`; empty = CUDA package for this CPU |

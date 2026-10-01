@@ -408,7 +408,7 @@ class QueryService:
         if cache is None or cache.status != "ready" or fingerprint != self.engine.info.fingerprint:
             return  # deleted, already being rebuilt, or the model changed meanwhile
         self.store.set_cache(doc.id, fingerprint, status="stale", error=reason)
-        if self.settings.auto_build_caches:
+        if self.settings.build_on_model_change:  # otherwise it waits to be rebuilt in the Library
             self.ingestor.enqueue(doc.id)
 
     async def _single(self, plan: Plan, t: Target, emit: Emit, tally: Tally) -> str:

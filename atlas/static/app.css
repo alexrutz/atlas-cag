@@ -1002,3 +1002,4 @@ body.source-open .chat-module { grid-template-columns: 340px minmax(0, 1fr) minm
 .gd-label .pill { vertical-align: 1px; }
 .src-chip.apart { color: var(--warn); border-style: dashed; }
 .quote-link.apart { text-decoration-color: var(--warn); }
+.state-cell .stop-build { margin-left: 4px; color: var(--err); }
