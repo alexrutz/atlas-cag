@@ -253,8 +253,18 @@ svg { width: 18px; height: 18px; stroke: currentColor; stroke-width: 2; fill: no
   border-radius: 14px 14px 4px 14px;
   white-space: pre-wrap; overflow-wrap: anywhere;
 }
-.question-docs { display: flex; flex-wrap: wrap; gap: 4px; justify-content: flex-end; margin: -4px 0 10px; }
-.question-docs span { font-size: 11px; color: var(--muted); background: var(--surface-2); border-radius: 4px; padding: 1px 6px; }
+.question-names { margin: -4px 0 10px; }
+.question-docs { display: flex; flex-wrap: wrap; gap: 4px; justify-content: flex-end; }
+.question-docs span { font-size: 11px; line-height: 16px; color: var(--muted); background: var(--surface-2); border-radius: 4px; padding: 1px 6px;
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.question-docs.collapsed { max-height: 18px; }
+/* rows of document names: one line until opened, then every name in full */
+.name-row { display: flex; align-items: flex-start; gap: 8px; min-width: 0; }
+.name-chips { flex: 1; min-width: 0; }
+.name-chips.collapsed { overflow: hidden; }
+.name-chips:not(.collapsed) > * { max-width: 100%; }
+.name-chips:not(.collapsed) span { white-space: normal; overflow-wrap: anywhere; }
+.names-toggle { flex: none; white-space: nowrap; line-height: 18px; }
 .response { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); }
 .response-status {
   display: flex; align-items: center; gap: 8px;
@@ -383,12 +393,16 @@ svg { width: 18px; height: 18px; stroke: currentColor; stroke-width: 2; fill: no
   padding: 8px 8px 8px 12px;
 }
 .composer:focus-within { border-color: var(--accent); }
-.chips { display: flex; flex-wrap: wrap; gap: 4px; padding: 2px 0 6px; }
-.chips:empty { display: none; }
+.chips-row { padding: 2px 0 6px; }
+.chips-row:has(.chips:empty) { display: none; }
+.chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.chips.collapsed { max-height: 22px; }
+.chips:not(.collapsed) { max-height: 33vh; overflow-y: auto; }  /* many documents: the box scrolls */
 .chip {
   display: inline-flex; align-items: center; gap: 4px;
   max-width: 240px;
   padding: 2px 4px 2px 8px;
+  line-height: 18px;
   border-radius: 6px;
   background: var(--accent-soft); color: var(--accent);
   font-size: 12px; font-weight: 550;

@@ -615,6 +615,26 @@
     return chips;
   }
 
+  // a row of document names: one line by default (long names cut short, "+3 more"); opened, every
+  // name in full, over as many lines as it needs
+  function foldNames(row) {
+    const box = row.querySelector(".name-chips"), toggle = row.querySelector(".names-toggle");
+    const measure = () => {
+      if (!box.classList.contains("collapsed")) { toggle.hidden = false; toggle.textContent = "show less"; return; }
+      const items = [...box.children];
+      const top = items[0]?.offsetTop ?? 0;
+      const hidden = items.filter((el) => el.offsetTop > top + 2).length;
+      const cut = items.some((el) => { const t = el.querySelector("span") || el; return t.scrollWidth > t.clientWidth + 1; });
+      toggle.hidden = !hidden && !cut;
+      toggle.textContent = hidden ? `+${hidden} more` : "full names";
+      toggle.title = hidden ? "Show all documents with their full names" : "Show the full names";
+    };
+    toggle.addEventListener("click", () => { box.classList.toggle("collapsed"); measure(); });
+    new ResizeObserver(measure).observe(box);  // also measures once the chat becomes visible
+    return measure;
+  }
+  let measureChips = null;
+
   function renderComposer() {
     const docs = selectedQueryable();
     const chips = selectionChips().map((c) =>
@@ -622,6 +642,7 @@
     ).join("");
     const chipBox = $("#chips");
     if (chipBox.dataset.html !== chips) { chipBox.innerHTML = chips; chipBox.dataset.html = chips; }
+    (measureChips ||= foldNames($(".chips-row")))();
     const ready = !!state.status?.ready;
     question.placeholder = !ready
       ? (state.status?.message || "Waiting for llama-server…")
@@ -854,7 +875,10 @@
       node.className = "turn";
       node.innerHTML = `
         <div class="question"><div class="question-bubble">${esc(q)}</div></div>
-        <div class="question-docs">${docs.map((d) => `<span>${esc(d.name)}</span>`).join("")}</div>
+        <div class="name-row question-names">
+          <div class="question-docs name-chips collapsed">${docs.map((d) => `<span title="${esc(d.name)}">${esc(d.name)}</span>`).join("")}</div>
+          <button type="button" class="link-btn small names-toggle" hidden></button>
+        </div>
         <div class="rewritten" hidden></div>
         <div class="response">
           <div class="response-status"></div>
@@ -887,6 +911,7 @@
       node.addEventListener("click", (e) => this.onClick(e));
       node.addEventListener("keydown", (e) => { if ((e.key === "Enter" || e.key === " ") && e.target.matches(".cite[data-n]")) { e.preventDefault(); this.onClick(e); } });
       thread.appendChild(node);
+      foldNames($(".question-names", node))();
       this.setStatus("Planning…");
       scrollDown(true);
     }
