@@ -42,12 +42,12 @@ grows with parameters × tokens.
 
 ## Quick start
 
-Requirements: Python ≥ 3.11 with [uv](https://docs.astral.sh/uv/) and a llama.cpp build with
-`llama-server` (CUDA build for NVIDIA GPUs).
+Requirements: Python ≥ 3.11 with [uv](https://docs.astral.sh/uv/) and an NVIDIA GPU. llama.cpp's
+`llama-server` is set up from the web interface.
 
 ```bash
 uv sync
-cp .env.example .env     # set ATLAS_LLAMA_SERVER_BIN to your llama-server binary
+cp .env.example .env     # optional: every setting has a default
 uv run atlas             # → http://127.0.0.1:8000  (ATLAS_HOST=0.0.0.0 to reach it from other machines)
 ```
 
@@ -66,6 +66,10 @@ uv run atlas --env-file prod.env --log-level debug
 
 Then open **Settings** (gear icon):
 
+0. **Model → Set up llama-server** (fresh install only): build the patched llama-server for this
+   machine (recommended; needs git, cmake, a C++ compiler and the CUDA toolkit), download a prebuilt
+   one, or point to one you have. Nothing is installed until you choose; afterwards it is kept up to
+   date (Model → llama-server builds).
 1. **Model files:** download a GGUF from Hugging Face, or check that your local ones are listed.
 2. **Model:** create a preset (model, context per slot, slots, KV cache type) and activate it.
 3. Back in the chat, upload documents into collections, tick them and ask.

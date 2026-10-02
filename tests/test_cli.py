@@ -65,8 +65,10 @@ def test_llama_server_port_flags_are_for_the_server_atlas_starts(clean):
     assert (s.llama_port, s.llama_host, s.managed) == (8050, "0.0.0.0", True)
     assert s._from_flags == {"llama_port", "llama_host"}  # they win over the address saved in Settings
     assert settings("--env-file", str(env))._from_flags == set()
-    # without a llama-server to start, a port makes no sense: say so instead of connecting somewhere
-    with pytest.raises(SystemExit, match="--llama-url"):
-        settings("--llama-port", "8050")
-    with pytest.raises(SystemExit, match="no llama-server is configured"):
+    # a fresh install without a binary still starts llama-server itself (once set up in Settings)
+    fresh = settings("--llama-port", "8050")
+    assert fresh.managed and fresh.llama_server_bin is None and fresh.llama_port == 8050
+    # connecting to a running llama-server leaves no port to choose: say so
+    with pytest.raises(SystemExit, match="starts none"):
         settings("--env-file", str(env), "--llama-url", "http://127.0.0.1:8080", "--llama-port", "8050")
+    assert settings("--llama-server-bin", "/opt/ls")._from_flags == {"llama_server_bin"}

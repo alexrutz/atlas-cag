@@ -40,8 +40,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                                                             "[ATLAS_MODELS_DIRS]")
     llama = parser.add_argument_group("llama-server")
     mode = llama.add_mutually_exclusive_group()
-    mode.add_argument("--llama-server-bin", metavar="CMD", help="managed mode: start llama-server from "
-                                                                "the presets [ATLAS_LLAMA_SERVER_BIN]")
+    mode.add_argument("--llama-server-bin", metavar="CMD", help="the llama-server Atlas starts from the presets; "
+                                                                "default: the one Atlas installs itself "
+                                                                "(Settings → Model) [ATLAS_LLAMA_SERVER_BIN]")
     mode.add_argument("--llama-url", metavar="URL", help="external mode: connect to a llama-server that is already "
                                                          "running; Atlas starts none (its --slot-save-path must be "
                                                          "the KV folder) [ATLAS_LLAMA_URL]")
@@ -90,9 +91,11 @@ def build_settings(args: argparse.Namespace) -> Settings:
     settings = Settings(_env_file=env_file, **overrides) if overrides else base
     if (args.llama_host or args.llama_port) and not settings.managed:
         raise SystemExit("atlas: --llama-host/--llama-port set where the llama-server Atlas starts itself listens, "
-                         "but no llama-server is configured (ATLAS_LLAMA_SERVER_BIN or --llama-server-bin). "
-                         "To connect to one that is already running, use --llama-url.")
+                         "but Atlas is set to connect to one that is already running (--llama-url or "
+                         "ATLAS_LLAMA_URL) and starts none.")
     settings._from_flags = {k for k in ("llama_host", "llama_port") if k in overrides}
+    if args.llama_server_bin:
+        settings._from_flags.add("llama_server_bin")
     return settings
 
 

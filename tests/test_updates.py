@@ -405,3 +405,35 @@ async def test_releases_are_built_from_source_with_atlas_patches(patched_updates
     updates = await wait_for(client, lambda u: u["job"]["state"] in ("done", "failed") and u["standard_tag"] == "v0.7.0",
                              "/api/builds/updates", 30)
     assert updates["source"] == "release"
+
+
+async def test_fresh_install_builds_the_patched_llama_server_on_request(tmp_path, github, monkeypatch):
+    """No llama-server at all: nothing is installed by itself; the setup card's Build installs the
+    patched build, and Atlas continues as usual."""
+    monkeypatch.setattr(updater_module, "find_nvcc", lambda: "/usr/bin/true")  # the fake project needs no CUDA
+    repo = tmp_path / "llama.cpp"
+    llama_source(repo, "v0.5.0")
+    github.publish("v0.5.0")
+    settings = Settings(
+        _env_file=None, llama_port=free_port(), kv_dir=tmp_path / "kv", data_dir=tmp_path / "data",
+        models_dirs=str(tmp_path / "models"), scan_model_caches=False, llama_start_timeout_s=30,
+        github_api=github.url, build_update_repo="ai-dock/llama.cpp-cuda", build_updates="install",
+        build_update_source="release", build_source_repo=f"file://{repo}", build_cuda_arch="89", build_jobs=2,
+    )
+    model = qwen35_like(tmp_path / "models" / "model-a.gguf", "Model A")
+    app = create_app(settings)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://atlas", timeout=30) as client:
+            assert (await client.get("/api/server")).json()["setup_needed"]
+            updates = (await client.get("/api/builds/updates")).json()
+            assert app.state.updater.waiting_for_setup and updates["job"]["state"] == "idle" and not updates["installed"]
+
+            # the setup card's "Build": the patched source, then a check
+            await client.patch("/api/settings", json={"build_update_source": "patched"})
+            updates = await check(client)
+            assert updates["job"]["state"] == "done", updates
+            assert updates["standard_tag"] == "v0.5.0+atlas"
+            assert not (await client.get("/api/server")).json()["setup_needed"]
+            assert "No model is running" in (await client.get("/api/status")).json()["message"]
+            p = (await client.post("/api/presets", json=preset("plain", model))).json()
+            assert (await activate(client, p["id"]))["ready"]

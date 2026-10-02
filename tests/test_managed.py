@@ -368,3 +368,37 @@ async def test_port_flag_wins_over_the_address_saved_in_settings(tmp_path):
             server = (await client.get("/api/server")).json()
     assert (settings.llama_host, settings.llama_port) == ("0.0.0.0", 8050)  # the saved host, the flag's port
     assert server["address_flags"] == ["port"]
+
+
+async def test_fresh_install_sets_up_llama_server_from_settings(tmp_path):
+    """Without any llama-server, Atlas still runs in managed mode and offers to set one up; the
+    first build is not installed by itself."""
+    models_dir = tmp_path / "models"
+    model = qwen35_like(models_dir / "model-a.gguf", "Model A")
+    settings = Settings(_env_file=None, llama_port=free_port(), kv_dir=tmp_path / "kv", data_dir=tmp_path / "data",
+                        models_dirs=str(models_dir), scan_model_caches=False, llama_start_timeout_s=30,
+                        build_updates="install", max_question_tokens=256, max_answer_tokens=256, max_final_tokens=256)
+    app = create_app(settings)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://atlas", timeout=30) as client:
+            server = (await client.get("/api/server")).json()
+            assert server["mode"] == "managed" and server["setup_needed"] and server["configured_bin"] is None
+            status = (await client.get("/api/status")).json()
+            assert "not installed yet" in status["message"]
+            assert app.state.updater.waiting_for_setup  # no automatic first build
+
+            # presets can be prepared; starting one says what is missing
+            p = (await client.post("/api/presets", json=preset("A", model))).json()
+            status = await activate(client, p["id"])
+            assert status["server"]["state"] == "failed" and "not installed yet" in status["server"]["error"]
+
+            # an existing llama-server can be chosen; then everything works as usual
+            r = await client.put("/api/server/binary", json={"command": str(tmp_path / "missing" / "llama-server")})
+            assert r.status_code == 422
+            r = await client.put("/api/server/binary", json={"command": f"{sys.executable} {CLI}"})
+            assert r.status_code == 200 and r.json()["setup_needed"] is False
+            assert not (await client.get("/api/server")).json()["setup_needed"]
+            assert not app.state.updater.waiting_for_setup
+            status = await activate(client, p["id"])
+            assert status["ready"], status
+            assert app.state.store.get_state("llama_server_bin") == f"{sys.executable} {CLI}"

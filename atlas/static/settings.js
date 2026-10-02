@@ -302,6 +302,7 @@
     const running = server.supervisor.state === "running";
     if (first || !$("#server-card")) {
       body.innerHTML = `
+        <div id="setup-box"></div>
         <section class="card">
           <div id="server-card"></div>
           <details class="log" id="server-log-box"><summary>Server log</summary><pre id="server-log"></pre></details>
@@ -339,9 +340,10 @@
         } catch (err) { toast(err.message, "error"); }
       });
     }
+    replaceIfChanged($("#setup-box"), setupCard(server, updates));
     replaceIfChanged($("#server-card"), serverCard(server));
     replaceIfChanged($("#updates-box"), updatesBox(updates));
-    const updating = ["checking", "downloading", "installing"].includes(updates?.job?.state);
+    const updating = ["checking", "downloading", "installing", "building"].includes(updates?.job?.state);
     if (view.wasUpdating && !updating) loadBuilds();  // a new build was installed
     view.wasUpdating = updating;
     // the log keeps its open state and scroll position; it opens by itself when a start begins or fails
@@ -375,24 +377,70 @@
     ["apply", "Install and restart llama-server when it is idle"],
   ];
 
+  // a fresh install has no llama-server: build the patched one, download one, or point to one
+  function setupCard(server, u) {
+    const job = u?.job || {};
+    const working = ["checking", "downloading", "installing", "building"].includes(job.state);
+    if (!server.setup_needed && !(working && !u?.installed?.length)) return "";
+    const missing = u?.toolchain || [];
+    const configured = server.configured_bin;
+    return `<section class="card setup-card">
+      <div class="card-head"><h2>Set up llama-server</h2></div>
+      <p>Atlas runs llama.cpp's <code>llama-server</code> to read documents and answer. None is installed yet${configured
+        ? `: <code>${esc(tildify(configured))}</code> (ATLAS_LLAMA_SERVER_BIN) does not exist` : ""}. Choose how to get one;
+        afterwards create a preset below as usual.</p>
+      ${working ? jobProgress(job) : `<div class="setup-options">
+        <div class="setup-option">
+          <h3>Build the patched llama-server <span class="badge ok">recommended</span></h3>
+          <p class="muted small">The latest llama.cpp release, built here for this machine's GPU with Atlas's fixes: restored
+            documents of sliding-window models (Gemma, gpt-oss) are reused, and caches survive changing the number of slots.
+            Takes a while; runs at low priority. Kept up to date afterwards.</p>
+          ${missing.length ? `<p class="warn-text small">Needs ${missing.map(esc).join(", ")}${missing.includes("nvcc") ? " (the CUDA toolkit)" : ""}:
+            install ${missing.length === 1 ? "it" : "them"} first, e.g. <code>sudo apt install git cmake build-essential</code>${missing.includes("nvcc") ? " and the CUDA toolkit" : ""}.</p>` : ""}
+          <button class="btn primary" data-act="setup-build" ${missing.length ? "disabled" : ""}>Build</button>
+        </div>
+        <div class="setup-option">
+          <h3>Download a prebuilt llama-server</h3>
+          <p class="muted small">The newest CUDA package of ${esc(u?.repo || "ai-dock/llama.cpp-cuda")}: ready in a few minutes, no
+            compiler needed. Without Atlas's fixes: Gemma and other sliding-window models read their documents again for every
+            question. You can switch to the patched build later.</p>
+          <button class="btn" data-act="setup-download">Download</button>
+        </div>
+        <div class="setup-option">
+          <h3>Use an existing llama-server</h3>
+          <p class="muted small">A llama-server already on this machine, e.g. from your own llama.cpp build.</p>
+          <form class="inline-form" id="setup-bin-form"><input name="command" placeholder="/path/to/llama-server" required>
+            <button class="btn">Use</button></form>
+        </div>
+      </div>`}
+      ${job.state === "failed" && !working ? `<div class="response-error">Setting up failed: ${esc(job.error || "")}</div>` : ""}
+    </section>`;
+  }
+
+  function jobProgress(job) {
+    if (job.state === "downloading") {
+      const pct = job.total ? Math.round((100 * job.done) / job.total) : 0;
+      return `<div class="muted small">Downloading ${esc(job.tag)} · ${fmtBytes(job.done)} of ${fmtBytes(job.total)}</div>
+        <div class="progress wide"><span style="width:${pct}%"></span></div>`;
+    }
+    if (job.state === "building") {
+      const pct = job.step === "compiling" ? job.percent || 0 : null;
+      return `<div class="muted small"><span class="spinner"></span> Building ${esc(job.tag)} from source · ${esc(job.step || "")}${pct !== null ? ` ${pct}%` : ""}…
+        <span class="muted">(runs at low priority; a few minutes)</span></div>${pct !== null ? `<div class="progress wide"><span style="width:${pct}%"></span></div>` : ""}`;
+    }
+    if (["checking", "installing"].includes(job.state)) {
+      return `<div class="muted small"><span class="spinner"></span> ${job.state === "checking" ? "Checking for a new release"
+        : `Installing ${esc(job.tag || "")}${job.detail ? ` · ${esc(job.detail)}` : ""}`}…</div>`;
+    }
+    return "";
+  }
+
   function updatesBox(u) {
     if (!u) return "";
     const job = u.job || {};
     const std = u.installed.find((i) => i.tag === u.standard_tag);
     const working = ["checking", "downloading", "installing", "building"].includes(job.state);
-    let progress = "";
-    if (job.state === "downloading") {
-      const pct = job.total ? Math.round((100 * job.done) / job.total) : 0;
-      progress = `<div class="muted small">Downloading ${esc(job.tag)} · ${fmtBytes(job.done)} of ${fmtBytes(job.total)}</div>
-        <div class="progress wide"><span style="width:${pct}%"></span></div>`;
-    } else if (job.state === "building") {
-      const pct = job.step === "compiling" ? job.percent || 0 : null;
-      progress = `<div class="muted small"><span class="spinner"></span> Building ${esc(job.tag)} from source · ${esc(job.step || "")}${pct !== null ? ` ${pct}%` : ""}…
-        <span class="muted">(runs at low priority; a few minutes)</span></div>${pct !== null ? `<div class="progress wide"><span style="width:${pct}%"></span></div>` : ""}`;
-    } else if (working) {
-      progress = `<div class="muted small"><span class="spinner"></span> ${job.state === "checking" ? "Checking for a new release"
-        : `Installing ${esc(job.tag || "")}${job.detail ? ` · ${esc(job.detail)}` : ""}`}…</div>`;
-    }
+    const progress = jobProgress(job);
     const latest = u.latest ? ` · newest release <a href="${esc(u.latest.url)}" target="_blank" rel="noopener">${esc(u.latest.tag)}</a>` : "";
     const patched = (u.standard_tag || "").endsWith("+atlas");
     const release = (u.standard_tag || "").replace("+atlas", "");
@@ -424,6 +472,16 @@
       ${u.can_roll_back ? `<button class="link-btn small" data-act="rollback-build">Go back to ${esc(u.previous || "the configured build")} and skip ${esc(u.standard_tag)}</button>` : ""}
     </div>`;
   }
+
+  body.addEventListener("submit", async (e) => {
+    if (e.target.id !== "setup-bin-form") return;
+    e.preventDefault();
+    try {
+      const r = await (await api("/api/server/binary", { method: "PUT", json: { command: e.target.elements.command.value.trim() } })).json();
+      toast(`Using ${r.command}${r.version ? ` (${r.version})` : ""}`);
+      renderModel(false);
+    } catch (err) { toast(err.message, "error"); }
+  });
 
   body.addEventListener("change", async (e) => {
     const key = e.target.dataset?.setting;
@@ -514,6 +572,11 @@
         return;
       } else if (act === "build-source") {
         await api("/api/settings", { method: "PATCH", json: { build_update_source: btn.dataset.source } });
+        setTimeout(() => renderModel(false), 300);
+        return;
+      } else if (act === "setup-build" || act === "setup-download") {
+        await api("/api/settings", { method: "PATCH", json: { build_update_source: act === "setup-build" ? "patched" : "release" } });
+        await api("/api/builds/updates/check", { method: "POST" });
         setTimeout(() => renderModel(false), 300);
         return;
       } else if (act === "check-updates") {

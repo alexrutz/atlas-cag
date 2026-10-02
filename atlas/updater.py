@@ -34,7 +34,7 @@ import httpx
 from . import builds, models, procs
 from .config import Settings
 from .store import Store
-from .supervisor import PresetConfig, Supervisor, standard_build
+from .supervisor import PresetConfig, Supervisor, build_available, standard_build
 
 log = logging.getLogger("atlas.updater")
 
@@ -265,7 +265,7 @@ class BuildUpdater:
                 unpatched = (self.settings.build_update_source == "patched"
                              and not (self.state.get("standard") or "").endswith(PATCHED_SUFFIX)
                              and not self.state.get("error"))
-                if mode != "off" and (due or unpatched) and not self.busy:
+                if mode != "off" and (due or unpatched) and not self.busy and not self.waiting_for_setup:
                     await self.check_now()
                 if mode == "apply":
                     await self.apply_if_idle()
@@ -273,6 +273,12 @@ class BuildUpdater:
                 raise
             except Exception:
                 log.exception("build update check failed")
+
+    @property
+    def waiting_for_setup(self) -> bool:
+        """A fresh install without any llama-server: the first one is installed when the user picks
+        how (Settings → Model), not by itself; automatic updates follow from then on."""
+        return not self._installed() and not build_available(self.settings, self.store)
 
     @property
     def busy(self) -> bool:
@@ -658,6 +664,8 @@ class BuildUpdater:
         if reason == "update":
             self._prune()
         log.info("standard llama-server build is now %s (was %s)", tag or new_command, old_tag or old_command)
+        if not old_command and not self.supervisor.preset:  # the first build of a fresh install
+            self.supervisor.engine.pause("No model is running. Choose or create a preset in Settings.")
         if self.settings.build_updates == "apply":
             await self.apply_if_idle()
 

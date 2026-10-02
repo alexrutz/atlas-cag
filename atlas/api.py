@@ -30,7 +30,8 @@ from .ingest import Ingestor
 from .query import QueryError, QueryService
 from .store import Store
 from . import sampling
-from .supervisor import LOOPBACK, PresetConfig, Supervisor, can_listen, connect_url, preset_sampling, standard_build
+from .supervisor import (LOOPBACK, PresetConfig, Supervisor, build_available, can_listen, connect_url,
+                         preset_sampling, standard_build)
 from .updater import BuildUpdater, UpdateError
 
 log = logging.getLogger("atlas.api")
@@ -138,6 +139,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             for key, value in (store.get_state("llama_address") or {}).items():
                 if f"llama_{key}" not in settings._from_flags:  # a start flag wins
                     setattr(settings, f"llama_{key}", value)
+            chosen = store.get_state("llama_server_bin")  # an existing llama-server picked in Settings → Model
+            if chosen and "llama_server_bin" not in settings._from_flags:
+                settings.llama_server_bin = chosen
             settings.llama_url = connect_url(settings.llama_host, settings.llama_port)
         engine = Engine(settings)
         ingestor = Ingestor(engine, store, settings)
@@ -1255,6 +1259,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "llama_server_bin": standard_build(settings, s.store) if s.supervisor else None,
             "supervisor": s.supervisor.to_json() if s.supervisor else None,
             "address_flags": sorted(k.removeprefix("llama_") for k in settings._from_flags if k in ("llama_host", "llama_port")),
+            "setup_needed": bool(s.supervisor) and not build_available(settings, s.store),
+            "configured_bin": settings.llama_server_bin,
             "gpus": await models.gpu_info(),
             "ram_total": models.system_memory(),
         }
@@ -1264,6 +1270,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if host != "localhost" and not re.fullmatch(r"[0-9A-Za-z.:%_-]+", host):
             raise HTTPException(422, f"host: '{host}' is not an IP address or host name")
         return host
+
+    class ServerBinary(BaseModel):
+        command: str = Field(min_length=1, max_length=1000)
+
+    @api.put("/server/binary")
+    async def set_server_binary(request: Request, body: ServerBinary):
+        """Use a llama-server that is already on this machine as the standard build."""
+        s = st(request)
+        managed(s)
+        command = body.command.strip()
+        info = await asyncio.to_thread(builds.inspect, command)
+        if not info.runnable:
+            raise HTTPException(422, f"{command}: {info.problem or 'cannot run'}")
+        settings.llama_server_bin = command
+        s.store.set_state("llama_server_bin", command)
+        if s.supervisor.state in ("stopped", "failed") and not s.supervisor.preset:
+            s.engine.pause("No model is running. Choose or create a preset in Settings.")
+        return {"command": command, "version": info.version, "setup_needed": not build_available(settings, s.store)}
 
     @api.put("/server/address", status_code=202)
     async def set_server_address(request: Request, body: ServerAddress):

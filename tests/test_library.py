@@ -89,7 +89,14 @@ def test_settings_expand_home(monkeypatch, tmp_path):
     assert s.data_dir == tmp_path / "atlas-data" and s.kv_dir == tmp_path / "atlas-data" / "kv"
     assert s.model_dirs[0] == tmp_path / "m1" and str(s.model_dirs[1]) == "/abs/m2"
     assert Settings(_env_file=None, models_dirs="rel/models").model_dirs[0].is_absolute()
-    assert Settings(_env_file=None, llama_server_bin="  ").managed is False
+    # Atlas starts llama-server itself unless only an external one is given; a blank binary is none
+    assert Settings(_env_file=None, llama_server_bin="  ").managed is True
+    external = Settings(_env_file=None, llama_server_bin="  ", llama_url="http://gpu:8080")
+    assert external.managed is False
+    external.llama_url = "http://other:8080"
+    managed = Settings(_env_file=None)
+    managed.llama_url = "http://127.0.0.1:8081"  # Atlas points at the llama-server it started
+    assert external.managed is False and managed.managed is True  # assignments never switch the mode
 
 
 # --- model discovery --------------------------------------------------------------------

@@ -3,7 +3,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field, PrivateAttr, field_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -13,10 +13,12 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="ATLAS_", env_file=".env", extra="ignore")
     # settings given as start flags: they win over values saved in the UI (e.g. the llama-server address)
     _from_flags: set[str] = PrivateAttr(default_factory=set)
+    _external: bool = PrivateAttr(default=False)
 
     # --- llama-server ---------------------------------------------------------------
-    # Managed mode: path (or command) of llama-server. Atlas then starts it itself from the
-    # active preset. Leave empty to connect to an external llama-server at ATLAS_LLAMA_URL.
+    # Atlas starts llama-server itself from the active preset (managed mode). This is the binary
+    # (or command) to use; empty: the build Atlas installs itself (Settings → Model sets it up on a
+    # fresh install). Only ATLAS_LLAMA_URL without this connects to an external llama-server instead.
     llama_server_bin: str | None = None
     # Managed mode: where llama-server listens. 127.0.0.1 = this computer only; 0.0.0.0 = every
     # network interface, so other programs (OpenAI-compatible clients) can use it too. Also
@@ -146,9 +148,16 @@ class Settings(BaseSettings):
         # expand ~ in every word, e.g. "~/llama.cpp/build/bin/llama-server" or "python ~/fake.py"
         return " ".join(os.path.expanduser(w) if w.startswith("~") else w for w in v.split(" "))
 
+    @model_validator(mode="after")
+    def _decide_mode(self) -> "Settings":
+        # decided once: Atlas itself assigns llama_url later, which must not switch the mode
+        self._external = not self.llama_server_bin and "llama_url" in self.model_fields_set
+        return self
+
     @property
     def managed(self) -> bool:
-        return bool(self.llama_server_bin)
+        """Atlas starts llama-server itself, unless only an external one was given (ATLAS_LLAMA_URL)."""
+        return bool(self.llama_server_bin) or not self._external
 
     @property
     def model_dirs(self) -> list[Path]:

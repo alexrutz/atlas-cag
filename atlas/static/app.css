@@ -1003,3 +1003,11 @@ body.source-open .chat-module { grid-template-columns: 340px minmax(0, 1fr) minm
 .src-chip.apart { color: var(--warn); border-style: dashed; }
 .quote-link.apart { text-decoration-color: var(--warn); }
 .state-cell .stop-build { margin-left: 4px; color: var(--err); }
+.setup-card { border-color: var(--accent); }
+.setup-options { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; margin-top: 4px; }
+.setup-option { display: grid; gap: 6px; align-content: start; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg); }
+.setup-option h3 { margin: 0; font-size: 14px; }
+.setup-option p { margin: 0; }
+.setup-option .btn { justify-self: start; }
+.setup-option .inline-form { display: flex; gap: 6px; }
+.setup-option .inline-form input { flex: 1; min-width: 0; }

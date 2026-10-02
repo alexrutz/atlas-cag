@@ -146,6 +146,16 @@ def can_listen(host: str, port: int) -> str | None:
     return None
 
 
+def build_available(settings: Settings, store: Store) -> bool:
+    """A standard build exists that can be started (a fresh install has none until it is set up)."""
+    command = standard_build(settings, store)
+    words = builds.command_words(command) if command else []
+    return bool(words) and (shutil.which(words[0]) is not None or Path(words[0]).is_file())
+
+
+NOT_INSTALLED = "llama-server is not installed yet: set it up in Settings → Model"
+
+
 def standard_build(settings: Settings, store: Store) -> str | None:
     """The build for presets that name none: the installed update, else ATLAS_LLAMA_SERVER_BIN."""
     updates = store.get_state("build_updates") or {}
@@ -318,7 +328,11 @@ class Supervisor:
         self._kill_leftover()
         preset_id = self.store.get_state("active_preset")
         preset = self.store.get_preset(preset_id) if preset_id else None
-        if preset:
+        if not build_available(self.settings, self.store) and not (preset and preset.get("binary")):
+            self.engine.pause(NOT_INSTALLED + ".")
+            self.ingestor.reconcile(startup=True)
+            self._first_activation = False
+        elif preset:
             self._spawn(self.activate(preset))
         else:
             self.engine.pause("No model is running. Choose or create a preset in Settings.")
@@ -410,7 +424,7 @@ class Supervisor:
         command = self.command_for(self.preset)
         binary = builds.command_words(command)
         if not binary:
-            raise SupervisorError("no llama-server build: set ATLAS_LLAMA_SERVER_BIN or choose a build in the preset")
+            raise SupervisorError(NOT_INSTALLED)
         self.running_command = command
         # the address and key in effect now (Settings → Model can change them for the next start)
         self.port = self.settings.llama_port
