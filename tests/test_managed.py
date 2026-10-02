@@ -14,6 +14,7 @@ import pytest
 from atlas import supervisor as supervisor_module
 from atlas.api import create_app
 from atlas.config import Settings
+from atlas.store import Store
 
 from .gguf_writer import qwen35_like, write_gguf
 from .helpers import add_text, query, wait_for
@@ -336,3 +337,34 @@ async def test_llama_cpp_fit_failure_is_reported(managed):
     q = (await managed.post("/api/presets", json=preset("small", managed.models[0]))).json()
     await activate(managed, q["id"])
     assert (await managed.get("/api/server")).json()["supervisor"]["fit_warning"] is None
+
+
+async def test_a_busy_port_stops_the_start_with_a_clear_error(managed):
+    """Another program on llama-server's port would answer in its place: Atlas refuses to start."""
+    model_a, _ = managed.models
+    p = (await managed.post("/api/presets", json=preset("A", model_a))).json()
+    port = managed.app.state.supervisor.settings.llama_port
+    with socket.socket() as taken:
+        taken.bind(("127.0.0.1", port))
+        taken.listen()
+        status = await activate(managed, p["id"])
+    server = status["server"]
+    assert server["state"] == "failed" and not status["ready"]
+    assert f"port {port} is already in use by another program" in server["error"] and "--llama-port" in server["error"]
+
+
+async def test_port_flag_wins_over_the_address_saved_in_settings(tmp_path):
+    settings = Settings(_env_file=None, llama_server_bin=f"{sys.executable} {CLI}", llama_port=8050,
+                        kv_dir=tmp_path / "kv", data_dir=tmp_path / "data", models_dirs=str(tmp_path / "models"),
+                        scan_model_caches=False, build_updates="off")
+    settings._from_flags = {"llama_port"}
+    settings.data_dir.mkdir(parents=True)
+    store = Store(settings.db_path)
+    store.set_state("llama_address", {"host": "0.0.0.0", "port": 9999, "api_key": None})
+    store.close()
+    app = create_app(settings)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://atlas") as client:
+            server = (await client.get("/api/server")).json()
+    assert (settings.llama_host, settings.llama_port) == ("0.0.0.0", 8050)  # the saved host, the flag's port
+    assert server["address_flags"] == ["port"]

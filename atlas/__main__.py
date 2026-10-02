@@ -42,8 +42,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     mode = llama.add_mutually_exclusive_group()
     mode.add_argument("--llama-server-bin", metavar="CMD", help="managed mode: start llama-server from "
                                                                 "the presets [ATLAS_LLAMA_SERVER_BIN]")
-    mode.add_argument("--llama-url", metavar="URL", help="external mode: connect to a running llama-server "
-                                                         "(its --slot-save-path must be the KV folder) [ATLAS_LLAMA_URL]")
+    mode.add_argument("--llama-url", metavar="URL", help="external mode: connect to a llama-server that is already "
+                                                         "running; Atlas starts none (its --slot-save-path must be "
+                                                         "the KV folder) [ATLAS_LLAMA_URL]")
+    llama.add_argument("--llama-host", metavar="HOST", help="managed mode: address the llama-server Atlas starts "
+                                                            "listens on [ATLAS_LLAMA_HOST, default 127.0.0.1]")
+    llama.add_argument("--llama-port", type=_port, metavar="PORT", help="managed mode: port of the llama-server "
+                                                                        "Atlas starts [ATLAS_LLAMA_PORT, default 8081]")
     parser.add_argument("--log-level", choices=["debug", "info", "warning", "error"], default="info",
                         help="log verbosity (default: info)")
     return parser.parse_args(argv)
@@ -79,7 +84,16 @@ def build_settings(args: argparse.Namespace) -> Settings:
         overrides["llama_server_bin"] = args.llama_server_bin
     if args.llama_url:
         overrides.update(llama_url=args.llama_url, llama_server_bin=None)  # external mode
-    return Settings(_env_file=env_file, **overrides) if overrides else base
+    for key in ("llama_host", "llama_port"):
+        if getattr(args, key) is not None:
+            overrides[key] = getattr(args, key)
+    settings = Settings(_env_file=env_file, **overrides) if overrides else base
+    if (args.llama_host or args.llama_port) and not settings.managed:
+        raise SystemExit("atlas: --llama-host/--llama-port set where the llama-server Atlas starts itself listens, "
+                         "but no llama-server is configured (ATLAS_LLAMA_SERVER_BIN or --llama-server-bin). "
+                         "To connect to one that is already running, use --llama-url.")
+    settings._from_flags = {k for k in ("llama_host", "llama_port") if k in overrides}
+    return settings
 
 
 def main(argv: list[str] | None = None) -> None:

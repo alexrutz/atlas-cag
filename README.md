@@ -58,7 +58,9 @@ Common settings can also be given as flags, which override environment variables
 uv run atlas --host 0.0.0.0 --port 8765                 # web interface for other machines
 uv run atlas --data-dir /mnt/big/atlas                   # database, documents, logs (and the KV and
                                                          # model folders that were inside ./data)
-uv run atlas --llama-url http://127.0.0.1:8081 --kv-dir /srv/kv   # external llama-server
+uv run atlas --llama-server-bin ~/llama.cpp/build/bin/llama-server --llama-port 8050
+                                                         # Atlas starts llama-server on port 8050
+uv run atlas --llama-url http://127.0.0.1:8081 --kv-dir /srv/kv   # a llama-server you run yourself
 uv run atlas --env-file prod.env --log-level debug
 ```
 
@@ -667,7 +669,11 @@ new documents are only built on demand too (a document's ⋯ menu → Build KV c
 
 Bootstrap settings come from start flags (`atlas --help`: host, port, data, KV and model folders,
 llama-server mode, settings file, log level), environment variables or `.env` (see
-`.env.example`), in that order of precedence. Generation
+`.env.example`), in that order of precedence. Whether Atlas starts llama-server itself depends only
+on `ATLAS_LLAMA_SERVER_BIN` (or `--llama-server-bin`): without it Atlas connects to `ATLAS_LLAMA_URL`
+and starts none. `--llama-port` / `--llama-host` set where the llama-server Atlas starts listens and
+win over the address saved in Settings → Model; if another program already uses that port, Atlas
+does not start llama-server and says so. Generation
 settings and prompts are edited in **Settings → Generation**. They are stored in the database and
 override the environment.
 

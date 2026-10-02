@@ -8,6 +8,7 @@ from logging.handlers import RotatingFileHandler
 import shlex
 import shutil
 import signal
+import socket
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
@@ -123,6 +124,26 @@ class PresetConfig(BaseModel):
         if self.kv_type not in ("f16", "bf16") and self.flash_attn == "off":
             raise ValueError("a quantized KV cache requires flash attention (set it to 'on' or 'auto')")
         return self
+
+
+def can_listen(host: str, port: int) -> str | None:
+    """Why llama-server could not listen on host:port, or None."""
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError as e:
+        return f"unknown host '{host}': {e.strerror or e}"
+    family, _, _, _, addr = infos[0]
+    with socket.socket(family, socket.SOCK_STREAM) as sock:
+        # like llama-server: a port it just left may still have connections in TIME_WAIT
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(addr)
+            sock.listen()
+        except OSError as e:
+            if e.errno == 98:  # EADDRINUSE
+                return f"port {port} is already in use by another program"
+            return f"cannot listen on {host}:{port}: {e.strerror or e}"
+    return None
 
 
 def standard_build(settings: Settings, store: Store) -> str | None:
@@ -393,6 +414,10 @@ class Supervisor:
         self.running_command = command
         # the address and key in effect now (Settings → Model can change them for the next start)
         self.port = self.settings.llama_port
+        if problem := can_listen(self.settings.llama_host, self.port):
+            # another program there would answer in llama-server's place, or llama-server could not start
+            raise SupervisorError(f"{problem}: choose another port in Settings → Model → Address, "
+                                  "or start Atlas with --llama-port")
         url = connect_url(self.settings.llama_host, self.port)
         settings_key = self.settings.llama_api_key or None
         self._write_key_file(settings_key)

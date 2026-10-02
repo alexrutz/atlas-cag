@@ -56,3 +56,17 @@ def test_bad_flags_are_rejected(clean, capsys):
     with pytest.raises(SystemExit) as e:
         parse_args(["--version"])
     assert e.value.code == 0 and __version__ in capsys.readouterr().out
+
+
+def test_llama_server_port_flags_are_for_the_server_atlas_starts(clean):
+    env = clean / "site.env"
+    env.write_text("ATLAS_LLAMA_SERVER_BIN=/opt/llama-server\n")
+    s = settings("--env-file", str(env), "--llama-port", "8050", "--llama-host", "0.0.0.0")
+    assert (s.llama_port, s.llama_host, s.managed) == (8050, "0.0.0.0", True)
+    assert s._from_flags == {"llama_port", "llama_host"}  # they win over the address saved in Settings
+    assert settings("--env-file", str(env))._from_flags == set()
+    # without a llama-server to start, a port makes no sense: say so instead of connecting somewhere
+    with pytest.raises(SystemExit, match="--llama-url"):
+        settings("--llama-port", "8050")
+    with pytest.raises(SystemExit, match="no llama-server is configured"):
+        settings("--env-file", str(env), "--llama-url", "http://127.0.0.1:8080", "--llama-port", "8050")

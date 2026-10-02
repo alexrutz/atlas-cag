@@ -177,6 +177,7 @@
       ${sup.api_key_set ? '<span class="badge ok" title="Clients must send Authorization: Bearer &lt;key&gt;">API key</span>' : exposed ? '<span class="warn-text">no API key</span>' : ""}
       ${pending ? `<span class="muted">(running on ${esc(hostPort(sup.listening.host, sup.listening.port))} until the next start)</span>` : ""}
       <button class="link-btn small" data-act="server-address">Change…</button>
+      ${server.address_flags?.length ? `<span class="muted small" title="Start flags win over the address saved here">set by ${server.address_flags.map((k) => `<code>--llama-${k}</code>`).join(" and ")} at start: a change here lasts until Atlas restarts</span>` : ""}
       ${exposed ? `<span class="muted small">OpenAI-compatible API for other programs: <code>http://${esc(hostPort(sup.host === "0.0.0.0" || sup.host === "::" ? (server.wsl ? "localhost" : "&lt;this computer&gt;") : sup.host, sup.port))}/v1</code></span>` : ""}`;
   }
 
@@ -285,11 +286,17 @@
       const e = A.state.status?.engine || {};
       body.innerHTML = `<section class="card">
         <div class="card-head"><h2>External llama-server</h2></div>
-        <p>Atlas is connected to a llama-server it does not manage: <code>${esc(server.llama_url)}</code>.</p>
-        <dl class="kv"><dt>Model</dt><dd>${esc(e.model || "–")}</dd><dt>Slots</dt><dd>${e.n_slots || 0} × ${fmtInt(e.n_ctx_slot || 0)} tokens</dd></dl>
-        <p class="muted">To create and switch presets from here, let Atlas run llama-server itself: set
+        <p>Atlas does not start llama-server itself: no <code>ATLAS_LLAMA_SERVER_BIN</code> is set, or Atlas was
+          started with <code>--llama-url</code>. It connects to <code>${esc(server.llama_url)}</code>.</p>
+        ${e.connected
+          ? `<p><span class="badge ok">connected</span></p>
+            <dl class="kv"><dt>Model</dt><dd>${esc(e.model || "–")}</dd><dt>Slots</dt><dd>${e.n_slots || 0} × ${fmtInt(e.n_ctx_slot || 0)} tokens</dd></dl>`
+          : `<p class="warn-text">No llama-server answers there${e.error ? `: ${esc(e.error)}` : ""}. Another program on that
+            port does not count: start a llama-server there, or let Atlas start its own.</p>`}
+        <p class="muted">To create and switch presets here, let Atlas run llama-server itself: set
         <code>ATLAS_LLAMA_SERVER_BIN</code> to the llama-server binary (for example
-        <code>~/llama.cpp/build/bin/llama-server</code>) and restart Atlas.</p></section>`;
+        <code>~/llama.cpp/build/bin/llama-server</code>), or start Atlas with
+        <code>--llama-server-bin PATH --llama-port PORT</code>, and restart Atlas.</p></section>`;
       return;
     }
     const running = server.supervisor.state === "running";

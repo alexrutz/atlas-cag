@@ -3,7 +3,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -11,6 +11,8 @@ class Settings(BaseSettings):
     """All settings can be overridden with ATLAS_* environment variables or a .env file."""
 
     model_config = SettingsConfigDict(env_prefix="ATLAS_", env_file=".env", extra="ignore")
+    # settings given as start flags: they win over values saved in the UI (e.g. the llama-server address)
+    _from_flags: set[str] = PrivateAttr(default_factory=set)
 
     # --- llama-server ---------------------------------------------------------------
     # Managed mode: path (or command) of llama-server. Atlas then starts it itself from the

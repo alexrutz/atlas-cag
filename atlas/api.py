@@ -8,7 +8,6 @@ import logging
 import platform
 import re
 import shutil
-import socket
 from contextlib import asynccontextmanager
 from pathlib import Path, PurePath
 
@@ -31,7 +30,7 @@ from .ingest import Ingestor
 from .query import QueryError, QueryService
 from .store import Store
 from . import sampling
-from .supervisor import LOOPBACK, PresetConfig, Supervisor, connect_url, preset_sampling, standard_build
+from .supervisor import LOOPBACK, PresetConfig, Supervisor, can_listen, connect_url, preset_sampling, standard_build
 from .updater import BuildUpdater, UpdateError
 
 log = logging.getLogger("atlas.api")
@@ -137,7 +136,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 setattr(settings, key, value)
         if settings.managed:  # the llama-server address chosen in Settings → Model
             for key, value in (store.get_state("llama_address") or {}).items():
-                setattr(settings, f"llama_{key}", value)
+                if f"llama_{key}" not in settings._from_flags:  # a start flag wins
+                    setattr(settings, f"llama_{key}", value)
             settings.llama_url = connect_url(settings.llama_host, settings.llama_port)
         engine = Engine(settings)
         ingestor = Ingestor(engine, store, settings)
@@ -1254,6 +1254,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "wsl": "microsoft" in platform.release().lower(),
             "llama_server_bin": standard_build(settings, s.store) if s.supervisor else None,
             "supervisor": s.supervisor.to_json() if s.supervisor else None,
+            "address_flags": sorted(k.removeprefix("llama_") for k in settings._from_flags if k in ("llama_host", "llama_port")),
             "gpus": await models.gpu_info(),
             "ram_total": models.system_memory(),
         }
@@ -1263,25 +1264,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if host != "localhost" and not re.fullmatch(r"[0-9A-Za-z.:%_-]+", host):
             raise HTTPException(422, f"host: '{host}' is not an IP address or host name")
         return host
-
-    def can_listen(host: str, port: int) -> str | None:
-        """Why llama-server could not listen on host:port, or None."""
-        try:
-            infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-        except OSError as e:
-            return f"unknown host '{host}': {e.strerror or e}"
-        family, _, _, _, addr = infos[0]
-        with socket.socket(family, socket.SOCK_STREAM) as sock:
-            # like llama-server: a port it just left may still have connections in TIME_WAIT
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                sock.bind(addr)
-                sock.listen()
-            except OSError as e:
-                if e.errno == 98:  # EADDRINUSE
-                    return f"port {port} is already in use by another program"
-                return f"cannot listen on {host}:{port}: {e.strerror or e}"
-        return None
 
     @api.put("/server/address", status_code=202)
     async def set_server_address(request: Request, body: ServerAddress):
