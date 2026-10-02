@@ -51,6 +51,17 @@ cp .env.example .env     # set ATLAS_LLAMA_SERVER_BIN to your llama-server binar
 uv run atlas             # → http://127.0.0.1:8000  (ATLAS_HOST=0.0.0.0 to reach it from other machines)
 ```
 
+Common settings can also be given as flags, which override environment variables and `.env`
+(`uv run atlas --help` lists them):
+
+```bash
+uv run atlas --host 0.0.0.0 --port 8765                 # web interface for other machines
+uv run atlas --data-dir /mnt/big/atlas                   # database, documents, logs (and the KV and
+                                                         # model folders that were inside ./data)
+uv run atlas --llama-url http://127.0.0.1:8081 --kv-dir /srv/kv   # external llama-server
+uv run atlas --env-file prod.env --log-level debug
+```
+
 Then open **Settings** (gear icon):
 
 1. **Model files:** download a GGUF from Hugging Face, or check that your local ones are listed.
@@ -654,7 +665,9 @@ new documents are only built on demand too (a document's ⋯ menu → Build KV c
 
 ## Configuration
 
-Bootstrap settings come from environment variables or `.env` (see `.env.example`). Generation
+Bootstrap settings come from start flags (`atlas --help`: host, port, data, KV and model folders,
+llama-server mode, settings file, log level), environment variables or `.env` (see
+`.env.example`), in that order of precedence. Generation
 settings and prompts are edited in **Settings → Generation**. They are stored in the database and
 override the environment.
 
